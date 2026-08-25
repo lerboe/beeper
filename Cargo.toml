@@ -5,12 +5,12 @@ members = ["beeper", "example", "utils"]
 [workspace.package]
 license = "GPL-3.0"
 authors = [
-    "lbrndnr <mail@laurinbrandner.ch>",
+    "lerboe <mail@laurinbrandner.ch>",
 ]
-repository = "https://github.com/lbrndnr/beeper"
+repository = "https://github.com/lerboe/beeper"
 readme = "README.md"
 keywords = ["ebpf", "bpf", "libbpf", "l7", "http"]
 description = "Application-Layer Parsing in eBPF"
 
 [patch.crates-io]
-h2 = { git = "https://github.com/lbrndnr/h2" }
+h2 = { git = "https://github.com/lerboe/h2" }

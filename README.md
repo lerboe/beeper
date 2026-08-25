@@ -9,8 +9,8 @@
 [crates-url]: https://crates.io/crates/beeper
 [gpl-badge]: https://img.shields.io/badge/License-GPL_v3-blue.svg
 [gpl-url]: LICENSE
-[actions-badge]: https://github.com/lbrndnr/beeper/actions/workflows/ci.yml/badge.svg
-[actions-url]: https://github.com/lbrndnr/beeper/actions/workflows/ci.yml
+[actions-badge]: https://github.com/lerboe/beeper/actions/workflows/ci.yml/badge.svg
+[actions-url]: https://github.com/lerboe/beeper/actions/workflows/ci.yml
 [doi-badge]: https://img.shields.io/badge/DOI-10.48550/arXiv.2605.31084-purple.svg
 [doi-url]: https://doi.org/10.48550/arXiv.2605.31084
 
