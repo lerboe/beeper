@@ -75,7 +75,7 @@ oha -c 100 -q 1000 -z 30s --http2 --latency-correction --urls-from-file example/
 
 If you use this library to conduct your own research, please cite the full paper as follows:
 ```
-@misc{brandner2026enforcingapplicationlayerpoliciesebpf,
+@misc{beeline,
       title={Enforcing Application-Layer Policies in eBPF}, 
       author={Laurin Brandner and Ayush Mishra and Sebastiano Miano and Aurojit Panda and Gianni Antichi and Laurent Vanbever},
       year={2026},
