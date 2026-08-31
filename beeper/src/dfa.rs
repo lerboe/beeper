@@ -175,9 +175,9 @@ impl DfaBuilder<'_> {
 
     /// Pushes one branch per input onto the [`Dfa`]. One of the branches
     /// must be matched case sensitively for the [`Dfa`] to reach a final state.
-    pub fn push_options(&mut self, inputs: &[&str]) -> &mut Self {
-        self.push_options_inner(inputs, true)
-    }
+    // pub fn push_options(&mut self, inputs: &[&str]) -> &mut Self {
+    //     self.push_options_inner(inputs, true)
+    // }
 
     /// Same as [`push_options`], but case insensitive.
     pub fn push_options_ci(&mut self, inputs: &[&str]) -> &mut Self {
@@ -226,10 +226,10 @@ impl DfaBuilder<'_> {
     }
 
     /// Same as [`push_optional`], but case-insensitive.
-    pub fn push_optional_ci(&mut self, input: &str) -> &mut Self {
-        self.optional_prefixes.push((input.to_string(), false));
-        self
-    }
+    // pub fn push_optional_ci(&mut self, input: &str) -> &mut Self {
+    //     self.optional_prefixes.push((input.to_string(), false));
+    //     self
+    // }
 
     /// Starts capturing at the next input pushed onto the pattern.
     ///
