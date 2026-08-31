@@ -28,6 +28,7 @@
 //! the parser stays in place until it is dropped.
 
 use anyhow::{Result, bail};
+pub(crate) use dfa::Dfa;
 use xbpf::libbpf::{Mut, OpenProgramImpl};
 
 mod dfa;

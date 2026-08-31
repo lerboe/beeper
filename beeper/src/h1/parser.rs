@@ -1,7 +1,6 @@
 #![allow(unused_imports)]
 use crate::{
-    Action, CaptureId, MatchId, StateId, autoload_and_attach,
-    dfa::Dfa,
+    Action, CaptureId, Dfa, MatchId, StateId, autoload_and_attach,
     header::{METHOD, PATH, STATUS},
 };
 use anyhow::Result;

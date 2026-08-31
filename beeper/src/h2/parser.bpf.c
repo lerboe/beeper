@@ -114,9 +114,7 @@ const u16 a_end_capture = 1 << 12;
 
 const u16 a_id_mask = 0x0FFF;
 
-// The state every pattern is anchored at. A field name can appear in any header
-// block, so all patterns start here.
-const u16 s_any = 0;
+const u16 s_any = 1;
 
 // these restrictions are needed to make the verifier happy
 #define MAX_STATES 256

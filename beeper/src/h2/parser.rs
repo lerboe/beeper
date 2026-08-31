@@ -1,22 +1,18 @@
 #![allow(unused_imports)]
-use crate::{
-    autoload_and_attach,
-    h2::{create_header_maps, dfa::Dfa, Action},
-};
-use anyhow::{bail, Result};
+use crate::{Action, Dfa, StateId, autoload_and_attach, h2::create_header_maps};
+use anyhow::{Result, bail};
 use as_bytes::AsBytes;
 use httlib_huffman as huffman;
 use http::HeaderName;
 use plain::Plain;
 use std::mem::MaybeUninit;
 use std::net::SocketAddr;
-use tracing::{debug, warn, Level};
+use tracing::{Level, debug, warn};
 use types::*;
 pub use types::{ip4_addr, ip4_conn};
 use xbpf::libbpf::{
-    self as libbpf_rs,
+    self as libbpf_rs, Link, MapCore, MapFlags, MapHandle, OpenObject,
     skel::{OpenSkel, Skel, SkelBuilder},
-    Link, MapCore, MapFlags, MapHandle, OpenObject,
 };
 
 extern crate plain;
@@ -27,11 +23,6 @@ extern crate plain;
 /// functions of the target program it replaces. Nothing is loaded into the
 /// kernel until [`Parser::attach`] is called.
 pub struct Parser {
-    /// The state every pattern is anchored at. A field name may appear in any
-    /// header block, so there is no equivalent to the request line of HTTP/1.x
-    /// to anchor a pattern at.
-    s_any: u16,
-
     /// The patterns configured so far, compiled into a DFA.
     dfa: Dfa,
 
@@ -50,15 +41,25 @@ xbpf::include_bpf!("h2/parser");
 ///
 /// An action is a bit field: the flag identifying the action occupies the high
 /// bits, the capture id the low ones.
-fn new_transition(state: u16, action: Action, rodata: &rodata) -> trans {
+fn new_transition(state: StateId, action: Option<Action>, rodata: &rodata) -> trans {
     let action = match action {
-        Action::CaptureFieldValue(cid) => rodata.a_start_capture | (cid as u16) & rodata.a_id_mask,
-        // Action::EndCapturing(rid) => rodata.a_end_capture | (rid as u16) & rodata.a_id_mask,
-        Action::Done => rodata.a_done,
-        Action::None => 0,
+        Some(Action::StartCapture(cid)) => {
+            rodata.a_start_capture | (cid.0 as u16) & rodata.a_id_mask
+        }
+        Some(Action::StartCaptureAndDone(cid)) => {
+            rodata.a_done | rodata.a_start_capture | (cid.0 as u16) & rodata.a_id_mask
+        }
+        Some(Action::Done) => rodata.a_done,
+        Some(Action::EndCapture(..)) | Some(Action::EndCaptureAndDone(..)) => {
+            unreachable!("HPACK announces the value length, so an h2 pattern never ends a capture")
+        }
+        None => 0,
     };
 
-    trans { state, action }
+    trans {
+        state: state.0,
+        action,
+    }
 }
 
 #[allow(dead_code)]
@@ -67,11 +68,8 @@ impl Parser {
     ///
     /// Additional configuration must be done through the builder methods before calling `attach`.
     pub fn new() -> Parser {
-        let states = vec![0, 1];
-
         Parser {
-            s_any: 0,
-            dfa: Dfa::new(states.into_iter()),
+            dfa: Dfa::new(),
             parse_msg_fn: None,
             parse_buf_fn: None,
             parse_skb_fn: None,
@@ -171,9 +169,9 @@ impl Parser {
         huffman::encode(name.as_str().as_bytes(), &mut name_encoded)?;
 
         self.dfa
-            .start_pattern(self.s_any)
-            .push(&name_encoded)
-            .capture_field_value();
+            .start_pattern(false)
+            .push_bytes(&name_encoded)
+            .capture();
 
         Ok(self)
     }
@@ -318,9 +316,9 @@ impl Parser {
     /// kernel freezes the section afterwards.
     fn inject(&self, skel: &mut OpenParserSkel) -> Result<()> {
         for (from, to, input, action) in self.dfa.iter_transitions() {
-            let s = *from as usize;
+            let s = from.0 as usize;
             let data = skel.maps.rodata_data.as_mut().unwrap();
-            let t = new_transition(*to, *action, data);
+            let t = new_transition(*to, action, data);
             data.s2ts[s][*input as usize] = t;
         }
 

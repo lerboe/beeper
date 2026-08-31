@@ -8,7 +8,7 @@
 
 use anyhow::Result;
 use as_bytes::AsBytes;
-use beeper::h2::{Action, Parser};
+use beeper::h2::Parser;
 use std::{
     io::{Error, ErrorKind},
     mem::MaybeUninit,
@@ -19,12 +19,11 @@ use std::{
         unix::fs::OpenOptionsExt,
     },
 };
-use tracing::{debug, info, warn, Level};
+use tracing::{Level, debug, info, warn};
 use types::*;
 use xbpf::libbpf::{
-    self as libbpf_rs,
+    self as libbpf_rs, Link, MapCore, MapFlags, MapHandle, MapType, ProgramInput,
     skel::{OpenSkel, Skel, SkelBuilder},
-    Link, MapCore, MapFlags, MapHandle, MapType, ProgramInput,
 };
 
 xbpf::include_bpf!("prog");

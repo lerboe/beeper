@@ -12,7 +12,7 @@ const ANY_STATE: StateId = StateId(1);
 
 /// The input a state matches any byte with. The parser only follows it if the
 /// state has no transition for the byte it read.
-const ANY_INPUT: char = '*';
+const ANY_INPUT: u8 = '*' as u8;
 
 /// Builds a single pattern into a [`Dfa`].
 ///
@@ -52,26 +52,23 @@ impl DfaBuilder<'_> {
     /// Appends a single input to the pattern, first building the optional
     /// prefixes that were pushed since the last input and starting a capture if
     /// one is pending.
-    fn push_edge(&mut self, input: char, to: Option<StateId>, case_sensitive: bool) {
+    fn push_edge(&mut self, input: u8, to: Option<StateId>, case_sensitive: bool) {
         let start = self.state;
         while let Some((optional, case_sensitive)) = self.optional_prefixes.pop() {
             let mut from = start;
-            for (i, c) in optional.char_indices() {
+            for (i, b) in optional.as_bytes().iter().enumerate() {
                 let to = if i == optional.len() - 1 {
                     Some(start)
                 } else {
                     None
                 };
-                from = self.push_edge_from(from, c, to, case_sensitive);
+                from = self.push_edge_from(from, *b, to, case_sensitive);
             }
         }
 
         if let Some(id) = self.start_capture.take() {
             trace!("start_capturing; state={:?}, cid={:?} ", self.state, id);
 
-            // [`INIT_STATE`] is never entered, so a capture anchored there cannot
-            // run an action. It doesn't have to: its start index is 0, which is
-            // what the parser initializes every capture to.
             if self.state != INIT_STATE {
                 self.dfa.add_action(self.state, Action::StartCapture(id));
             }
@@ -81,7 +78,7 @@ impl DfaBuilder<'_> {
         trace!(
             "push_edge; state={:?}, input={}, to={:?}",
             self.state,
-            input.escape_debug(),
+            (input as char).escape_debug(),
             to
         );
 
@@ -94,7 +91,7 @@ impl DfaBuilder<'_> {
     fn push_edge_from(
         &mut self,
         from: StateId,
-        input: char,
+        input: u8,
         to: Option<StateId>,
         case_sensitive: bool,
     ) -> StateId {
@@ -102,7 +99,7 @@ impl DfaBuilder<'_> {
 
         self.dfa.insert_edge(from, input, to);
         if !case_sensitive {
-            let other_case = if input.is_lowercase() {
+            let other_case = if input.is_ascii_lowercase() {
                 input.to_ascii_uppercase()
             } else {
                 input.to_ascii_lowercase()
@@ -118,17 +115,22 @@ impl DfaBuilder<'_> {
     /// Appends `input` to the pattern, one edge per character. Characters are
     /// matched case sensitively.
     pub fn push(&mut self, input: &str) -> &mut Self {
+        self.push_inner(input.as_bytes(), true)
+    }
+
+    /// Same as [`push`], but accepts raw bytes.
+    pub fn push_bytes(&mut self, input: &[u8]) -> &mut Self {
         self.push_inner(input, true)
     }
 
     /// Same as [`push`], but characters are matched case insensitively.
     pub fn push_ci(&mut self, input: &str) -> &mut Self {
-        self.push_inner(input, false)
+        self.push_inner(input.as_bytes(), false)
     }
 
-    pub fn push_inner(&mut self, input: &str, case_sensitive: bool) -> &mut Self {
-        for c in input.chars() {
-            self.push_edge(c, None, case_sensitive);
+    pub fn push_inner(&mut self, input: &[u8], case_sensitive: bool) -> &mut Self {
+        for b in input {
+            self.push_edge(*b, None, case_sensitive);
         }
         self
     }
@@ -190,7 +192,7 @@ impl DfaBuilder<'_> {
         // the longest option is pushed normally, its final state is the one
         // all the other options have to end in as well
         let start = self.state;
-        self.push_inner(longest, case_sensitive);
+        self.push_inner(longest.as_bytes(), case_sensitive);
         let final_state = self.state;
 
         trace!(
@@ -204,13 +206,13 @@ impl DfaBuilder<'_> {
             assert!(!input.is_empty(), "Cannot push an empty option");
 
             self.state = start;
-            for (i, c) in input.char_indices() {
+            for (i, b) in input.as_bytes().iter().enumerate() {
                 let to = if i == input.len() - 1 {
                     Some(final_state)
                 } else {
                     None
                 };
-                self.push_edge(c, to, case_sensitive);
+                self.push_edge(*b, to, case_sensitive);
             }
         }
 
@@ -243,6 +245,25 @@ impl DfaBuilder<'_> {
         self
     }
 
+    /// Starts capturing at the state the pattern has been built up to, rather
+    /// than at the next input pushed onto it.
+    ///
+    /// It is meant for a parser that does not have to match the end of the
+    /// range it captures, and therefore never calls
+    /// [`DfaBuilder::end_capturing`]: HPACK prefixes a field value with its
+    /// length, so the HTTP/2 pattern matching a field name ends where the
+    /// capture begins.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a capture has already been started but not yet pushed.
+    pub fn capture(&mut self) -> &mut Self {
+        let cid = self.dfa.new_capture();
+        self.dfa.add_action(self.state, Action::StartCapture(cid));
+
+        self
+    }
+
     /// Ends the open capture at the last input pushed onto the pattern and
     /// turns the captured range into a match.
     ///
@@ -266,10 +287,10 @@ impl DfaBuilder<'_> {
     /// Matches the given input string but sets the final state
     /// to the state the DFA would be in if it started from [`ANY_STATE`].
     pub fn restart_with(&mut self, input: &str) {
-        let final_state = input.chars().fold(ANY_STATE, |state, c| {
+        let final_state = input.as_bytes().iter().fold(ANY_STATE, |state, b| {
             // next state only inserts a state, we also have to ensure an edge exists
-            let next = self.dfa.next_state(&state, &c);
-            self.push_edge_from(state, c, Some(next), false);
+            let next = self.dfa.next_state(&state, &b);
+            self.push_edge_from(state, *b, Some(next), false);
             next
         });
 
@@ -279,13 +300,13 @@ impl DfaBuilder<'_> {
             final_state
         );
 
-        for (i, c) in input.char_indices() {
+        for (i, b) in input.as_bytes().iter().enumerate() {
             let to = if i == input.len() - 1 {
                 Some(final_state)
             } else {
                 None
             };
-            self.push_edge(c, to, false);
+            self.push_edge(*b, to, false);
         }
     }
 
@@ -295,7 +316,7 @@ impl DfaBuilder<'_> {
     }
 }
 
-type EdgeMap = HashMap<StateId, HashMap<char, StateId>>;
+type EdgeMap = HashMap<StateId, HashMap<u8, StateId>>;
 type ActionMap = HashMap<StateId, Action>;
 
 /// The DFA the patterns of a [`Parser`](super::Parser) are compiled into.
@@ -334,12 +355,12 @@ impl Dfa {
 
     /// Starts a new pattern.
     ///
-    /// A `status_line` pattern is anchored at [`INIT_STATE`] and therefore only
+    /// A `head` pattern is anchored at [`INIT_STATE`] and therefore only
     /// matches at the very beginning of a message, any other pattern is
     /// anchored at [`ANY_STATE`] and may match anywhere in the header block.
-    pub fn start_pattern<'a>(&'a mut self, status_line: bool) -> DfaBuilder<'a> {
-        trace!("start_pattern; status_line={:?}", status_line);
-        let state = if status_line { INIT_STATE } else { ANY_STATE };
+    pub fn start_pattern<'a>(&'a mut self, head: bool) -> DfaBuilder<'a> {
+        trace!("start_pattern; head={:?}", head);
+        let state = if head { INIT_STATE } else { ANY_STATE };
         DfaBuilder::new(self, state)
     }
 
@@ -366,7 +387,7 @@ impl Dfa {
 
     /// Queries the edges to retrieve the next state from given state and
     /// input character. Creates a new state if none exists.
-    fn next_state(&mut self, from: &StateId, input: &char) -> StateId {
+    fn next_state(&mut self, from: &StateId, input: &u8) -> StateId {
         self.edges
             .get(from)
             .and_then(|es| es.get(input).map(|to| *to))
@@ -379,7 +400,7 @@ impl Dfa {
     ///
     /// Panics if `from` already has an edge for `input` that leads somewhere
     /// else, as that would make the automaton non-deterministic.
-    fn insert_edge(&mut self, from: StateId, input: char, to: StateId) {
+    fn insert_edge(&mut self, from: StateId, input: u8, to: StateId) {
         if let Some(to_old) = self.edges.entry(from).or_default().insert(input, to) {
             assert!(
                 to_old == to,
@@ -409,7 +430,7 @@ impl Dfa {
     /// action of the state it leads to.
     pub fn iter_transitions<'a>(
         &'a self,
-    ) -> impl Iterator<Item = (&'a StateId, &'a StateId, &'a char, Option<Action>)> {
+    ) -> impl Iterator<Item = (&'a StateId, &'a StateId, &'a u8, Option<Action>)> {
         self.edges.iter().flat_map(move |(from, edges)| {
             edges.iter().map(move |(input, to)| {
                 let action = self.actions.get(to).copied();

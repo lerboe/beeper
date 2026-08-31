@@ -9,9 +9,8 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
-mod dfa;
 mod parser;
-pub use parser::{ip4_addr, ip4_conn, AttachedParser, Parser};
+pub use parser::{AttachedParser, Parser, ip4_addr, ip4_conn};
 
 impl From<SocketAddr> for ip4_addr {
     /// Converts `addr` into the address the BPF programs key their per
