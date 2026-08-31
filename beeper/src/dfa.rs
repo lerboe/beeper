@@ -1,4 +1,4 @@
-use crate::h1::{Action, CaptureId, MatchId, StateId};
+use crate::{Action, CaptureId, MatchId, StateId};
 use std::{collections::HashMap, ops::RangeBounds};
 use tracing::trace;
 
@@ -29,7 +29,7 @@ pub struct DfaBuilder<'a> {
     /// Strings that may appear before the next input. They are only built into
     /// the DFA once that input is known, as each of them has to lead back to
     /// the state it branched off of.
-    optional_prefixes: Vec<String>,
+    optional_prefixes: Vec<(String, bool)>,
 
     /// The capture the next input starts, if any.
     start_capture: Option<CaptureId>,
@@ -49,33 +49,12 @@ impl DfaBuilder<'_> {
         }
     }
 
-    /// Inserts an edge for both the lower and the upper case of `input` and
-    /// returns the state they lead to. If `to` is `None`, the edge leads to the
-    /// state the DFA already has for `input`, or to a new one.
-    fn push_edge_case_insensitive(
-        &mut self,
-        from: StateId,
-        input: char,
-        to: Option<StateId>,
-    ) -> StateId {
-        let to = to.unwrap_or(self.dfa.next_state(&from, &input));
-        let lc = input.to_ascii_lowercase();
-        self.dfa.insert_edge(from, lc, to);
-
-        let uc = input.to_ascii_uppercase();
-        if uc != lc {
-            self.dfa.insert_edge(from, uc, to);
-        }
-
-        to
-    }
-
     /// Appends a single input to the pattern, first building the optional
     /// prefixes that were pushed since the last input and starting a capture if
     /// one is pending.
-    fn push_edge(&mut self, input: char, to: Option<StateId>) {
+    fn push_edge(&mut self, input: char, to: Option<StateId>, case_sensitive: bool) {
         let start = self.state;
-        while let Some(optional) = self.optional_prefixes.pop() {
+        while let Some((optional, case_sensitive)) = self.optional_prefixes.pop() {
             let mut from = start;
             for (i, c) in optional.char_indices() {
                 let to = if i == optional.len() - 1 {
@@ -83,7 +62,7 @@ impl DfaBuilder<'_> {
                 } else {
                     None
                 };
-                from = self.push_edge_case_insensitive(from, c, to);
+                from = self.push_edge_from(from, c, to, case_sensitive);
             }
         }
 
@@ -106,14 +85,50 @@ impl DfaBuilder<'_> {
             to
         );
 
-        self.state = self.push_edge_case_insensitive(start, input, to);
+        self.state = self.push_edge_from(start, input, to, case_sensitive);
+    }
+
+    /// Inserts an edge for both the lower and the upper case of `input` and
+    /// returns the state they lead to. If `to` is `None`, the edge leads to the
+    /// state the DFA already has for `input`, or to a new one.
+    fn push_edge_from(
+        &mut self,
+        from: StateId,
+        input: char,
+        to: Option<StateId>,
+        case_sensitive: bool,
+    ) -> StateId {
+        let to = to.unwrap_or(self.dfa.next_state(&from, &input));
+
+        self.dfa.insert_edge(from, input, to);
+        if !case_sensitive {
+            let other_case = if input.is_lowercase() {
+                input.to_ascii_uppercase()
+            } else {
+                input.to_ascii_lowercase()
+            };
+            if other_case != input {
+                self.dfa.insert_edge(from, other_case, to);
+            }
+        }
+
+        to
     }
 
     /// Appends `input` to the pattern, one edge per character. Characters are
-    /// matched case insensitively.
+    /// matched case sensitively.
     pub fn push(&mut self, input: &str) -> &mut Self {
+        self.push_inner(input, true)
+    }
+
+    /// Same as [`push`], but characters are matched case insensitively.
+    pub fn push_ci(&mut self, input: &str) -> &mut Self {
+        self.push_inner(input, false)
+    }
+
+    pub fn push_inner(&mut self, input: &str, case_sensitive: bool) -> &mut Self {
         for c in input.chars() {
-            self.push_edge(c, None);
+            self.push_edge(c, None, case_sensitive);
         }
         self
     }
@@ -140,25 +155,34 @@ impl DfaBuilder<'_> {
         );
 
         for _ in 0..min_len {
-            self.push_edge(ANY_INPUT, None);
+            self.push_edge(ANY_INPUT, None, true);
         }
 
         // the following transitions are optional and must point to `self.state`
         for i in 1..max_len - min_len {
             let prefix = ANY_INPUT.to_string().repeat(i);
-            self.optional_prefixes.push(prefix);
+            self.optional_prefixes.push((prefix, true));
         }
 
         if matches!(range.end_bound(), std::ops::Bound::Unbounded) {
-            self.push_edge_case_insensitive(self.state, ANY_INPUT, Some(self.state));
+            self.push_edge_from(self.state, ANY_INPUT, Some(self.state), true);
         }
 
         self
     }
 
     /// Pushes one branch per input onto the [`Dfa`]. One of the branches
-    /// must be matched for the [`Dfa`] to reach a final state.
+    /// must be matched case sensitively for the [`Dfa`] to reach a final state.
     pub fn push_options(&mut self, inputs: &[&str]) -> &mut Self {
+        self.push_options_inner(inputs, true)
+    }
+
+    /// Same as [`push_options`], but case insensitive.
+    pub fn push_options_ci(&mut self, inputs: &[&str]) -> &mut Self {
+        self.push_options_inner(inputs, false)
+    }
+
+    pub fn push_options_inner(&mut self, inputs: &[&str], case_sensitive: bool) -> &mut Self {
         let Some(longest) = inputs.iter().copied().max_by_key(|input| input.len()) else {
             return self;
         };
@@ -166,7 +190,7 @@ impl DfaBuilder<'_> {
         // the longest option is pushed normally, its final state is the one
         // all the other options have to end in as well
         let start = self.state;
-        self.push(longest);
+        self.push_inner(longest, case_sensitive);
         let final_state = self.state;
 
         trace!(
@@ -186,7 +210,7 @@ impl DfaBuilder<'_> {
                 } else {
                     None
                 };
-                self.push_edge(c, to);
+                self.push_edge(c, to, case_sensitive);
             }
         }
 
@@ -195,7 +219,13 @@ impl DfaBuilder<'_> {
 
     /// Appends `input` to the pattern, but allows it to be skipped.
     pub fn push_optional(&mut self, input: &str) -> &mut Self {
-        self.optional_prefixes.push(input.to_string());
+        self.optional_prefixes.push((input.to_string(), true));
+        self
+    }
+
+    /// Same as [`push_optional`], but case-insensitive.
+    pub fn push_optional_ci(&mut self, input: &str) -> &mut Self {
+        self.optional_prefixes.push((input.to_string(), false));
         self
     }
 
@@ -239,7 +269,7 @@ impl DfaBuilder<'_> {
         let final_state = input.chars().fold(ANY_STATE, |state, c| {
             // next state only inserts a state, we also have to ensure an edge exists
             let next = self.dfa.next_state(&state, &c);
-            self.push_edge_case_insensitive(state, c, Some(next));
+            self.push_edge_from(state, c, Some(next), false);
             next
         });
 
@@ -255,7 +285,7 @@ impl DfaBuilder<'_> {
             } else {
                 None
             };
-            self.push_edge(c, to);
+            self.push_edge(c, to, false);
         }
     }
 

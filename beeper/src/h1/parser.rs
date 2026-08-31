@@ -1,18 +1,17 @@
 #![allow(unused_imports)]
 use crate::{
-    autoload_and_attach,
-    h1::{dfa::Dfa, Action, CaptureId, MatchId, StateId},
+    Action, CaptureId, MatchId, StateId, autoload_and_attach,
+    dfa::Dfa,
     header::{METHOD, PATH, STATUS},
 };
 use anyhow::Result;
 use http::HeaderName;
 use std::{collections::HashMap, mem::MaybeUninit};
-use tracing::{debug, trace, warn, Level};
+use tracing::{Level, debug, trace, warn};
 use types::*;
 use xbpf::libbpf::{
-    self as libbpf_rs,
+    self as libbpf_rs, Link, MapCore, OpenObject,
     skel::{OpenSkel, Skel, SkelBuilder},
-    Link, MapCore, OpenObject,
 };
 
 /// The sequence terminating the lines of a message.
@@ -156,11 +155,11 @@ impl Parser {
 
         self.dfa
             .start_pattern(false)
-            .push(CRLF)
-            .push(name.as_str())
+            .push_ci(CRLF)
+            .push_ci(name.as_str())
             .push_optional("\t")
             .push_optional(" ")
-            .push(":")
+            .push_ci(":")
             .push_optional("\t")
             .push_optional(" ")
             .start_capturing()
@@ -212,21 +211,21 @@ impl Parser {
             self.dfa
                 .start_pattern(true)
                 .start_capturing()
-                .push_options(&methods)
+                .push_options_ci(&methods)
                 .end_capturing()
                 .push(" ")
                 .push_any(1..)
-                .push(" HTTP/1.1")
+                .push_ci(" HTTP/1.1")
                 .restart_with(CRLF);
         } else if name == &PATH {
             self.dfa
                 .start_pattern(true)
-                .push_options(&methods)
+                .push_options_ci(&methods)
                 .push(" ")
                 .start_capturing()
                 .push_any(1..)
                 .end_capturing()
-                .push(" HTTP/1.1")
+                .push_ci(" HTTP/1.1")
                 .restart_with(CRLF);
         } else {
             panic!(
@@ -243,7 +242,7 @@ impl Parser {
     fn capture_status_code(mut self) -> Parser {
         self.dfa
             .start_pattern(true)
-            .push("HTTP/1.1 ")
+            .push_ci("HTTP/1.1 ")
             .start_capturing()
             .push_any(3..=3)
             .end_capturing()
@@ -336,10 +335,7 @@ impl Parser {
             let t = new_transition(*to, action, data);
             trace!(
                 "inject; from={} to={} input={} action={:?}",
-                from.0,
-                to.0,
-                *input as u8 as char,
-                action
+                from.0, to.0, *input as u8 as char, action
             );
             data.s2ts[s][*input as usize] = t;
         }
