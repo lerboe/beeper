@@ -24,6 +24,25 @@
 // table.
 #define SETTINGS_HEADER_TABLE_SIZE 0x1
 
+// The length of a frame header, see section 4.1 of RFC 9113.
+#define H2_FRAME_HDR_LEN 9
+
+// The frame types the parser reads. Every other one is skipped.
+#define H2_HEADERS_FRAME 0x01
+#define H2_SETTINGS_FRAME 0x04
+#define H2_CONTINUATION_FRAME 0x09
+
+// The flags of a HEADERS frame that move the header block within it, and the
+// one saying that the block ends with the frame rather than carrying on into a
+// CONTINUATION frame. See sections 6.2 and 6.10 of RFC 9113.
+#define H2_END_HEADERS_FLAG 0x04
+#define H2_PADDED_FLAG 0x08
+#define H2_PRIORITY_FLAG 0x20
+
+// The number of bytes the priority of a HEADERS frame takes up, a stream
+// dependency and a weight.
+#define H2_PRIORITY_LEN 5
+
 // The HPACK static table. User space populates and freezes it when the parser
 // is attached.
 struct {
@@ -72,6 +91,13 @@ struct dynamic_table_info {
     u32 size;
     u32 max_size;
     u32 deleted;
+
+    // Whether the table has drifted from the peer's, which happens when a
+    // header block is split over frames in the middle of a field: the parser
+    // cannot address the half that is already gone, so the entry the peer adds
+    // is one it cannot mirror. A table that has drifted is neither added to nor
+    // resolved from, as its indices no longer mean what the peer means by them.
+    u32 dirty;
 };
 
 struct {
@@ -261,6 +287,34 @@ static __always_inline u32 hpack_huffman_decoded_len(const u8 *src, u16 src__sz)
     return n;
 }
 
+// The offsets of the header block of the frame at `data`, whose payload is
+// `len` bytes long. A HEADERS frame may put a pad length and a priority in
+// front of its block and pad it at the end, see section 6.2 of RFC 9113. Every
+// other frame is nothing but its payload.
+//
+// Returns 0, or -1 if the frame is too short to hold what its flags announce.
+static __always_inline int _h2_block(const u8 *data, const u8 *data_end, u32 len, u8 type, u8 flags, u16 *start, u16 *end) {
+    u32 off = H2_FRAME_HDR_LEN;
+    u32 pad_len = 0;
+
+    if (type == H2_HEADERS_FRAME) {
+        if ((flags & H2_PADDED_FLAG) != 0) {
+            if (data + off + 1 > data_end) return -1;
+            pad_len = data[off];
+            off += 1;
+        }
+
+        if ((flags & H2_PRIORITY_FLAG) != 0) off += H2_PRIORITY_LEN;
+    }
+
+    if (off + pad_len > H2_FRAME_HDR_LEN + len) return -1;
+
+    *start = off;
+    *end = H2_FRAME_HDR_LEN + len - pad_len;
+
+    return 0;
+}
+
 // Everything the parser needs of the message it walks, no matter whether that
 // message came in as an sk_msg, an sk_buff or a dynptr: the bytes to parse and
 // the connection they belong to, which is what keys the dynamic table.
@@ -393,20 +447,16 @@ static __always_inline void _next(u16 state, u8 input, u16 *next_state, u16 *act
     *action = t.action;
 }
 
-// Looks up the oldest entry of the dynamic table, i.e. the one HPACK evicts
-// first. `*entry` is NULL if the table is empty.
-static __always_inline void _get_lru_dynamic_table_entry(const struct ip4_conn *conn __arg_nonnull, struct dynamic_table_info *dt_info __arg_nonnull, struct dynamic_table_entry **entry) {
-    u32 end_idx = STATIC_TABLE_SIZE + dt_info->deleted;
-    bpf_trace("dt: getting LRU entry at index %d", end_idx);
-    struct dynamic_table_key key = _new_dynamic_table_key(conn, end_idx);
-    *entry = bpf_map_lookup_elem(&dynamic_table, &key);
-}
-
 // Looks up the field the HPACK index `idx` refers to, in the static table if it
 // is one of the first `STATIC_TABLE_SIZE` indices and in the dynamic table of
 // `conn` otherwise. `*hf` is NULL if there is no such entry.
 static __always_inline void _get_table_entry(const struct ip4_conn *conn __arg_nonnull, const struct dynamic_table_info *dt_info __arg_nonnull, u32 idx, struct header_field **hf) {
     if (idx > STATIC_TABLE_SIZE) {
+        if (dt_info->dirty) {
+            *hf = NULL;
+            return;
+        }
+
         u32 dt_idx = _get_dynamic_table_index(dt_info, idx);
         struct dynamic_table_key key = _new_dynamic_table_key(conn, dt_idx);
 
@@ -453,38 +503,48 @@ static __always_inline struct dynamic_table_info* _get_dynamic_table(const struc
         .size = 0,
         .max_size = 4096,
         .deleted = 0,
+        .dirty = 0,
     };
     bpf_map_update_elem(&dynamic_table_info, conn, &new_info, BPF_ANY);
     return bpf_map_lookup_elem(&dynamic_table_info, conn);
 }
 
-// evicts the least recently used entries from the dynamic table to make room for the new entry of size `new_entry_size`.
-// returns the number of bytes freed.
+// Evicts the oldest entries of the dynamic table until an entry of
+// `new_entry_size` fits into it, which is what section 4.4 of RFC 7541 has the
+// peer do before adding one. Returns the number of bytes freed.
+//
+// An entry that does not fit into the empty table frees all of them, and is
+// then dropped by the caller, which is what the peer does with it as well.
 __noinline __weak u32 _try_evict_dynamic_table_entries(const struct msg_ctx *ctx __arg_nonnull, struct dynamic_table_info *dt_info __arg_nonnull, u32 new_entry_size) {
     bpf_trace("dt: try evicting %dB (%d actual entries)", new_entry_size, dt_info->count);
 
     u32 freed = 0;
     bpf_repeat(dt_info->count) {
-        if (dt_info->size + new_entry_size < dt_info->max_size) break;
+        if (dt_info->size + new_entry_size <= dt_info->max_size) break;
 
-        struct dynamic_table_entry *last_entry;
-        _get_lru_dynamic_table_entry(&ctx->conn, dt_info, &last_entry);
-        if (!last_entry) {
-            bpf_error("dt: no entries");
+        // entries are stored under the running count of the ones added so far,
+        // so the oldest one that is still live sits right above the evicted
+        u32 idx = STATIC_TABLE_SIZE + dt_info->deleted;
+        struct dynamic_table_key key = _new_dynamic_table_key(&ctx->conn, idx);
+        struct dynamic_table_entry *entry = bpf_map_lookup_elem(&dynamic_table, &key);
+        if (!entry) {
+            bpf_error("dt: no entry at index %d", idx);
             break;
         }
 
-        bpf_trace("dt: evicting LRU entry");
+        bpf_trace("dt: evicting %dB entry at index %d", entry->size, idx);
+
+        // the table has to shrink as the entries go, or the loop would not know
+        // when it has freed enough
+        dt_info->size -= entry->size;
         dt_info->count--;
         dt_info->deleted++;
-        freed += last_entry->size;
+        freed += entry->size;
 
-        struct dynamic_table_key key = _new_dynamic_table_key(&ctx->conn, dt_info->count - 1);
         bpf_map_delete_elem(&dynamic_table, &key);
     }
 
     bpf_trace("dt: evicted %dB", freed);
-    dt_info->size -= freed;
 
     return freed;
 }
@@ -497,6 +557,8 @@ __noinline __weak u32 _try_evict_dynamic_table_entries(const struct msg_ctx *ctx
 // Returns 0 if the entry was added, -1 if it could not be resolved or does not
 // fit into the table even when emptied, in which case the peer drops it too.
 __noinline __weak int _add_dynamic_table_entry(const struct msg_ctx *ctx __arg_nonnull, struct dynamic_table_info *dt_info __arg_nonnull, const struct hdr_match *key __arg_nonnull, const struct hdr_match *val __arg_nonnull) {
+    if (dt_info->dirty) return -1;
+
     u8 *key_ptr = NULL;
     u32 key_len = 0;
     bool key_huff = false;
@@ -516,7 +578,7 @@ __noinline __weak int _add_dynamic_table_entry(const struct msg_ctx *ctx __arg_n
     struct dynamic_table_entry *dt_val = bpf_map_lookup_elem(&dynamic_table_entry, &per_cpu_key);
     if (!dt_val) return -1;
 
-    u32 idx = STATIC_TABLE_SIZE + dt_info->count;
+    u32 idx = STATIC_TABLE_SIZE + dt_info->count + dt_info->deleted;
     struct dynamic_table_key dt_key = _new_dynamic_table_key(&ctx->conn, idx);
 
     __builtin_memset(dt_val, 0, sizeof(*dt_val));
@@ -642,6 +704,38 @@ struct h2_parse_state {
     u8 flags;
 };
 
+// The state of a header block that carries on into a CONTINUATION frame, see
+// section 6.10 of RFC 9113.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 16384);
+    __type(key, struct ip4_conn);
+    __type(value, struct h2_parse_state);
+} continued_blocks SEC(".maps");
+
+// Returns the state a header block is read from its first byte with.
+static __always_inline struct h2_parse_state _new_h2_parse_state(void) {
+    return (struct h2_parse_state) {
+        .s = S_FIELD,
+        .k = 0,
+        .m = 0,
+        .skip = 0,
+        .is_key = false,
+        .cid = -1,
+        .add_to_dt = 0,
+        .key = {
+            .idx = 0,
+            .len = 0,
+            .in_msg = true,
+            .huff = false,
+        },
+        .i = 0,
+        .v = 0,
+        .kind = H2A_NONE,
+        .flags = 0,
+    };
+}
+
 // Runs the action of the transition `ps` holds, which is what turns the parts
 // of a field the DFA picked out into a capture, into an entry of the mirrored
 // dynamic table, or into both.
@@ -753,46 +847,25 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
 // Decodes the header block between the offsets `start` and `end` and records
 // the values of the fields whose name matches a pattern in `pres`. Fields the
 // peer adds to its dynamic table are added to the mirrored one, so that later
-// blocks can resolve the indices referring to them. `s` is the state the DFA
-// walk starts in, which for the beginning of a block is `S_FIELD`.
+// blocks can resolve the indices referring to them. `ps` is where the walk
+// picks up, which for the beginning of a block is `_new_h2_parse_state`.
 //
 // `null_prefix` is the length of the run of NUL bytes at the beginning of the
 // buffer that is to be skipped rather than parsed; it is updated as those bytes
 // are consumed. It may be NULL if the data cannot carry such a prefix.
 //
-// Returns the offset it stopped at.
-static __always_inline int _parse_hdr_from(const struct msg_ctx *ctx, u16 start, u16 end, u16 *s, struct parse_res *pres, u16 *null_prefix) {
+// Returns the offset it stopped at, which is `end` if the whole block was read.
+static __always_inline int _parse_hdr_from(const struct msg_ctx *ctx, u16 start, u16 end, struct dynamic_table_info *dt_info, struct h2_parse_state *ps, struct parse_res *pres, u16 *null_prefix) {
     const u8 *data = ctx->data;
     const u8 *data_end = ctx->data_end;
     u32 len = (u32)(data_end - data) & MAX_BYTES;
     if (end < len) len = end & MAX_BYTES;
-    if (data + 9 > data_end) return 0;
-
-    struct dynamic_table_info *dt_info = _get_dynamic_table(&ctx->conn);
-    if (!dt_info) return 0;
-
-    struct h2_parse_state ps = {
-        .s = *s,
-        .k = 0,
-        .m = 0,
-        .skip = 0,
-        .is_key = false,
-        .cid = -1,
-        .add_to_dt = 0,
-        .key = {
-            .idx = 0,
-            .len = 0,
-            .in_msg = true,
-            .huff = false,
-        },
-        .i = 0,
-        .v = 0,
-        .kind = H2A_NONE,
-        .flags = 0,
-    };
 
     u32 i = 0;
     bpf_for(i, start, len+1) {
+        // the block ends before the message does when the message carries more
+        // than one frame, so the loop cannot lean on the bounds check alone
+        if (i >= len) break;
         if (data + i + 1 > data_end) break;
         u8 c = data[i];
 
@@ -802,31 +875,31 @@ static __always_inline int _parse_hdr_from(const struct msg_ctx *ctx, u16 start,
             continue;
         }
 
-        if (ps.skip > 0) {
-            if (ps.is_key) {
+        if (ps->skip > 0) {
+            if (ps->is_key) {
                 u16 a = 0;
-                _next(ps.s, c, &ps.s, &a);
+                _next(ps->s, c, &ps->s, &a);
 
                 struct h2_action act = _action(a);
-                if (act.kind == H2A_CAPTURE) ps.cid = act.val & MAX_MATCH_MASK;
+                if (act.kind == H2A_CAPTURE) ps->cid = act.val & MAX_MATCH_MASK;
             }
 
-            ps.skip--;
+            ps->skip--;
             // the name ended, so the length of the value comes next. A value
             // ends on the transition that announced it, which already leads
             // back to `S_FIELD`
-            if (ps.skip == 0 && ps.is_key) ps.s = S_VAL_LEN;
+            if (ps->skip == 0 && ps->is_key) ps->s = S_VAL_LEN;
 
             continue;
         }
 
         u16 a = 0;
-        _next(ps.s, c, &ps.s, &a);
+        _next(ps->s, c, &ps->s, &a);
         struct h2_action act = _action(a);
 
         if (act.kind == H2A_INT_START) {
-            ps.k = act.val;
-            ps.m = 0;
+            ps->k = act.val;
+            ps->m = 0;
             continue;
         }
         if (act.kind == H2A_INT_CONT) {
@@ -834,35 +907,73 @@ static __always_inline int _parse_hdr_from(const struct msg_ctx *ctx, u16 start,
             // use, and shifting by more than the width of the accumulator is
             // not defined. Such an integer is left short, which makes the field
             // it belongs to unresolvable rather than the block unparsable
-            if (ps.m <= 28) {
-                ps.k += (u32)(c & 0x7F) << ps.m;
-                ps.m += 7;
+            if (ps->m <= 28) {
+                ps->k += (u32)(c & 0x7F) << ps->m;
+                ps->m += 7;
             }
 
             continue;
         }
 
-        ps.i = i;
-        ps.v = act.val;
+        ps->i = i;
+        ps->v = act.val;
         if ((act.flags & H2F_CONT) != 0) {
-            ps.v = ps.k;
-            if (ps.m <= 28) ps.v += (u32)(c & 0x7F) << ps.m;
+            ps->v = ps->k;
+            if (ps->m <= 28) ps->v += (u32)(c & 0x7F) << ps->m;
         }
-        ps.kind = act.kind;
-        ps.flags = act.flags;
+        ps->kind = act.kind;
+        ps->flags = act.flags;
 
-        if (_run_action(ctx, dt_info, pres, &ps) < 0) break;
+        if (_run_action(ctx, dt_info, pres, ps) < 0) break;
     }
-
-    *s = ps.s;
 
     return i;
 }
 
-// Decodes the header block carried by an sk_buff, see `_parse_hdr_from`.
-static __always_inline int _parse_skb_from(const struct __sk_buff *skb, u16 start, u16 end, u16 *s, struct parse_res *pres, u16 *null_prefix) {
-    struct msg_ctx ctx = _new_skb_ctx(skb);
-    return _parse_hdr_from(&ctx, start, end, s, pres, null_prefix);
+// Reads the header block of a HEADERS or a CONTINUATION frame, picking up where
+// the frame before it left off if the block is split over several of them.
+//
+// A field whose bytes straddle two frames has half of itself in a frame the
+// parser cannot address anymore. The block itself stays readable, as the parser
+// only has to count those bytes, but the field can neither be captured nor
+// mirrored, so the dynamic table is marked as drifted.
+//
+// Returns the offset it stopped at, see `_parse_hdr_from`.
+static __always_inline int _parse_hdr_frame(const struct msg_ctx *ctx, u16 start, u16 end, u8 type, u8 flags, struct parse_res *pres, u16 *null_prefix) {
+    struct dynamic_table_info *dt_info = _get_dynamic_table(&ctx->conn);
+    if (!dt_info) return start;
+
+    struct h2_parse_state ps = _new_h2_parse_state();
+    if (type == H2_CONTINUATION_FRAME) {
+        struct h2_parse_state *resumed = bpf_map_lookup_elem(&continued_blocks, &ctx->conn);
+        if (resumed == NULL) {
+            bpf_debug("hdr: a continuation of a block that was not followed");
+            return end;
+        }
+
+        ps = *resumed;
+    }
+
+    int res = _parse_hdr_from(ctx, start, end, dt_info, &ps, pres, null_prefix);
+
+    if ((flags & H2_END_HEADERS_FLAG) != 0) {
+        bpf_map_delete_elem(&continued_blocks, &ctx->conn);
+        return res;
+    }
+
+    if (ps.skip > 0 && !dt_info->dirty) {
+        bpf_debug("dt: a field split over two frames, the table has drifted");
+        dt_info->dirty = 1;
+    }
+
+    // the pending field belongs to the frame that is ending, so nothing of it
+    // survives into the next one
+    ps.cid = -1;
+    ps.add_to_dt = 0;
+
+    bpf_map_update_elem(&continued_blocks, &ctx->conn, &ps, BPF_ANY);
+
+    return res;
 }
 
 // Parses the frame the message starts with and describes it in `frame`, so that
@@ -881,30 +992,31 @@ int parse_msg(struct sk_msg_md *msg, struct parse_res *pres __arg_nonnull, struc
     u8 *data = (u8 *)(long)msg->data;
     u8 *data_end = (u8 *)(long)msg->data_end;
 
-    if (data + 9 > data_end) return 0;
+    if (data + H2_FRAME_HDR_LEN > data_end) return 0;
 
     u32 len = data[0] << 16 | data[1] << 8 | data[2];
     u8 type = data[3];
     u8 flags = data[4];
-    bool padded = flags & 0x08;
-    u8 hdr_len = (padded) ? 10 : 9;
+    u32 frame_len = H2_FRAME_HDR_LEN + len;
 
     *frame = _new_h2_frame(data, type, flags);
 
     bpf_debug("Parsing HTTP/2 message with length %d, type %d, flags %d", len, type, flags);
 
-    bool is_hdr = (type == 0x01);
-    bool is_stg = (type == 0x04);
+    bool is_hdr = (type == H2_HEADERS_FRAME || type == H2_CONTINUATION_FRAME);
+    bool is_stg = (type == H2_SETTINGS_FRAME);
     if (!is_hdr && !(is_stg && flags == 0)) {
-        return len + hdr_len;
+        return frame_len;
     }
 
-    if (bpf_msg_pull_data(msg, 0, len+hdr_len, 0) < 0) {
+    if (bpf_msg_pull_data(msg, 0, frame_len, 0) < 0) {
         return -(data_end - data);
     }
 
-    u16 s = S_FIELD;
     struct msg_ctx ctx = _new_msg_ctx(msg);
+
+    u16 start = 0, end = 0;
+    if (_h2_block(ctx.data, ctx.data_end, len, type, flags, &start, &end) < 0) return -1;
 
     // the entry is only ever updated below, never deleted, so the pointer
     // stays good across the parse
@@ -913,16 +1025,17 @@ int parse_msg(struct sk_msg_md *msg, struct parse_res *pres __arg_nonnull, struc
 
     int res;
     if (is_hdr) {
-        res = _parse_hdr_from(&ctx, hdr_len, len+hdr_len, &s, pres, NULL);
+        res = _parse_hdr_frame(&ctx, start, end, type, flags, pres, NULL);
     } else {
-        res = _parse_stg_from(&ctx, hdr_len, len+hdr_len, &s, pres, NULL);
+        u16 s = S_FIELD;
+        res = _parse_stg_from(&ctx, start, end, &s, pres, NULL);
     }
 
     frame->dt_count = dt_info ? dt_info->count : 0;
 
-    if (len > hdr_len + res) return -1;
+    if (res < end) return -1;
 
-    return res;
+    return frame_len;
 }
 
 // Parses the frame the packet starts with, pulling it into the linear part of
@@ -933,31 +1046,34 @@ int parse_skb(struct __sk_buff *skb, struct parse_res *pres __arg_nonnull, struc
     u8 *data = (u8 *)(long)skb->data;
     u8 *data_end = (u8 *)(long)skb->data_end;
 
-    if (data + 9 > data_end) return 0;
+    if (data + H2_FRAME_HDR_LEN > data_end) return 0;
 
     u32 len = data[0] << 16 | data[1] << 8 | data[2];
     u8 type = data[3];
     u8 flags = data[4];
-    bool padded = flags & 0x08;
-    u8 hdr_len = (padded) ? 10 : 9;
+    u32 frame_len = H2_FRAME_HDR_LEN + len;
 
     *frame = _new_h2_frame(data, type, flags);
 
     bpf_debug("Parsing HTTP/2 sk_buff with length %d, type %d, flags %d", len, type, flags);
 
-    if (type != 0x01) {
-        return len + hdr_len;
+    if (type != H2_HEADERS_FRAME && type != H2_CONTINUATION_FRAME) {
+        return frame_len;
     }
 
-    if (bpf_skb_pull_data(skb, len+hdr_len) < 0) {
+    if (bpf_skb_pull_data(skb, frame_len) < 0) {
         return -(data_end - data);
     }
 
-    u16 s = S_FIELD;
-    int res = _parse_skb_from(skb, hdr_len, len+hdr_len, &s, pres, null_prefix);
-    if (len + hdr_len > res) return -1;
+    struct msg_ctx ctx = _new_skb_ctx(skb);
 
-    return res;
+    u16 start = 0, end = 0;
+    if (_h2_block(ctx.data, ctx.data_end, len, type, flags, &start, &end) < 0) return -1;
+
+    int res = _parse_hdr_frame(&ctx, start, end, type, flags, pres, null_prefix);
+    if (res < end) return -1;
+
+    return frame_len;
 }
 
 // Parses the frame `buf_ptr` starts with. A buffer carries no connection of its
@@ -971,33 +1087,29 @@ int parse_buf(const struct bpf_dynptr *buf_ptr, struct ip4_conn *conn, struct pa
     u32 len = data[0] << 16 | data[1] << 8 | data[2];
     u8 type = data[3];
     u8 flags = data[4];
-    bool padded = flags & 0x08;
-    u8 hdr_len = (padded) ? 10 : 9;
+    u32 frame_len = H2_FRAME_HDR_LEN + len;
 
     *frame = _new_h2_frame(data, type, flags);
 
     bpf_debug("Parsing HTTP/2 buf with length %d, type %d, flags %d", len, type, flags);
 
-    if (type != 0x01) {
-        return len + hdr_len;
+    if (type != H2_HEADERS_FRAME && type != H2_CONTINUATION_FRAME) {
+        return frame_len;
     }
 
-    u32 cidx[MAX_MATCHES] = { 0 };
-    u16 s = S_FIELD;
-
-    data = bpf_dynptr_data(buf_ptr, 0, len + hdr_len);
+    data = bpf_dynptr_data(buf_ptr, 0, frame_len);
     if (data == NULL) return -1;
 
-    u8 *data_end = data + len + hdr_len;
     struct msg_ctx ctx = {
         .data = data,
-        .data_end = data_end,
+        .data_end = data + frame_len,
         .conn = *conn
     };
 
-    int res = _parse_hdr_from(&ctx, hdr_len, len+hdr_len, &s, pres, null_prefix);
+    u16 start = 0, end = 0;
+    if (_h2_block(ctx.data, ctx.data_end, len, type, flags, &start, &end) < 0) return -1;
 
-    return res;
+    return _parse_hdr_frame(&ctx, start, end, type, flags, pres, null_prefix);
 }
 
 // Reads the `idx`th entry of `conn`'s dynamic table into `out`, `idx` counted

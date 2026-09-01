@@ -400,6 +400,16 @@ pub struct DynamicTableInfo {
     /// The number of entries evicted so far. Together with `count` it turns an
     /// HPACK index into an index into the table.
     pub deleted: u32,
+
+    /// Whether the table has drifted from the peer's and can no longer be
+    /// trusted.
+    ///
+    /// It drifts when a header block is split over a HEADERS frame and the
+    /// CONTINUATION frames following it in the middle of a field, see section
+    /// 6.10 of RFC 9113: the parser cannot address the half of the field that
+    /// is in the frame before, so the entry the peer adds is one it cannot
+    /// mirror. A table that has drifted is neither added to nor resolved from.
+    pub dirty: u32,
 }
 
 unsafe impl Plain for DynamicTableInfo {}
