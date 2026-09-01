@@ -108,16 +108,11 @@ const u16 a_done = 1 << 14;
 // under the id in the low bits.
 const u16 a_start_capture = 1 << 13;
 
-// Unused: HPACK announces the length of a value, so the parser never has to
-// match its end.
-const u16 a_end_capture = 1 << 12;
-
 const u16 a_id_mask = 0x0FFF;
 
 const u16 s_any = 1;
 
-// these restrictions are needed to make the verifier happy
-#define MAX_STATES 256
+#define MAX_STATES 2048
 #define MAX_TRANS 256
 
 // The transition table of the DFA, indexed by state and input byte. User space
@@ -296,20 +291,16 @@ static __always_inline void _extract_match(const struct msg_ctx *ctx, const stru
 }
 
 // Follows the transition `input` takes out of `state`. A state that has no
-// transition for `input` falls back to the one matching any byte, and if it has
-// none either, back to `s_any`.
+// transition for `input` falls back to `s_any`.
 static __always_inline void _next(u16 state, u8 input, u16 *next_state, u16 *action) {
-    state &= 0xFF;
-    input &= 0xFF;
+    state &= MAX_STATES - 1;
+    input &= MAX_TRANS - 1;
 
     struct trans t = s2ts[state][input];
     if (t.state == 0 && t.action == 0) {
-        t = s2ts[state]['*'];
-        if (t.state == 0 && t.action == 0) {
-            *next_state = s_any;
-            *action = 0;
-            return;
-        }
+        *next_state = s_any;
+        *action = 0;
+        return;
     }
 
     *next_state = t.state;

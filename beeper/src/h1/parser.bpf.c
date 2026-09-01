@@ -35,7 +35,6 @@ const u16 s_init = 0;
 const u16 s_any = 1;
 
 
-// these restrictions are needed to make the verifier happy
 #define MAX_STATES 512
 #define MAX_TRANS 128
 
@@ -47,8 +46,8 @@ volatile const struct trans s2ts[MAX_STATES][MAX_TRANS];
 // transition for `input` falls back to the one matching any byte, and if it has
 // none either, back to `s_any`.
 static __always_inline void _next(u16 state, u8 input, u16 *next_state, u16 *action) {
-    state &= 0xFF;
-    input &= 0xFF;
+    state &= MAX_STATES - 1;
+    input &= MAX_TRANS - 1;
 
     struct trans t = s2ts[state][input];
     if (t.state == 0 && t.action == 0) {
