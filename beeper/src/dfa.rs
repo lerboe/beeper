@@ -344,13 +344,27 @@ pub(crate) struct Dfa {
 impl Dfa {
     /// Creates a DFA that holds nothing but [`INIT_STATE`] and [`ANY_STATE`].
     pub fn new() -> Dfa {
+        Dfa::with_reserved_states(2)
+    }
+
+    /// Creates a DFA that leaves the first `reserved` state ids to the caller.
+    ///
+    /// A parser that anchors its patterns at states it lays out itself, as the
+    /// HTTP/2 one anchors them at the root of its field name trie, keeps those
+    /// ids and lets the patterns take the ones above them.
+    pub fn with_reserved_states(reserved: u16) -> Dfa {
         Dfa {
             num_captures: 0,
             num_matches: 0,
-            num_states: 2,
+            num_states: reserved.max(2),
             edges: HashMap::new(),
             actions: HashMap::new(),
         }
+    }
+
+    /// Returns the number of states the DFA has, the reserved ones included.
+    pub fn num_states(&self) -> u16 {
+        self.num_states
     }
 
     /// Starts a new pattern.
@@ -361,6 +375,13 @@ impl Dfa {
     pub fn start_pattern<'a>(&'a mut self, head: bool) -> DfaBuilder<'a> {
         trace!("start_pattern; head={:?}", head);
         let state = if head { INIT_STATE } else { ANY_STATE };
+        self.start_pattern_at(state)
+    }
+
+    /// Starts a new pattern anchored at `state`, which the caller has to have
+    /// reserved with [`Dfa::with_reserved_states`].
+    pub fn start_pattern_at<'a>(&'a mut self, state: StateId) -> DfaBuilder<'a> {
+        trace!("start_pattern_at; state={:?}", state);
         DfaBuilder::new(self, state)
     }
 

@@ -1,5 +1,8 @@
 #![allow(unused_imports)]
-use crate::{Action, Dfa, StateId, autoload_and_attach, h2::create_header_maps};
+use crate::{
+    Action, Dfa, StateId, autoload_and_attach,
+    h2::{create_header_maps, hpack},
+};
 use anyhow::{Result, bail};
 use as_bytes::AsBytes;
 use httlib_huffman as huffman;
@@ -36,29 +39,21 @@ pub struct Parser {
 
 xbpf::include_bpf!("h2/parser");
 
-/// Encodes a transition the way the BPF parser reads it out of its transition
-/// table.
+/// Translates the action of a pattern into the one the BPF parser runs.
 ///
-/// An action is a bit field: the flag identifying the action occupies the high
-/// bits, the capture id the low ones.
-fn new_transition(state: StateId, action: Option<Action>, rodata: &rodata) -> trans {
-    let action = match action {
-        Some(Action::StartCapture(cid)) => {
-            rodata.a_start_capture | (cid.0 as u16) & rodata.a_id_mask
+/// A pattern only ever matches a field name, which HPACK announces the length
+/// of, so the only action an HTTP/2 pattern carries is the one starting the
+/// capture of the value that follows.
+fn new_action(action: Option<Action>) -> hpack::Action {
+    match action {
+        None => hpack::Action::NONE,
+        Some(Action::StartCapture(cid)) => hpack::Action::capture(cid.0),
+        Some(Action::Done) | Some(Action::StartCaptureAndDone(..)) => {
+            unreachable!("an h2 pattern never terminates the parse, it captures and moves on")
         }
-        Some(Action::StartCaptureAndDone(cid)) => {
-            rodata.a_done | rodata.a_start_capture | (cid.0 as u16) & rodata.a_id_mask
-        }
-        Some(Action::Done) => rodata.a_done,
         Some(Action::EndCapture(..)) | Some(Action::EndCaptureAndDone(..)) => {
             unreachable!("HPACK announces the value length, so an h2 pattern never ends a capture")
         }
-        None => 0,
-    };
-
-    trans {
-        state: state.0,
-        action,
     }
 }
 
@@ -69,7 +64,7 @@ impl Parser {
     /// Additional configuration must be done through the builder methods before calling `attach`.
     pub fn new() -> Parser {
         Parser {
-            dfa: Dfa::new(),
+            dfa: Dfa::with_reserved_states(hpack::S_RESERVED),
             parse_msg_fn: None,
             parse_buf_fn: None,
             parse_skb_fn: None,
@@ -169,7 +164,7 @@ impl Parser {
         huffman::encode(name.as_str().as_bytes(), &mut name_encoded)?;
 
         self.dfa
-            .start_pattern(false)
+            .start_pattern_at(StateId(hpack::S_NAME))
             .push_bytes(&name_encoded)
             .capture();
 
@@ -311,15 +306,61 @@ impl Parser {
         })
     }
 
-    /// Writes the transition table of the DFA into the read-only data of the
-    /// parser program. This has to happen before the program is loaded, as the
-    /// kernel freezes the section afterwards.
+    /// Writes the transition table of the DFA and the actions its transitions
+    /// carry into the read-only data of the parser program. This has to happen
+    /// before the program is loaded, as the kernel freezes the section
+    /// afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the patterns do not fit into the tables the parser
+    /// program reserves for them.
     fn inject(&self, skel: &mut OpenParserSkel) -> Result<()> {
+        let mut table = hpack::Table::new();
         for (from, to, input, action) in self.dfa.iter_transitions() {
-            let s = from.0 as usize;
-            let data = skel.maps.rodata_data.as_mut().unwrap();
-            let t = new_transition(*to, action, data);
-            data.s2ts[s][*input as usize] = t;
+            table.push_edge(from.0, *input, to.0, new_action(action));
+        }
+
+        let Some(data) = skel.maps.rodata_data.as_mut() else {
+            bail!("the parser program has no read-only data to inject into");
+        };
+
+        let num_states = self.dfa.num_states() as usize;
+        if num_states > data.s2ts.len() {
+            bail!(
+                "the patterns take {num_states} states, the parser holds {}",
+                data.s2ts.len()
+            );
+        }
+
+        let num_actions = table.actions().len();
+        if num_actions > data.a2as.len() {
+            bail!(
+                "the patterns take {num_actions} actions, the parser holds {}",
+                data.a2as.len()
+            );
+        }
+
+        for hpack::Edge {
+            from,
+            input,
+            to,
+            action,
+        } in table.edges()
+        {
+            data.s2ts[*from as usize][*input as usize] = trans {
+                state: *to,
+                action: *action,
+            };
+        }
+
+        for (i, action) in table.actions().iter().enumerate() {
+            let (kind, flags) = action.encode();
+            data.a2as[i] = h2_action {
+                val: action.val,
+                kind,
+                flags,
+            };
         }
 
         Ok(())

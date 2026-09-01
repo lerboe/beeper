@@ -9,26 +9,6 @@
 // dynamic table so that fields which are only referenced by index can be
 // resolved as well.
 
-// The part of a header field the parser is currently reading. HPACK encodes a
-// field as a sequence of integers and strings, and the parser needs to know
-// which one it is looking at to interpret the bytes it reads.
-enum h2_parse_state {
-    // integers
-    H2_IDX = 0,
-    H2_KEY_LEN = 1,
-    H2_VAL_LEN = 2,
-
-    // strings
-    H2_KEY = 3,
-    H2_VAL = 4,
-};
-
-// Whether the parser is reading a string rather than an integer.
-#define PS_IS_STR(ps) (ps > H2_VAL_LEN)
-
-// The state reading the string a length integer announces.
-#define PS_LEN_TO_STR(ps) (ps + 2)
-
 // The number of bytes of a name or a value that are kept in a table entry.
 // Longer fields are truncated, which bounds the copies for the verifier.
 // `header_field`, which both tables are made of, is declared in beeper.h so
@@ -101,23 +81,126 @@ struct {
 	__type(value, struct dynamic_table_info);
 } dynamic_table_info SEC(".maps");
 
-// Parsing is complete, the rest of the message is not a header anymore.
-const u16 a_done = 1 << 14;
+// The states the shape of a header field representation is walked with. HPACK
+// spells a field out as a sequence of integers and strings, and which one comes
+// next is decided by the bytes read so far, so it is the DFA that keeps track
+// of it rather than the parser.
+//
+// User space fills the rows of `s2ts` these index, and hands out the ids from
+// `S_RESERVED` on to the states of the field name trie. They must stay in sync
+// with the state ids of h2/hpack.rs.
 
-// The value of the field whose name the DFA just matched is to be captured
-// under the id in the low bits.
-const u16 a_start_capture = 1 << 13;
+// A field name that matched no pattern. It carries no transition of its own, so
+// the parser stays in it until the name it is reading ends.
+#define S_DEAD 2
 
-const u16 a_id_mask = 0x0FFF;
+// At the first byte of a field representation.
+#define S_FIELD 3
 
-const u16 s_any = 1;
+// At the first byte of the length of a field name, respectively of a value.
+#define S_KEY_LEN 4
+#define S_VAL_LEN 5
 
-#define MAX_STATES 2048
+// The root of the trie of the field names to capture.
+#define S_NAME 6
+
+// The continuation of an integer that did not fit into the prefix of its first
+// byte. There is one state per representation, as what the integer means
+// differs, and one per Huffman bit for the lengths, as that bit is announced by
+// the first byte but is only recorded once the last one has been read.
+#define S_IDX7_CONT 7
+#define S_IDX6_CONT 8
+#define S_IDX4_CONT 9
+#define S_STG_CONT 10
+#define S_KEY_LEN_CONT 11
+#define S_KEY_LEN_CONT_HUFF 12
+#define S_VAL_LEN_CONT 13
+#define S_VAL_LEN_CONT_HUFF 14
+
+// The number of state ids the ones above reserve.
+#define S_RESERVED 15
+
+// What the parser does upon taking a transition. Must stay in sync with the
+// action kinds of h2/hpack.rs.
+
+// Nothing.
+#define H2A_NONE 0
+
+// A field spelled out by nothing but an index: `val` addresses the entry of the
+// static or the dynamic table both its name and its value are read from.
+#define H2A_INDEXED 1
+
+// A field whose name is an index and whose value is spelled out: `val`
+// addresses the entry the name is read from.
+#define H2A_IDX_NAME 2
+
+// A field whose name is spelled out as well.
+#define H2A_LIT_NAME 3
+
+// The length of a field name, respectively of a value: `val` counts the bytes
+// it occupies on the wire.
+#define H2A_KEY_LEN 4
+#define H2A_VAL_LEN 5
+
+// A dynamic table size update: `val` is the size the peer resizes to.
+#define H2A_TABLE_SIZE 6
+
+// The first byte of an integer that does not fit into the prefix of that byte:
+// `val` is the prefix maximum the integer is counted from.
+#define H2A_INT_START 7
+
+// A byte of such an integer that is not its last one either.
+#define H2A_INT_CONT 8
+
+// The name of the field being read just matched a pattern, `val` being the id
+// its value is to be captured under.
+#define H2A_CAPTURE 9
+
+// The representation is malformed. There is no telling where the next field
+// starts, so the rest of the block is dropped.
+#define H2A_ERR 10
+
+// The string the action describes is Huffman coded.
+#define H2F_HUFF (1 << 0)
+
+// The field the action describes is added to the dynamic table.
+#define H2F_ADD_DT (1 << 1)
+
+// The integer the action describes is spread over several bytes, so it is to be
+// read out of the accumulator rather than out of `val`.
+#define H2F_CONT (1 << 2)
+
+// A single action of the DFA. `val` is an index, a length or a table size,
+// depending on `kind`.
+//
+// Actions are kept in a table of their own because they do not fit into the 16
+// bits `struct trans` carries; the action of a transition is the index of its
+// entry. Keeping them on the transition rather than on the state it leads to is
+// what keeps the automaton small: every index a representation can carry is a
+// transition of its own, but all of them lead to the same handful of states.
+struct h2_action {
+    u16 val;
+    u8 kind;
+    u8 flags;
+};
+
+// these restrictions are needed to make the verifier happy. All three are
+// masked onto an index, so all three have to be powers of two.
+#define MAX_STATES 1024
 #define MAX_TRANS 256
+#define MAX_ACTIONS 1024
 
-// The transition table of the DFA, indexed by state and input byte. User space
-// fills it in before the program is loaded, after which it is read-only.
+// The transition table of the DFA, indexed by state and input byte, and the
+// actions its transitions carry. User space fills both in before the program is
+// loaded, after which they are read-only.
 volatile const struct trans s2ts[MAX_STATES][MAX_TRANS];
+volatile const struct h2_action a2as[MAX_ACTIONS];
+
+// Reads the action a transition carries. Transition 0 is the one a state
+// without a transition for the byte it read falls back to, and carries none.
+static __always_inline struct h2_action _action(u16 id) {
+    return a2as[id & (MAX_ACTIONS - 1)];
+}
 
 // The length of the longest code of the HPACK Huffman code.
 #define HPACK_HUFF_MAXLEN 30
@@ -291,99 +374,23 @@ static __always_inline void _extract_match(const struct msg_ctx *ctx, const stru
 }
 
 // Follows the transition `input` takes out of `state`. A state that has no
-// transition for `input` falls back to `s_any`.
+// transition for `input` falls back to `S_DEAD`, which has none either: the
+// rows the shape of a representation is walked with carry a transition per
+// byte, so this only happens while a field name is being read, and a name that
+// took a byte no pattern has cannot match one anymore.
 static __always_inline void _next(u16 state, u8 input, u16 *next_state, u16 *action) {
     state &= MAX_STATES - 1;
     input &= MAX_TRANS - 1;
 
     struct trans t = s2ts[state][input];
     if (t.state == 0 && t.action == 0) {
-        *next_state = s_any;
+        *next_state = S_DEAD;
         *action = 0;
         return;
     }
 
     *next_state = t.state;
     *action = t.action;
-}
-
-// The number of bits the first byte of a field representation carries the
-// integer in, indexed by its top nibble. It is what identifies the
-// representation as well: 7 bits for an indexed field, 6 for a literal that is
-// added to the dynamic table, 5 for a table size update and 4 for a literal
-// that is not indexed.
-static const u8 hpack_prefix_len[16] = {
-    4, 4, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7
-};
-
-// Moves on to the part of the field that follows the one that just ended, `c`
-// being its first byte. `n` is set to the prefix length of the integer to read
-// next, `j` to the number of bytes still to read and `k` is cleared, ready to
-// take the next integer.
-//
-// A field is either fully indexed, in which case the next byte starts a new
-// field, or it spells out its value, and possibly its name, which is what the
-// index of 0 and the representations with a 6 or 4 bit prefix indicate.
-static __always_inline int _next_hpack(u8 c, enum h2_parse_state *ps __arg_nonnull, u32 *n __arg_nonnull, u32 *k __arg_nonnull, u8 *j __arg_nonnull) {
-    if (*ps == H2_KEY_LEN || *ps == H2_VAL_LEN) {
-        *ps = PS_LEN_TO_STR(*ps);
-        *j = *k-1;
-        *n = 0;
-    }
-    else if (*ps == H2_IDX && *k == 0 && (*n == 6 || *n == 4)) {
-        *ps = H2_KEY_LEN;
-        *j = 0;
-        *n = 7;
-    }
-    else if ((*ps == H2_IDX && (*n == 6 || *n == 4)) || *ps == H2_KEY) {
-        *ps = H2_VAL_LEN;
-        *j = 0;
-        *n = 7;
-    }
-    else {
-        *ps = H2_IDX;
-        *j = 0;
-        *n = hpack_prefix_len[c >> 4];
-    }
-
-    *k = 0;
-
-    return 0;
-}
-
-// Feeds the byte `c` to the HPACK decoder. `ps` is the part of the field being
-// read, `k` the integer that is being accumulated, i.e. an index or the length
-// of a string, `n` the number of bits its first byte carries and `m` the shift
-// of the continuation byte to come. `j` counts the bytes still to read, which
-// for an integer is only ever 0 or 1, as its continuation is announced by the
-// top bit of every byte.
-//
-// A caller that finds `j` back at 0 with `ps` at an integer state has just read
-// the last byte of that integer, and one that finds `ps` at a string state has
-// just read a byte of the string.
-static __always_inline void _parse_hpack(u8 c, enum h2_parse_state *ps, u32 *n, u32 *m, u32 *k, u8 *j, bool *huff) {
-    if (*j > 0) {
-        if (PS_IS_STR(*ps)) {
-            *j -= 1;
-        }
-        else {
-            *k += (c & 127) * (1 << *m);
-            *m += 7;
-            *j = ((c & 128) == 128);
-        }
-
-        return;
-    }
-
-    _next_hpack(c, ps, n, k, j);
-    *m = 0;
-
-    if (!PS_IS_STR(*ps)) {
-        u8 mask = (1 << *n) - 1;
-        *k = c & mask;
-        *j = (*k == mask);
-        *huff = (c & 0x80) != 0;
-    }
 }
 
 // Looks up the oldest entry of the dynamic table, i.e. the one HPACK evicts
@@ -414,20 +421,21 @@ static __always_inline void _get_table_entry(const struct ip4_conn *conn __arg_n
     }
 }
 
-// Walks the DFA over `key`, the Huffman encoded name of a field the peer only
-// referenced by index, and returns the id of the capture it matched, or -1 if
-// the name matches no pattern. `s` is left in the state the walk ended in.
-static __always_inline s8 _match_header_key(const u8 *key __arg_nonnull, u16 key__sz, u16 *s __arg_nonnull) {
-    u8 j = 0;
-    u16 a = 0;
+// Walks the name trie over `key`, the name of a field the peer only referenced
+// by index, and returns the id of the capture it matched, or -1 if the name
+// matches no pattern.
+//
+// It is only reached through `_run_action`, so the walk is verified once rather
+// than as part of every byte of the block the parser reads.
+static __always_inline int _match_header_key(const u8 *key __arg_nonnull, u16 key__sz) {
+    u16 s = S_NAME;
+    u16 j = 0;
     bpf_for(j, 0, key__sz) {
-        u8 c = key[j];
-        _next(*s, c, s, &a);
+        u16 a = 0;
+        _next(s, key[j], &s, &a);
 
-        if ((a & a_start_capture) != 0) {
-            u8 cid = a & a_id_mask & MAX_MATCH_MASK;
-            return cid;
-        }
+        struct h2_action act = _action(a);
+        if (act.kind == H2A_CAPTURE) return act.val & MAX_MATCH_MASK;
     }
 
     return -1;
@@ -598,11 +606,155 @@ static __always_inline int _parse_stg_from(const struct msg_ctx *ctx, u16 start,
     return i;
 }
 
+// Everything the parser carries from one byte of a header block to the next,
+// along with the transition it is about to run. The DFA holds the shape of a
+// representation, so what is left is the integer a multi byte length or index
+// accumulates into, how many bytes of the string that was announced are still
+// to come, and the field being assembled out of the two.
+struct h2_parse_state {
+    // the state of the DFA
+    u16 s;
+
+    // the integer being accumulated and the shift of its next byte
+    u32 k;
+    u32 m;
+
+    // the bytes of the string that was announced that are still to be read, and
+    // whether they are a name, which is walked so that it can match a pattern,
+    // rather than a value, which is only counted
+    u32 skip;
+    bool is_key;
+
+    // the capture the name of the field being read matched, or -1
+    s8 cid;
+
+    // whether the peer adds the field being read to its dynamic table
+    u8 add_to_dt;
+
+    // the name of that field
+    struct hdr_match key;
+
+    // the offset of the byte being read, and the action and the integer of the
+    // transition it took
+    u32 i;
+    u32 v;
+    u8 kind;
+    u8 flags;
+};
+
+// Runs the action of the transition `ps` holds, which is what turns the parts
+// of a field the DFA picked out into a capture, into an entry of the mirrored
+// dynamic table, or into both.
+//
+// It is a program of its own so that it is verified once rather than as part of
+// every byte of the block the parser reads.
+//
+// Returns 0, or -1 if the block cannot be read any further.
+__noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struct dynamic_table_info *dt_info __arg_nonnull, struct parse_res *pres __arg_nonnull, struct h2_parse_state *ps __arg_nonnull) {
+    u32 v = ps->v & MAX_BYTES;
+
+    bpf_trace("hdr: %d: kind %d, val %d", ps->i, ps->kind, v);
+
+    // a name that is an index has to be read out of a table before it can be
+    // matched. Both representations that carry one are handled here, so that the
+    // walk over the entry is only built into the program once
+    if (ps->kind == H2A_INDEXED || ps->kind == H2A_IDX_NAME) {
+        ps->add_to_dt = (ps->flags & H2F_ADD_DT) != 0;
+        ps->cid = -1;
+        ps->key = (struct hdr_match) {
+            .idx = v,
+            .len = 0,
+            .in_msg = false,
+            .huff = false,
+        };
+
+        struct header_field *hf = NULL;
+        _get_table_entry(&ctx->conn, dt_info, v, &hf);
+        if (hf == NULL) return 0;
+
+        int mid = _match_header_key(hf->key, hf->key_len & HEADER_FIELD_MASK);
+        if (mid < 0) return 0;
+
+        if (ps->kind == H2A_IDX_NAME) {
+            ps->cid = mid;
+            return 0;
+        }
+
+        // both halves of the field are in the table, so the value is reported
+        // as the index it is to be read back with
+        pres->ms[mid & MAX_MATCH_MASK] = (struct hdr_match) {
+            .idx = v,
+            .len = HEADER_FIELD_MASK,
+            .in_msg = false,
+            .huff = false,
+        };
+
+        return 0;
+    }
+
+    if (ps->kind == H2A_LIT_NAME) {
+        ps->add_to_dt = (ps->flags & H2F_ADD_DT) != 0;
+        ps->cid = -1;
+        return 0;
+    }
+
+    if (ps->kind == H2A_KEY_LEN) {
+        ps->key = (struct hdr_match) {
+            .idx = ps->i + 1,
+            .len = v,
+            .in_msg = true,
+            .huff = (ps->flags & H2F_HUFF) != 0,
+        };
+
+        ps->skip = v;
+        ps->is_key = true;
+        if (v == 0) ps->s = S_VAL_LEN;
+
+        return 0;
+    }
+
+    if (ps->kind == H2A_VAL_LEN) {
+        struct hdr_match val = (struct hdr_match) {
+            .idx = ps->i + 1,
+            .len = v,
+            .in_msg = true,
+            .huff = (ps->flags & H2F_HUFF) != 0,
+        };
+
+        if (ps->add_to_dt) {
+            _add_dynamic_table_entry(ctx, dt_info, &ps->key, &val);
+        }
+
+        if (ps->cid >= 0) {
+            pres->ms[ps->cid & MAX_MATCH_MASK] = val;
+            ps->cid = -1;
+        }
+
+        ps->skip = v;
+        ps->is_key = false;
+
+        return 0;
+    }
+
+    if (ps->kind == H2A_TABLE_SIZE) {
+        bpf_debug("hdr: table size update: %u", v);
+        dt_info->max_size = v;
+        return 0;
+    }
+
+    if (ps->kind == H2A_ERR) {
+        bpf_debug("hdr: malformed representation at %d", ps->i);
+        return -1;
+    }
+
+    return 0;
+}
+
 // Decodes the header block between the offsets `start` and `end` and records
 // the values of the fields whose name matches a pattern in `pres`. Fields the
 // peer adds to its dynamic table are added to the mirrored one, so that later
 // blocks can resolve the indices referring to them. `s` is the state the DFA
-// walk over the field names starts in.
+// walk starts in, which for the beginning of a block is `S_FIELD`.
 //
 // `null_prefix` is the length of the run of NUL bytes at the beginning of the
 // buffer that is to be skipped rather than parsed; it is updated as those bytes
@@ -616,26 +768,30 @@ static __always_inline int _parse_hdr_from(const struct msg_ctx *ctx, u16 start,
     if (end < len) len = end & MAX_BYTES;
     if (data + 9 > data_end) return 0;
 
-    u8 type = data[3];
-    u8 flags = data[4];
-    u32 stream_id = data[5] << 24 | data[6] << 16 | data[7] << 8 | data[8];
-
     struct dynamic_table_info *dt_info = _get_dynamic_table(&ctx->conn);
     if (!dt_info) return 0;
 
-    u32 n = 0, m = 0, i = 0, k = 0;
-    u8 j = 0;
-    s8 cid = -1;
-    u8 add_to_dt = 0;
-    bool huff = false;
-    enum h2_parse_state ps = H2_IDX;
-    struct hdr_match key = {
-        .idx = 0,
-        .len = 0,
-        .in_msg = true,
-        .huff = false,
+    struct h2_parse_state ps = {
+        .s = *s,
+        .k = 0,
+        .m = 0,
+        .skip = 0,
+        .is_key = false,
+        .cid = -1,
+        .add_to_dt = 0,
+        .key = {
+            .idx = 0,
+            .len = 0,
+            .in_msg = true,
+            .huff = false,
+        },
+        .i = 0,
+        .v = 0,
+        .kind = H2A_NONE,
+        .flags = 0,
     };
 
+    u32 i = 0;
     bpf_for(i, start, len+1) {
         if (data + i + 1 > data_end) break;
         u8 c = data[i];
@@ -646,68 +802,59 @@ static __always_inline int _parse_hdr_from(const struct msg_ctx *ctx, u16 start,
             continue;
         }
 
-        _parse_hpack(c, &ps, &n, &m, &k, &j, &huff);
-        bpf_trace("hdr: hpack idx: %d, ps: %d, n: %d, k: %d, j: %d", i, ps, n, k, j);
+        if (ps.skip > 0) {
+            if (ps.is_key) {
+                u16 a = 0;
+                _next(ps.s, c, &ps.s, &a);
 
-        if (j != 0 && !PS_IS_STR(ps)) continue;
-        if (ps == H2_IDX) {
-            add_to_dt = (u8)(n == 6);
-            *s = s_any;
-            struct header_field *hf;
-            _get_table_entry(&ctx->conn, dt_info, k, &hf);
-            if (hf == NULL) {
-                cid = -1;
-                continue;
+                struct h2_action act = _action(a);
+                if (act.kind == H2A_CAPTURE) ps.cid = act.val & MAX_MATCH_MASK;
             }
 
-            cid = _match_header_key(hf->key, hf->key_len, s);
-            if (cid >= 0) {
-                // check if we are replacing the exisiting entry, or taking
-                // the one in the table
-                if (n == 7) {
-                    pres->ms[cid & MAX_MATCH_MASK] = (struct hdr_match) {
-                        .idx = k,
-                        .len = HEADER_FIELD_MASK,
-                        .in_msg = false,
-                        .huff = false,
-                    };
-                }
-            }
-            key.idx = k;
-            key.in_msg = false;
+            ps.skip--;
+            // the name ended, so the length of the value comes next. A value
+            // ends on the transition that announced it, which already leads
+            // back to `S_FIELD`
+            if (ps.skip == 0 && ps.is_key) ps.s = S_VAL_LEN;
+
+            continue;
         }
-        else if (ps == H2_KEY_LEN) {
-            key.idx = i + 1;
-            key.len = k;
-            key.in_msg = true;
-            key.huff = huff;
-        }
-        else if (ps == H2_KEY) {
-            u16 a = 0;
-            _next(*s, c, s, &a);
 
-            if ((a & a_start_capture) != 0) {
-                cid = a & a_id_mask & MAX_MATCH_MASK;
-            }
-        }
-        else if (ps == H2_VAL_LEN) {
-            struct hdr_match val = (struct hdr_match) {
-                .idx = i + 1,
-                .len = k,
-                .in_msg = true,
-                .huff = huff,
-            };
+        u16 a = 0;
+        _next(ps.s, c, &ps.s, &a);
+        struct h2_action act = _action(a);
 
-            if (add_to_dt) {
-                _add_dynamic_table_entry(ctx, dt_info, &key, &val);
+        if (act.kind == H2A_INT_START) {
+            ps.k = act.val;
+            ps.m = 0;
+            continue;
+        }
+        if (act.kind == H2A_INT_CONT) {
+            // an integer wider than the longest block the parser reads is of no
+            // use, and shifting by more than the width of the accumulator is
+            // not defined. Such an integer is left short, which makes the field
+            // it belongs to unresolvable rather than the block unparsable
+            if (ps.m <= 28) {
+                ps.k += (u32)(c & 0x7F) << ps.m;
+                ps.m += 7;
             }
 
-            if (cid >= 0) {
-                pres->ms[cid & MAX_MATCH_MASK] = val;
-                cid = -1;
-            }
+            continue;
         }
+
+        ps.i = i;
+        ps.v = act.val;
+        if ((act.flags & H2F_CONT) != 0) {
+            ps.v = ps.k;
+            if (ps.m <= 28) ps.v += (u32)(c & 0x7F) << ps.m;
+        }
+        ps.kind = act.kind;
+        ps.flags = act.flags;
+
+        if (_run_action(ctx, dt_info, pres, &ps) < 0) break;
     }
+
+    *s = ps.s;
 
     return i;
 }
@@ -756,7 +903,7 @@ int parse_msg(struct sk_msg_md *msg, struct parse_res *pres __arg_nonnull, struc
         return -(data_end - data);
     }
 
-    u16 s = s_any;
+    u16 s = S_FIELD;
     struct msg_ctx ctx = _new_msg_ctx(msg);
 
     // the entry is only ever updated below, never deleted, so the pointer
@@ -806,7 +953,7 @@ int parse_skb(struct __sk_buff *skb, struct parse_res *pres __arg_nonnull, struc
         return -(data_end - data);
     }
 
-    u16 s = s_any;
+    u16 s = S_FIELD;
     int res = _parse_skb_from(skb, hdr_len, len+hdr_len, &s, pres, null_prefix);
     if (len + hdr_len > res) return -1;
 
@@ -836,7 +983,7 @@ int parse_buf(const struct bpf_dynptr *buf_ptr, struct ip4_conn *conn, struct pa
     }
 
     u32 cidx[MAX_MATCHES] = { 0 };
-    u16 s = s_any;
+    u16 s = S_FIELD;
 
     data = bpf_dynptr_data(buf_ptr, 0, len + hdr_len);
     if (data == NULL) return -1;

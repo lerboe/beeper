@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
+mod hpack;
 mod parser;
 pub use parser::{AttachedParser, Parser, ip4_addr, ip4_conn};
 
