@@ -66,5 +66,4 @@ jobs:
             - name: Run HTTP/1.1 tests
               run: cargo test --profile=${{ matrix.profile }} --locked --verbose -p beeper --test h1 -- --include-ignored
             - name: Run HTTP/2 tests
-              if: matrix.os == 'ubuntu-26.04'
               run: cargo test --profile=${{ matrix.profile }} --locked --verbose -p beeper --test h2 -- --include-ignored

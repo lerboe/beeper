@@ -19,7 +19,7 @@ Beeper (BEEline's ParsER) is an application-layer parser for eBPF. It allows you
 Protocol      | Status  | Minimal Kernel Version
 ------------- | ------- | ----------------------
 HTTP/1.1      | ✅      | 6.8
-HTTP/2        | ✅      | 7.0
+HTTP/2        | ✅      | 6.8
 gRPC          | WIP     | 
 
 ## Build

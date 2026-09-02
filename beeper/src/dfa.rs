@@ -1,18 +1,29 @@
-use crate::{Action, CaptureId, MatchId, StateId};
-use std::{collections::HashMap, ops::RangeBounds};
+use crate::StateId;
+use std::{collections::HashMap, fmt::Debug, ops::RangeBounds};
 use tracing::trace;
 
 /// The state a message is parsed from. Only patterns that must appear at the
 /// very beginning of a message are anchored here.
-const INIT_STATE: StateId = StateId(0);
+pub const INIT_STATE: StateId = StateId(0);
 
 /// The state input that matches no pattern leads back to. Patterns that may
 /// appear anywhere in the header block are anchored here.
-const ANY_STATE: StateId = StateId(1);
+pub const ANY_STATE: StateId = StateId(1);
 
 /// The input a state matches any byte with. The parser only follows it if the
 /// state has no transition for the byte it read.
 const ANY_INPUT: u8 = '*' as u8;
+
+/// A single transition of a [`Dfa`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Edge<A: PartialEq + Eq> {
+    /// The state the transition leads to.
+    to: StateId,
+
+    /// The action it carries, if it carries one of its own rather than the one
+    /// of the state it leads to.
+    action: Option<A>,
+}
 
 /// Builds a single pattern into a [`Dfa`].
 ///
@@ -20,8 +31,8 @@ const ANY_INPUT: u8 = '*' as u8;
 /// inserting states and edges as it goes. Patterns share their states, so
 /// pushing an input another pattern already pushed reuses its state instead of
 /// creating a new one.
-pub struct DfaBuilder<'a> {
-    dfa: &'a mut Dfa,
+pub struct DfaBuilder<'a, A: Copy + Debug + PartialEq + Eq> {
+    dfa: &'a mut Dfa<A>,
 
     /// The state the pattern has been built up to.
     state: StateId,
@@ -31,49 +42,66 @@ pub struct DfaBuilder<'a> {
     /// the state it branched off of.
     optional_prefixes: Vec<(String, bool)>,
 
-    /// The capture the next input starts, if any.
-    start_capture: Option<CaptureId>,
-
-    /// The capture [`DfaBuilder::end_capturing`] closes, if a capture is open.
-    end_capture: Option<CaptureId>,
+    /// All edges that lead into [`DfaBuilder::state`].
+    last_edges: Vec<(StateId, u8, bool)>,
 }
 
-impl DfaBuilder<'_> {
-    fn new(dfa: &mut Dfa, state: StateId) -> DfaBuilder<'_> {
+impl<A: Copy + Debug + PartialEq + Eq> DfaBuilder<'_, A> {
+    fn new(dfa: &mut Dfa<A>, state: StateId) -> DfaBuilder<'_, A> {
         DfaBuilder {
             dfa,
             state,
             optional_prefixes: Vec::new(),
-            start_capture: None,
-            end_capture: None,
+            last_edges: Vec::new(),
         }
     }
 
-    /// Appends a single input to the pattern, first building the optional
-    /// prefixes that were pushed since the last input and starting a capture if
-    /// one is pending.
-    fn push_edge(&mut self, input: u8, to: Option<StateId>, case_sensitive: bool) {
+    /// Attaches `action` to every transition that leads into the state the
+    /// pattern has been built up to.
+    pub fn with(&mut self, action: A) -> &mut Self {
+        trace!("with; state={:?}, action={:?}", self.state, action);
+
+        // an optional prefix loops back into the current state, so it is one of
+        // the routes into it and has to carry the action too
+        self.push_optional_prefixes();
+
+        for (from, input, case_sensitive) in self.last_edges.clone() {
+            if case_sensitive {
+                self.dfa.add_action(from, input, action);
+            } else {
+                self.dfa
+                    .add_action(from, input.to_ascii_lowercase(), action);
+                self.dfa
+                    .add_action(from, input.to_ascii_uppercase(), action);
+            }
+        }
+
+        self
+    }
+
+    /// Builds the optional prefixes that were pushed since the last input, each
+    /// of them leading back into the state the pattern has been built up to.
+    fn push_optional_prefixes(&mut self) {
         let start = self.state;
         while let Some((optional, case_sensitive)) = self.optional_prefixes.pop() {
             let mut from = start;
             for (i, b) in optional.as_bytes().iter().enumerate() {
                 let to = if i == optional.len() - 1 {
+                    self.last_edges.push((from, *b, case_sensitive));
                     Some(start)
                 } else {
                     None
                 };
+
                 from = self.push_edge_from(from, *b, to, case_sensitive);
             }
         }
+    }
 
-        if let Some(id) = self.start_capture.take() {
-            trace!("start_capturing; state={:?}, cid={:?} ", self.state, id);
-
-            if self.state != INIT_STATE {
-                self.dfa.add_action(self.state, Action::StartCapture(id));
-            }
-            self.end_capture = Some(id);
-        }
+    /// Appends a single input to the pattern, first building the optional
+    /// prefixes that were pushed since the last input.
+    fn push_edge(&mut self, input: u8, to: Option<StateId>, case_sensitive: bool) {
+        self.push_optional_prefixes();
 
         trace!(
             "push_edge; state={:?}, input={}, to={:?}",
@@ -82,12 +110,15 @@ impl DfaBuilder<'_> {
             to
         );
 
+        let start = self.state;
         self.state = self.push_edge_from(start, input, to, case_sensitive);
+        self.last_edges = vec![(start, input, case_sensitive)];
     }
 
-    /// Inserts an edge for both the lower and the upper case of `input` and
-    /// returns the state they lead to. If `to` is `None`, the edge leads to the
-    /// state the DFA already has for `input`, or to a new one.
+    /// Inserts an edge for both the lower and the upper case of `input`,
+    /// carrying `action`, and returns the state they lead to. If `to` is
+    /// `None`, the edge leads to the state the DFA already has for `input`, or
+    /// to a new one.
     fn push_edge_from(
         &mut self,
         from: StateId,
@@ -97,7 +128,7 @@ impl DfaBuilder<'_> {
     ) -> StateId {
         let to = to.unwrap_or(self.dfa.next_state(&from, &input));
 
-        self.dfa.insert_edge(from, input, to);
+        self.dfa.insert_edge(from, input, to, None);
         if !case_sensitive {
             let other_case = if input.is_ascii_lowercase() {
                 input.to_ascii_uppercase()
@@ -105,7 +136,7 @@ impl DfaBuilder<'_> {
                 input.to_ascii_lowercase()
             };
             if other_case != input {
-                self.dfa.insert_edge(from, other_case, to);
+                self.dfa.insert_edge(from, other_case, to, None);
             }
         }
 
@@ -166,18 +197,15 @@ impl DfaBuilder<'_> {
             self.optional_prefixes.push((prefix, true));
         }
 
+        // the loop leads back into the state the repetition ends in, so it is
+        // one of the routes into it
         if matches!(range.end_bound(), std::ops::Bound::Unbounded) {
             self.push_edge_from(self.state, ANY_INPUT, Some(self.state), true);
+            self.last_edges.push((self.state, ANY_INPUT, true));
         }
 
         self
     }
-
-    /// Pushes one branch per input onto the [`Dfa`]. One of the branches
-    /// must be matched case sensitively for the [`Dfa`] to reach a final state.
-    // pub fn push_options(&mut self, inputs: &[&str]) -> &mut Self {
-    //     self.push_options_inner(inputs, true)
-    // }
 
     /// Same as [`push_options`], but case insensitive.
     pub fn push_options_ci(&mut self, inputs: &[&str]) -> &mut Self {
@@ -194,6 +222,10 @@ impl DfaBuilder<'_> {
         let start = self.state;
         self.push_inner(longest.as_bytes(), case_sensitive);
         let final_state = self.state;
+
+        // every option ends in the same state, so every one of them is a route
+        // into it
+        let mut last_edges = std::mem::take(&mut self.last_edges);
 
         trace!(
             "push_options; state={:?}, longest={}, final_state={:?}",
@@ -214,7 +246,11 @@ impl DfaBuilder<'_> {
                 };
                 self.push_edge(*b, to, case_sensitive);
             }
+
+            last_edges.append(&mut self.last_edges);
         }
+
+        self.last_edges = last_edges;
 
         self
     }
@@ -222,65 +258,6 @@ impl DfaBuilder<'_> {
     /// Appends `input` to the pattern, but allows it to be skipped.
     pub fn push_optional(&mut self, input: &str) -> &mut Self {
         self.optional_prefixes.push((input.to_string(), true));
-        self
-    }
-
-    /// Same as [`push_optional`], but case-insensitive.
-    // pub fn push_optional_ci(&mut self, input: &str) -> &mut Self {
-    //     self.optional_prefixes.push((input.to_string(), false));
-    //     self
-    // }
-
-    /// Starts capturing at the next input pushed onto the pattern.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a capture has already been started but not yet pushed.
-    pub fn start_capturing(&mut self) -> &mut Self {
-        assert!(self.start_capture.is_none());
-        let cid = self.dfa.new_capture();
-
-        self.start_capture = Some(cid);
-
-        self
-    }
-
-    /// Starts capturing at the state the pattern has been built up to, rather
-    /// than at the next input pushed onto it.
-    ///
-    /// It is meant for a parser that does not have to match the end of the
-    /// range it captures, and therefore never calls
-    /// [`DfaBuilder::end_capturing`]: HPACK prefixes a field value with its
-    /// length, so the HTTP/2 pattern matching a field name ends where the
-    /// capture begins.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a capture has already been started but not yet pushed.
-    pub fn capture(&mut self) -> &mut Self {
-        let cid = self.dfa.new_capture();
-        self.dfa.add_action(self.state, Action::StartCapture(cid));
-
-        self
-    }
-
-    /// Ends the open capture at the last input pushed onto the pattern and
-    /// turns the captured range into a match.
-    ///
-    /// # Panics
-    ///
-    /// Panics if no capture has been started.
-    pub fn end_capturing(&mut self) -> &mut Self {
-        let cid = self.end_capture.take().expect("No capture started");
-        let mid = self.dfa.new_match();
-        trace!(
-            "end_capturing; state={:?}, cid={:?} mid={:?}",
-            self.state, cid, mid
-        );
-
-        self.dfa
-            .add_action(self.state, Action::EndCapture(cid, mid));
-
         self
     }
 
@@ -309,79 +286,60 @@ impl DfaBuilder<'_> {
             self.push_edge(*b, to, false);
         }
     }
-
-    /// Terminates parsing once the pattern has been matched.
-    pub fn done(&mut self) {
-        self.dfa.add_action(self.state, Action::Done);
-    }
 }
 
-type EdgeMap = HashMap<StateId, HashMap<u8, StateId>>;
-type ActionMap = HashMap<StateId, Action>;
+type EdgeMap<A> = HashMap<StateId, HashMap<u8, Edge<A>>>;
 
 /// The DFA the patterns of a [`Parser`](super::Parser) are compiled into.
 ///
 /// It is injected into the BPF parser program as a table of transitions,
 /// indexed by state and input byte, which is why states are shared between
-/// patterns wherever possible.
-pub(crate) struct Dfa {
-    /// The number of captures handed out so far.
-    num_captures: u16,
-
-    /// The number of matches handed out so far.
-    num_matches: u16,
-
+/// patterns wherever possible. A transition names the action it carries by the
+/// index it is held under in [`Dfa::actions`], so that an action can say more
+/// than the 16 bits of a transition have room for.
+pub(crate) struct Dfa<A: Copy + Debug + PartialEq + Eq> {
     /// The number of states, including [`INIT_STATE`] and [`ANY_STATE`].
     num_states: u16,
 
     /// The transitions of the DFA, keyed by state and input.
-    edges: EdgeMap,
-
-    /// The action a state runs when it is entered.
-    actions: ActionMap,
+    edges: EdgeMap<A>,
 }
 
-impl Dfa {
+impl<A: Copy + Debug + PartialEq + Eq> Dfa<A> {
     /// Creates a DFA that holds nothing but [`INIT_STATE`] and [`ANY_STATE`].
-    pub fn new() -> Dfa {
+    pub fn new() -> Dfa<A> {
+        Dfa::with_reserved_states(2)
+    }
+
+    /// Creates a DFA that leaves the first `reserved` state ids to the caller.
+    pub fn with_reserved_states(reserved: u16) -> Dfa<A> {
         Dfa {
-            num_captures: 0,
-            num_matches: 0,
-            num_states: 2,
+            num_states: reserved.max(2),
             edges: HashMap::new(),
-            actions: HashMap::new(),
         }
     }
 
-    /// Starts a new pattern.
-    ///
-    /// A `head` pattern is anchored at [`INIT_STATE`] and therefore only
-    /// matches at the very beginning of a message, any other pattern is
-    /// anchored at [`ANY_STATE`] and may match anywhere in the header block.
-    pub fn start_pattern<'a>(&'a mut self, head: bool) -> DfaBuilder<'a> {
-        trace!("start_pattern; head={:?}", head);
-        let state = if head { INIT_STATE } else { ANY_STATE };
+    /// Returns the number of states the DFA has, the reserved ones included.
+    pub fn num_states(&self) -> u16 {
+        self.num_states
+    }
+
+    /// Returns the number of edges the DFA has.
+    pub fn num_edges(&self) -> usize {
+        self.edges.len()
+    }
+
+    /// Starts a new pattern anchored at `state`, which the caller has to have
+    /// reserved with [`Dfa::with_reserved_states`].
+    pub fn start_pattern<'a>(&'a mut self, state: StateId) -> DfaBuilder<'a, A> {
+        trace!("start_pattern; state={:?}", state);
         DfaBuilder::new(self, state)
     }
 
     /// Returns an unused state id.
     fn new_state(&mut self) -> StateId {
         let id = StateId(self.num_states);
-        self.num_states += 1;
-        id
-    }
-
-    /// Returns an unused capture id.
-    fn new_capture(&mut self) -> CaptureId {
-        let id = CaptureId(self.num_captures);
-        self.num_captures += 1;
-        id
-    }
-
-    /// Returns an unused match id.
-    fn new_match(&mut self) -> MatchId {
-        let id = MatchId(self.num_matches);
-        self.num_matches += 1;
+        self.num_states = self.num_states.strict_add(1);
         id
     }
 
@@ -390,52 +348,72 @@ impl Dfa {
     fn next_state(&mut self, from: &StateId, input: &u8) -> StateId {
         self.edges
             .get(from)
-            .and_then(|es| es.get(input).map(|to| *to))
+            .and_then(|es| es.get(input).map(|edge| edge.to))
             .unwrap_or_else(|| self.new_state())
     }
 
     /// Inserts an edge from `from` to `to`, matching `input`.
     ///
+    /// `action` is the action the edge carries itself, which a parser whose
+    /// transitions mean more than the state they lead to needs; an edge without
+    /// one runs the action of `to`.
+    ///
     /// # Panics
     ///
     /// Panics if `from` already has an edge for `input` that leads somewhere
-    /// else, as that would make the automaton non-deterministic.
-    fn insert_edge(&mut self, from: StateId, input: u8, to: StateId) {
-        if let Some(to_old) = self.edges.entry(from).or_default().insert(input, to) {
-            assert!(
-                to_old == to,
-                "Cannot create a transition from {from:?} to {to_old:?} and {to:?}"
-            );
+    /// else, as that would make the automaton non-deterministic, or if it
+    /// carries an action `action` cannot be combined with.
+    pub fn insert_edge(&mut self, from: StateId, input: u8, to: StateId, action: Option<A>) {
+        let edges = self.edges.entry(from).or_default();
+        let Some(old) = edges.get_mut(&input) else {
+            let _ = edges.insert(input, Edge { to, action });
+            return;
+        };
+
+        assert!(
+            old.to == to,
+            "Cannot create a transition from {from:?} to {:?} and {to:?}",
+            old.to
+        );
+
+        // patterns share their transitions wherever they run alongside each
+        // other, so one walking over a transition another already laid down
+        // leaves the action on it alone
+        match (old.action, action) {
+            (_, None) => {}
+            (None, Some(action)) => old.action = Some(action),
+            (Some(old_action), Some(action)) => assert!(
+                old_action == action,
+                "Cannot {action:?} and {old_action:?} on the same transition"
+            ),
         }
     }
 
-    /// Attaches `action` to `state`, combining it with the action the state
-    /// already carries.
+    /// Adds an action to an existing edge.
     ///
     /// # Panics
     ///
-    /// Panics if the two actions cannot be combined, see [`Action::push`].
-    fn add_action(&mut self, state: StateId, action: Action) {
-        let action = match self.actions.get(&state) {
-            Some(action_old) => action_old
-                .push(action)
-                .unwrap_or_else(|err| panic!("Cannot add {action:?} to {state:?}: {err}")),
-            None => action,
+    /// Panics if the edge does not exist, or already has an action assigned.
+    fn add_action(&mut self, from: StateId, input: u8, action: A) {
+        let Some(edges) = self.edges.get_mut(&from) else {
+            panic!("State not found");
         };
 
-        self.actions.insert(state, action);
+        let Some(edge) = edges.get_mut(&input) else {
+            panic!("Edge not found");
+        };
+
+        edge.action = Some(action);
     }
 
-    /// Returns an iterator over the edges of the DFA, each paired with the
-    /// action of the state it leads to.
-    pub fn iter_transitions<'a>(
-        &'a self,
-    ) -> impl Iterator<Item = (&'a StateId, &'a StateId, &'a u8, Option<Action>)> {
+    /// Returns an iterator over the transitions of the DFA, each paired with
+    /// the id of the action it carries: its own if it has one, and the one of
+    /// the state it leads to otherwise.
+    pub fn iter_transitions(&self) -> impl Iterator<Item = (StateId, u8, StateId, Option<A>)> + '_ {
         self.edges.iter().flat_map(move |(from, edges)| {
-            edges.iter().map(move |(input, to)| {
-                let action = self.actions.get(to).copied();
-                (from, to, input, action)
-            })
+            edges
+                .iter()
+                .map(move |(input, edge)| (*from, *input, edge.to, edge.action))
         })
     }
 }

@@ -4,29 +4,8 @@
 #include <bpf/bpf_helpers.h>
 
 // The parser for HTTP/1.x messages. It walks a message byte by byte, following
-// the transitions user space injected into `s2ts`, and runs the action of every
-// state it enters. The flags below are how those actions are encoded; they are
-// read back by the Rust side, which is what assembles the table.
-
-// Parsing is complete, the rest of the message is not a header anymore.
-const u16 a_done = 1 << 14;
-
-// The capture identified by the low bits starts at the next byte.
-const u16 a_start_capture = 1 << 13;
-
-// The capture identified by the low bits ends at the current byte.
-const u16 a_end_capture = 1 << 12;
-
-// Reserved for the HTTP/2 parser, unused here.
-const u16 a_h2_read_st = 1 << 11;
-const u16 a_h2_read_dt = 1 << 10;
-
-// if a_done -> then this is 0
-// if a_start_capture -> then this is the cid
-// if a_end_capture -> then this is cid | mid
-const u16 a_id_mask = 0x0FFF;
-const u16 a_id_1_mask = 0x0FC0;
-const u16 a_id_2_mask = 0x003F;
+// the transitions user space injected into `s2ts`, and runs the action every
+// one of them carries.
 
 // The state a message is parsed from.
 const u16 s_init = 0;
@@ -34,13 +13,52 @@ const u16 s_init = 0;
 // The state input that matches no pattern leads back to.
 const u16 s_any = 1;
 
+// What the parser does upon taking a transition. Must stay in sync with the
+// action kinds of h1/action.rs.
 
+// Nothing.
+#define H1A_NONE 0
+
+// A capture starts at the byte behind the transition: `cid` names the one whose
+// start index is to be written down.
+#define H1A_START_CAPTURE 1
+
+// The open capture ends at the byte the transition read: `cid` names the one
+// whose start index is to be read back, `mid` the match its range is reported
+// under.
+#define H1A_END_CAPTURE 2
+
+// Parsing is complete, the rest of the message is not a header anymore.
+#define H1F_DONE (1 << 0)
+
+// A single action of the DFA.
+//
+// Actions are kept in a table of their own so that a transition only has to
+// name the index of the one it carries, which leaves room for saying more than
+// the 16 bits of a transition would hold.
+struct h1_action {
+    u8 kind;
+    u8 flags;
+    u8 mid;
+};
+
+// these restrictions are needed to make the verifier happy. All three are
+// masked onto an index, so all three have to be powers of two.
 #define MAX_STATES 512
 #define MAX_TRANS 128
+#define MAX_ACTIONS 256
 
-// The transition table of the DFA, indexed by state and input byte. User space
-// fills it in before the program is loaded, after which it is read-only.
+// The transition table of the DFA, indexed by state and input byte, and the
+// actions its transitions carry. User space fills both in before the program is
+// loaded, after which they are read-only.
 volatile const struct trans s2ts[MAX_STATES][MAX_TRANS];
+volatile const struct h1_action a2as[MAX_ACTIONS];
+
+// Reads the action a transition carries. Transition 0 is the one a state
+// without a transition for the byte it read falls back to, and carries none.
+static __always_inline struct h1_action _action(u16 id) {
+    return a2as[id & (MAX_ACTIONS - 1)];
+}
 
 // Follows the transition `input` takes out of `state`. A state that has no
 // transition for `input` falls back to the one matching any byte, and if it has
@@ -92,7 +110,6 @@ static __always_inline int _parse_from(u8 *data, u8 *data_end, u16 start, struct
             continue;
         }
 
-        u16 old_state = *s;
         u16 a = 0;
         _next(*s, c, s, &a);
 
@@ -100,23 +117,24 @@ static __always_inline int _parse_from(u8 *data, u8 *data_end, u16 start, struct
             _next(s_any, c, s, &a);
         }
 
-        if ((a & a_start_capture) != 0) {
-            u16 cid = a & a_id_mask & MAX_MATCH_MASK;
-            bpf_debug("start capture range (%d, ?) in [%d, ...]", cid, i+1);
-            cidx[cid] = i + 1;
+        struct h1_action act = _action(a);
+        if (act.kind == H1A_START_CAPTURE) {
+            u16 mid = act.mid & MAX_MATCH_MASK;
+            bpf_debug("start capture range (%d) in [%d, ...]", mid, i+1);
+            cidx[mid] = i + 1;
         }
-        if ((a & a_end_capture) != 0) {
-            u16 cid = ((a & a_id_1_mask) >> 6) & MAX_MATCH_MASK;
-            u16 mid = a & a_id_2_mask & MAX_MATCH_MASK;
-            bpf_debug("end capture range (%d, %d) in [%d, %d]", cid, mid, cidx[cid], i - cidx[cid] + 1);
+        else if (act.kind == H1A_END_CAPTURE) {
+            u16 mid = act.mid & MAX_MATCH_MASK;
+            bpf_debug("end capture range (%d) in [%d, %d]", mid, cidx[mid], i - cidx[mid] + 1);
 
             ms[mid] = (struct hdr_match) {
-                .idx = cidx[cid],
-                .len = i - cidx[cid] + 1,
+                .idx = cidx[mid],
+                .len = i - cidx[mid] + 1,
                 .in_msg = true
             };
         }
-        if ((a & a_done) != 0) {
+
+        if ((act.flags & H1F_DONE) != 0) {
             bpf_debug("done parsing at %d", i);
             return i+1;
         }

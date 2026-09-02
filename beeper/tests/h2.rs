@@ -91,6 +91,25 @@ impl Client {
         uri: String,
         headers: &[(header::HeaderName, HeaderValue)],
     ) -> Response<RecvStream> {
+        let response = self.send(uri, headers).await;
+        assert!(
+            response.status().is_success(),
+            "status: {}",
+            response.status()
+        );
+
+        response
+    }
+
+    /// Same as [`Client::get`], but does not expect the server to have accepted
+    /// the request. A header list the server turns down still reaches the
+    /// parser, which is all some tests need of it.
+    #[allow(unused_results)]
+    async fn send(
+        &self,
+        uri: String,
+        headers: &[(header::HeaderName, HeaderValue)],
+    ) -> Response<RecvStream> {
         let mut req = Request::builder().method("GET").uri(uri);
         for (name, value) in headers {
             req = req.header(name, value);
@@ -101,11 +120,7 @@ impl Client {
         let (response, _) = send_request
             .send_request(request, true)
             .expect("send_request");
-        let response = response.await.expect("response");
-
-        assert!(response.status().is_success());
-
-        response
+        response.await.expect("response")
     }
 }
 
@@ -208,17 +223,48 @@ impl RawClient {
     /// Sends a request carrying `block` and waits for its response, so that the
     /// parser has seen it by the time this returns.
     async fn request(&mut self, block: Vec<u8>) {
+        self.request_all(&[(0, block)]).await;
+    }
+
+    /// Sends a request whose header block is split at `split`, the first half
+    /// going out in the HEADERS frame and the second in a CONTINUATION frame,
+    /// see section 6.10 of RFC 9113.
+    async fn request_continued(&mut self, block: Vec<u8>, split: usize) {
         let id = self.next_stream_id;
         self.next_stream_id += 2;
 
-        // END_STREAM | END_HEADERS
-        self.stream
-            .write_all(&frame(0x01, 0x05, id, &block))
-            .await
-            .expect("request");
+        let mut out = Vec::new();
+        // END_STREAM, but the block carries on
+        out.extend_from_slice(&frame(0x01, 0x01, id, &block[..split]));
+        // CONTINUATION | END_HEADERS
+        out.extend_from_slice(&frame(0x09, 0x04, id, &block[split..]));
+
+        self.stream.write_all(&out).await.expect("request");
         self.stream.flush().await.expect("flush");
 
         self.read_frame(0x01).await;
+    }
+
+    /// Sends every request in `reqs` in a single write, so that the parser has
+    /// to find each frame by the length of the one before it. Each of them is
+    /// the flags its HEADERS frame carries on top of END_STREAM and
+    /// END_HEADERS, and the payload of that frame, which the caller lays out
+    /// itself rather than handing over a bare block.
+    async fn request_all(&mut self, reqs: &[(u8, Vec<u8>)]) {
+        let mut out = Vec::new();
+        for (flags, payload) in reqs {
+            let id = self.next_stream_id;
+            self.next_stream_id += 2;
+
+            out.extend_from_slice(&frame(0x01, 0x05 | flags, id, payload));
+        }
+
+        self.stream.write_all(&out).await.expect("request");
+        self.stream.flush().await.expect("flush");
+
+        for _ in reqs {
+            self.read_frame(0x01).await;
+        }
     }
 
     /// Writes `bytes` as they are, without expecting an answer.
@@ -826,13 +872,278 @@ async fn evict_header_field_from_dynamic_table() {
         )
         .await;
 
-    // this should evict all entries, and add back the user-agent
+    // this should evict the authority, the oldest entry, and nothing more
     let info = h2
         .dynamic_table_info(client.local_addr, client.remote_addr)
         .expect("dynamic_table_info");
-    let expected_dt = &[(header::USER_AGENT, test_header_val.clone())];
+    let expected_dt = &[
+        (TEST_HEADER, test_header_val.clone()),
+        (header::USER_AGENT, user_agent_val.clone()),
+        (header::USER_AGENT, test_header_val.clone()),
+    ];
     assert_eq!(info.max_size, 254);
     assert_eq!(info.count, expected_dt.len() as u32);
     assert_eq!(info.size, dynamic_table_size_for_headers(expected_dt));
+    assert_eq!(info.deleted, 1);
     assert_match_eq(&prog, 1, Some(&test_header_val));
+}
+
+/// The flag of a HEADERS frame saying that its block is padded, see section 6.2
+/// of RFC 9113.
+const PADDED_FLAG: u8 = 0x08;
+
+/// The flag saying that a priority comes in front of its block.
+const PRIORITY_FLAG: u8 = 0x20;
+
+/// Renders the payload of a HEADERS frame that pads `block` with `pad`, see
+/// section 6.2 of RFC 9113: the length of the padding, the block, and the
+/// padding itself.
+fn padded(block: Vec<u8>, pad: &[u8]) -> Vec<u8> {
+    let mut payload = vec![pad.len() as u8];
+    payload.extend_from_slice(&block);
+    payload.extend_from_slice(pad);
+
+    payload
+}
+
+/// Renders the payload of a HEADERS frame that puts a priority in front of
+/// `block`, see section 6.3 of RFC 9113: a stream dependency and a weight.
+fn prioritised(block: Vec<u8>) -> Vec<u8> {
+    let mut payload = vec![0x00, 0x00, 0x00, 0x00, 0x10];
+    payload.extend_from_slice(&block);
+
+    payload
+}
+
+#[tokio::test]
+async fn parse_padded_header_frame() {
+    let addr = server::launch().await.expect("launch server");
+
+    let mut open_obj = OpenObject::new();
+    let prog =
+        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
+
+    let _h1 = attach_preface_parser(prog.prog_fd());
+    let h2 = attach_h2_parser(prog.prog_fd(), &[header::ACCEPT]);
+
+    let authority = addr.to_string();
+    let padded_val = HeaderValue::from_static("padded");
+    let next_val = HeaderValue::from_static("after-the-padding");
+
+    // the padding is a field that would be added to the dynamic table if it
+    // were read as one, which is how the test tells that it was skipped
+    let pad = [0x40, 0x00, 0x00];
+
+    // both requests go out in a single write, so the second is only found if
+    // the padded frame reported its own length correctly
+    let mut client = RawClient::connect(addr).await;
+    client
+        .request_all(&[
+            (
+                PADDED_FLAG,
+                padded(
+                    raw_request_block(&authority, &[(Some(19), "accept", "padded")]),
+                    &pad,
+                ),
+            ),
+            (
+                0,
+                raw_request_block(&authority, &[(Some(19), "accept", "after-the-padding")]),
+            ),
+        ])
+        .await;
+
+    assert_eq!(
+        prog.get_match(0).expect("get_match").as_deref(),
+        Some(next_val.as_bytes()),
+        "the frame after the padded one was not found"
+    );
+
+    let info = h2
+        .dynamic_table_info(client.local_addr, client.remote_addr)
+        .expect("dynamic_table_info");
+
+    let expected_dt = &[
+        (header::ACCEPT, padded_val.clone()),
+        (header::ACCEPT, next_val.clone()),
+    ];
+    assert_eq!(
+        info.count,
+        expected_dt.len() as u32,
+        "the padding was read as a header field"
+    );
+    assert_eq!(info.size, dynamic_table_size_for_headers(expected_dt));
+}
+
+#[tokio::test]
+async fn parse_header_frame_that_carries_a_priority() {
+    let addr = server::launch().await.expect("launch server");
+
+    let mut open_obj = OpenObject::new();
+    let prog =
+        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
+
+    let _h1 = attach_preface_parser(prog.prog_fd());
+    let h2 = attach_h2_parser(prog.prog_fd(), &[header::ACCEPT]);
+
+    let authority = addr.to_string();
+    let accept_val = HeaderValue::from_static("after-the-priority");
+
+    let mut client = RawClient::connect(addr).await;
+    client
+        .request_all(&[(
+            PRIORITY_FLAG,
+            prioritised(raw_request_block(
+                &authority,
+                &[(Some(19), "accept", "after-the-priority")],
+            )),
+        )])
+        .await;
+
+    assert_eq!(
+        prog.get_match(0).expect("get_match").as_deref(),
+        Some(accept_val.as_bytes()),
+        "the block was not read from behind the priority"
+    );
+
+    let info = h2
+        .dynamic_table_info(client.local_addr, client.remote_addr)
+        .expect("dynamic_table_info");
+
+    let expected_dt = &[(header::ACCEPT, accept_val.clone())];
+    assert_eq!(
+        info.count,
+        expected_dt.len() as u32,
+        "the priority was read as a header field"
+    );
+    assert_eq!(info.size, dynamic_table_size_for_headers(expected_dt));
+}
+
+#[tokio::test]
+async fn resolve_index_of_entry_added_after_an_eviction() {
+    let addr = server::launch().await.expect("launch server");
+
+    let mut open_obj = OpenObject::new();
+    let prog =
+        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
+
+    let _h1 = attach_preface_parser(prog.prog_fd());
+    let h2 = attach_h2_parser(prog.prog_fd(), &[TEST_HEADER, header::USER_AGENT]);
+
+    let long_val = HeaderValue::from_static("asdfqwerasdfqwerasdfqwerasdfqwer");
+    let agent_val = HeaderValue::from_static("test-agent");
+    let other_agent_val = HeaderValue::from_static("other-agent");
+    let url = format!("http://{}", addr);
+
+    // a table this small fills up over the three requests below, the last of
+    // which evicts the authority the connection opened with
+    let client = Client::connect(addr, Some(254)).await;
+    client
+        .get(url.clone(), &[(TEST_HEADER, long_val.clone())])
+        .await;
+    client
+        .get(url.clone(), &[(header::USER_AGENT, agent_val.clone())])
+        .await;
+    client
+        .get(url.clone(), &[(header::USER_AGENT, long_val.clone())])
+        .await;
+
+    let info = h2
+        .dynamic_table_info(client.local_addr, client.remote_addr)
+        .expect("dynamic_table_info");
+    assert_eq!(
+        info.deleted, 1,
+        "nothing was evicted, so the entries below are stored where they would be anyway"
+    );
+
+    // this one is added to a table that has already evicted, which is what
+    // decides whether the entries added before it keep the index they were
+    // stored under
+    client
+        .get(url.clone(), &[(header::USER_AGENT, other_agent_val.clone())])
+        .await;
+    assert_match_eq(&prog, 1, Some(&other_agent_val));
+
+    // the client still holds the long user agent, so it sends it as nothing but
+    // the index of the entry it was added under before the eviction
+    client
+        .get(url.clone(), &[(header::USER_AGENT, long_val.clone())])
+        .await;
+
+    assert_match_eq(&prog, 1, Some(&long_val));
+}
+#[tokio::test]
+async fn parse_header_block_split_over_a_continuation_frame() {
+    let addr = server::launch().await.expect("launch server");
+
+    let mut open_obj = OpenObject::new();
+    let prog =
+        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
+
+    let _h1 = attach_preface_parser(prog.prog_fd());
+    let h2 = attach_h2_parser(prog.prog_fd(), &[header::ACCEPT]);
+
+    let authority = addr.to_string();
+    let accept_val = HeaderValue::from_static("in-the-continuation");
+    let block = raw_request_block(&authority, &[(Some(19), "accept", "in-the-continuation")]);
+
+    // the block breaks right after the three indexed pseudo headers it opens
+    // with, so every field of it is whole in the frame that carries it
+    let mut client = RawClient::connect(addr).await;
+    client.request_continued(block, 3).await;
+
+    assert_eq!(
+        prog.get_match(0).expect("get_match").as_deref(),
+        Some(accept_val.as_bytes()),
+        "the field in the continuation frame was not read"
+    );
+
+    let info = h2
+        .dynamic_table_info(client.local_addr, client.remote_addr)
+        .expect("dynamic_table_info");
+
+    let expected_dt = &[(header::ACCEPT, accept_val.clone())];
+    assert_eq!(info.count, expected_dt.len() as u32);
+    assert_eq!(info.size, dynamic_table_size_for_headers(expected_dt));
+    assert_eq!(
+        info.dirty, 0,
+        "a block that breaks between fields left the table looking untrustworthy"
+    );
+}
+
+#[tokio::test]
+async fn mark_the_table_as_drifted_when_a_continuation_frame_splits_a_field() {
+    let addr = server::launch().await.expect("launch server");
+
+    let mut open_obj = OpenObject::new();
+    let prog =
+        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
+
+    let _h1 = attach_preface_parser(prog.prog_fd());
+    let h2 = attach_h2_parser(prog.prog_fd(), &[header::ACCEPT]);
+
+    let authority = addr.to_string();
+    let accept_val = HeaderValue::from_static("across-the-break");
+    let block = raw_request_block(&authority, &[(Some(19), "accept", "across-the-break")]);
+
+    // the block breaks two bytes into the authority, whose first half is in a
+    // frame the parser cannot address once the second one arrives
+    let mut client = RawClient::connect(addr).await;
+    client.request_continued(block, 3 + 1 + 1 + 2).await;
+
+    // the fields behind the break are still read, the parser only loses the one
+    // the break falls inside of
+    assert_eq!(
+        prog.get_match(0).expect("get_match").as_deref(),
+        Some(accept_val.as_bytes()),
+        "the field behind the break was not read"
+    );
+
+    let info = h2
+        .dynamic_table_info(client.local_addr, client.remote_addr)
+        .expect("dynamic_table_info");
+    assert_eq!(
+        info.dirty, 1,
+        "a block that breaks inside a field left the table looking trustworthy"
+    );
 }

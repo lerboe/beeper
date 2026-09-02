@@ -5,6 +5,7 @@
 //! message byte by byte, follows the table and runs the action of every state it
 //! enters, which is what turns a pattern into a captured range.
 
+mod action;
 mod parser;
 
 pub use parser::AttachedParser;

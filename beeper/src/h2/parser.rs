@@ -1,10 +1,14 @@
 #![allow(unused_imports)]
-use crate::{Action, Dfa, StateId, autoload_and_attach, h2::create_header_maps};
+use crate::{
+    Dfa, MatchId, autoload_and_attach,
+    h2::{action::*, hpack},
+};
 use anyhow::{Result, bail};
 use as_bytes::AsBytes;
 use httlib_huffman as huffman;
 use http::HeaderName;
 use plain::Plain;
+use std::collections::HashMap;
 use std::mem::MaybeUninit;
 use std::net::SocketAddr;
 use tracing::{Level, debug, warn};
@@ -24,7 +28,10 @@ extern crate plain;
 /// kernel until [`Parser::attach`] is called.
 pub struct Parser {
     /// The patterns configured so far, compiled into a DFA.
-    dfa: Dfa,
+    dfa: Dfa<Action>,
+
+    /// The number of matches occuring in the patterns.
+    num_matches: u16,
 
     parse_msg_fn: Option<String>,
     parse_buf_fn: Option<String>,
@@ -36,40 +43,17 @@ pub struct Parser {
 
 xbpf::include_bpf!("h2/parser");
 
-/// Encodes a transition the way the BPF parser reads it out of its transition
-/// table.
-///
-/// An action is a bit field: the flag identifying the action occupies the high
-/// bits, the capture id the low ones.
-fn new_transition(state: StateId, action: Option<Action>, rodata: &rodata) -> trans {
-    let action = match action {
-        Some(Action::StartCapture(cid)) => {
-            rodata.a_start_capture | (cid.0 as u16) & rodata.a_id_mask
-        }
-        Some(Action::StartCaptureAndDone(cid)) => {
-            rodata.a_done | rodata.a_start_capture | (cid.0 as u16) & rodata.a_id_mask
-        }
-        Some(Action::Done) => rodata.a_done,
-        Some(Action::EndCapture(..)) | Some(Action::EndCaptureAndDone(..)) => {
-            unreachable!("HPACK announces the value length, so an h2 pattern never ends a capture")
-        }
-        None => 0,
-    };
-
-    trans {
-        state: state.0,
-        action,
-    }
-}
-
 #[allow(dead_code)]
 impl Parser {
     /// Creates a new HTTP/2 parser.
     ///
     /// Additional configuration must be done through the builder methods before calling `attach`.
     pub fn new() -> Parser {
+        let dfa = hpack::dfa();
+
         Parser {
-            dfa: Dfa::new(),
+            dfa,
+            num_matches: 0,
             parse_msg_fn: None,
             parse_buf_fn: None,
             parse_skb_fn: None,
@@ -168,12 +152,20 @@ impl Parser {
         let mut name_encoded = Vec::new();
         huffman::encode(name.as_str().as_bytes(), &mut name_encoded)?;
 
+        let mid = self.new_match();
         self.dfa
-            .start_pattern(false)
+            .start_pattern(S_NAME)
             .push_bytes(&name_encoded)
-            .capture();
+            .with(Action::capture(mid));
 
         Ok(self)
+    }
+
+    /// Returns an unused match id.
+    fn new_match(&mut self) -> MatchId {
+        let id = MatchId(self.num_matches);
+        self.num_matches += 1;
+        id
     }
 
     /// Fills `static_table` with the Huffman encoded entries of the HPACK
@@ -216,7 +208,7 @@ impl Parser {
             anyhow::Ok(())
         };
 
-        let (st_keys, st_hfs) = create_header_maps();
+        let (st_keys, st_hfs) = hpack::create_header_maps();
         for (key, vals) in st_hfs.iter() {
             for (val, idx) in vals.iter() {
                 insert(*idx as u32, key, Some(val))?;
@@ -311,15 +303,52 @@ impl Parser {
         })
     }
 
-    /// Writes the transition table of the DFA into the read-only data of the
-    /// parser program. This has to happen before the program is loaded, as the
-    /// kernel freezes the section afterwards.
+    /// Writes the transition table of the DFA and the actions its transitions
+    /// carry into the read-only data of the parser program. This has to happen
+    /// before the program is loaded, as the kernel freezes the section
+    /// afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the patterns do not fit into the tables the parser
+    /// program reserves for them.
     fn inject(&self, skel: &mut OpenParserSkel) -> Result<()> {
-        for (from, to, input, action) in self.dfa.iter_transitions() {
-            let s = from.0 as usize;
-            let data = skel.maps.rodata_data.as_mut().unwrap();
-            let t = new_transition(*to, action, data);
-            data.s2ts[s][*input as usize] = t;
+        let Some(data) = skel.maps.rodata_data.as_mut() else {
+            bail!("the parser program has no read-only data to inject into");
+        };
+
+        let num_states = self.dfa.num_states() as usize;
+        if num_states > data.s2ts.len() {
+            bail!(
+                "the patterns take {num_states} states, the parser holds {}",
+                data.s2ts.len()
+            );
+        }
+
+        // action index 0 is reserved for the noop action
+        let mut action_idx = HashMap::new();
+        action_idx.insert(None, 0usize);
+
+        for (from, input, to, action) in self.dfa.iter_transitions() {
+            let new_action_idx = action_idx.len();
+            let action = *action_idx.entry(action).or_insert(new_action_idx);
+            if action >= data.a2as.len() {
+                bail!(
+                    "the patterns take more actions than the {} the parser holds",
+                    data.a2as.len()
+                );
+            }
+
+            data.s2ts[from.0 as usize][input as usize] = trans {
+                state: to.0,
+                action: action as u16,
+            };
+        }
+
+        for (action, i) in action_idx {
+            let Some(action) = action else { continue };
+
+            data.a2as[i] = action.into();
         }
 
         Ok(())
@@ -359,6 +388,16 @@ pub struct DynamicTableInfo {
     /// The number of entries evicted so far. Together with `count` it turns an
     /// HPACK index into an index into the table.
     pub deleted: u32,
+
+    /// Whether the table has drifted from the peer's and can no longer be
+    /// trusted.
+    ///
+    /// It drifts when a header block is split over a HEADERS frame and the
+    /// CONTINUATION frames following it in the middle of a field, see section
+    /// 6.10 of RFC 9113: the parser cannot address the half of the field that
+    /// is in the frame before, so the entry the peer adds is one it cannot
+    /// mirror. A table that has drifted is neither added to nor resolved from.
+    pub dirty: u32,
 }
 
 unsafe impl Plain for DynamicTableInfo {}
