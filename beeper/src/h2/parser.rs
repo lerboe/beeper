@@ -1,13 +1,14 @@
 #![allow(unused_imports)]
 use crate::{
-    Action, Dfa, StateId, autoload_and_attach,
-    h2::{create_header_maps, hpack},
+    Dfa, MatchId, autoload_and_attach,
+    h2::{action::*, hpack},
 };
 use anyhow::{Result, bail};
 use as_bytes::AsBytes;
 use httlib_huffman as huffman;
 use http::HeaderName;
 use plain::Plain;
+use std::collections::HashMap;
 use std::mem::MaybeUninit;
 use std::net::SocketAddr;
 use tracing::{Level, debug, warn};
@@ -27,7 +28,10 @@ extern crate plain;
 /// kernel until [`Parser::attach`] is called.
 pub struct Parser {
     /// The patterns configured so far, compiled into a DFA.
-    dfa: Dfa,
+    dfa: Dfa<Action>,
+
+    /// The number of matches occuring in the patterns.
+    num_matches: u16,
 
     parse_msg_fn: Option<String>,
     parse_buf_fn: Option<String>,
@@ -39,32 +43,18 @@ pub struct Parser {
 
 xbpf::include_bpf!("h2/parser");
 
-/// Translates the action of a pattern into the one the BPF parser runs.
-///
-/// A pattern only ever matches a field name, which HPACK announces the length
-/// of, so the only action an HTTP/2 pattern carries is the one starting the
-/// capture of the value that follows.
-fn new_action(action: Option<Action>) -> hpack::Action {
-    match action {
-        None => hpack::Action::NONE,
-        Some(Action::StartCapture(cid)) => hpack::Action::capture(cid.0),
-        Some(Action::Done) | Some(Action::StartCaptureAndDone(..)) => {
-            unreachable!("an h2 pattern never terminates the parse, it captures and moves on")
-        }
-        Some(Action::EndCapture(..)) | Some(Action::EndCaptureAndDone(..)) => {
-            unreachable!("HPACK announces the value length, so an h2 pattern never ends a capture")
-        }
-    }
-}
-
 #[allow(dead_code)]
 impl Parser {
     /// Creates a new HTTP/2 parser.
     ///
     /// Additional configuration must be done through the builder methods before calling `attach`.
     pub fn new() -> Parser {
+        let mut dfa = Dfa::with_reserved_states(S_RESERVED);
+        hpack::insert_representations(&mut dfa);
+
         Parser {
-            dfa: Dfa::with_reserved_states(hpack::S_RESERVED),
+            dfa,
+            num_matches: 0,
             parse_msg_fn: None,
             parse_buf_fn: None,
             parse_skb_fn: None,
@@ -163,12 +153,20 @@ impl Parser {
         let mut name_encoded = Vec::new();
         huffman::encode(name.as_str().as_bytes(), &mut name_encoded)?;
 
+        let mid = self.new_match();
         self.dfa
-            .start_pattern_at(StateId(hpack::S_NAME))
+            .start_pattern(S_NAME)
             .push_bytes(&name_encoded)
-            .capture();
+            .with(Action::capture(mid.0));
 
         Ok(self)
+    }
+
+    /// Returns an unused match id.
+    fn new_match(&mut self) -> MatchId {
+        let id = MatchId(self.num_matches);
+        self.num_matches += 1;
+        id
     }
 
     /// Fills `static_table` with the Huffman encoded entries of the HPACK
@@ -211,7 +209,7 @@ impl Parser {
             anyhow::Ok(())
         };
 
-        let (st_keys, st_hfs) = create_header_maps();
+        let (st_keys, st_hfs) = hpack::create_header_maps();
         for (key, vals) in st_hfs.iter() {
             for (val, idx) in vals.iter() {
                 insert(*idx as u32, key, Some(val))?;
@@ -316,11 +314,6 @@ impl Parser {
     /// Returns an error if the patterns do not fit into the tables the parser
     /// program reserves for them.
     fn inject(&self, skel: &mut OpenParserSkel) -> Result<()> {
-        let mut table = hpack::Table::new();
-        for (from, to, input, action) in self.dfa.iter_transitions() {
-            table.push_edge(from.0, *input, to.0, new_action(action));
-        }
-
         let Some(data) = skel.maps.rodata_data.as_mut() else {
             bail!("the parser program has no read-only data to inject into");
         };
@@ -333,34 +326,30 @@ impl Parser {
             );
         }
 
-        let num_actions = table.actions().len();
-        if num_actions > data.a2as.len() {
-            bail!(
-                "the patterns take {num_actions} actions, the parser holds {}",
-                data.a2as.len()
-            );
-        }
+        // action index 0 is reserved for the noop action
+        let mut action_idx = HashMap::new();
+        action_idx.insert(None, 0usize);
 
-        for hpack::Edge {
-            from,
-            input,
-            to,
-            action,
-        } in table.edges()
-        {
-            data.s2ts[*from as usize][*input as usize] = trans {
-                state: *to,
-                action: *action,
+        for (from, input, to, action) in self.dfa.iter_transitions() {
+            let new_action_idx = action_idx.len();
+            let action = *action_idx.entry(action).or_insert(new_action_idx);
+            if action >= data.a2as.len() {
+                bail!(
+                    "the patterns take more actions than the {} the parser holds",
+                    data.a2as.len()
+                );
+            }
+
+            data.s2ts[from.0 as usize][input as usize] = trans {
+                state: to.0,
+                action: action as u16,
             };
         }
 
-        for (i, action) in table.actions().iter().enumerate() {
-            let (kind, flags) = action.encode();
-            data.a2as[i] = h2_action {
-                val: action.val,
-                kind,
-                flags,
-            };
+        for (action, i) in action_idx {
+            let Some(action) = action else { continue };
+
+            data.a2as[i] = action.into();
         }
 
         Ok(())

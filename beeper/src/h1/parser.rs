@@ -1,9 +1,11 @@
 #![allow(unused_imports)]
 use crate::{
-    Action, CaptureId, Dfa, MatchId, StateId, autoload_and_attach,
+    Dfa, MatchId, autoload_and_attach,
+    dfa::{ANY_STATE, INIT_STATE},
+    h1::action::Action,
     header::{METHOD, PATH, STATUS},
 };
-use anyhow::Result;
+use anyhow::{Result, bail};
 use http::HeaderName;
 use std::{collections::HashMap, mem::MaybeUninit};
 use tracing::{Level, debug, trace, warn};
@@ -23,7 +25,10 @@ const CRLF: &str = "\r\n";
 /// kernel until [`Parser::attach`] is called.
 pub struct Parser {
     /// The patterns configured so far, compiled into a DFA.
-    dfa: Dfa,
+    dfa: Dfa<Action>,
+
+    /// The number of matches occuring in the patterns.
+    num_matches: u16,
 
     parse_msg_fn: Option<String>,
     parse_buf_fn: Option<String>,
@@ -34,36 +39,6 @@ pub struct Parser {
 
 xbpf::include_bpf!("h1/parser");
 
-/// Encodes a transition the way the BPF parser reads it out of its transition
-/// table.
-///
-/// An action is a bit field: the flags identifying the action occupy the high
-/// bits, the capture and match ids the low ones. [`Action::EndCapture`] needs
-/// both ids, so it packs the capture id above the match id.
-fn new_transition(state: StateId, action: Option<Action>, rodata: &rodata) -> trans {
-    fn start(cid: CaptureId, rodata: &rodata) -> u16 {
-        rodata.a_start_capture | (cid.0 as u16) & rodata.a_id_mask
-    }
-    fn end(cid: CaptureId, mid: MatchId, rodata: &rodata) -> u16 {
-        let id = (cid.0 as u16) << 6 | (mid.0 as u16);
-        rodata.a_end_capture | id & rodata.a_id_mask
-    }
-
-    let action = match action {
-        Some(Action::StartCapture(cid)) => start(cid, rodata),
-        Some(Action::EndCapture(cid, mid)) => end(cid, mid, rodata),
-        Some(Action::Done) => rodata.a_done,
-        Some(Action::StartCaptureAndDone(cid)) => start(cid, rodata) | rodata.a_done,
-        Some(Action::EndCaptureAndDone(cid, mid)) => end(cid, mid, rodata) | rodata.a_done,
-        None => 0,
-    };
-
-    trans {
-        state: state.0,
-        action,
-    }
-}
-
 #[allow(dead_code)]
 impl Parser {
     /// Creates a new HTTP/1.1 parser.
@@ -72,6 +47,7 @@ impl Parser {
     pub fn new() -> Parser {
         Parser {
             dfa: Dfa::new(),
+            num_matches: 0,
             parse_msg_fn: None,
             parse_buf_fn: None,
             parse_skb_fn: None,
@@ -135,6 +111,13 @@ impl Parser {
         self
     }
 
+    /// Returns an unused match id.
+    fn new_match(&mut self) -> MatchId {
+        let id = MatchId(self.num_matches);
+        self.num_matches += 1;
+        id
+    }
+
     /// Configures the parser to capture the value of a header field.
     ///
     /// The field is matched case insensitively and its value is captured up to
@@ -152,8 +135,9 @@ impl Parser {
             return self.capture_status_code();
         }
 
+        let mid = self.new_match();
         self.dfa
-            .start_pattern(false)
+            .start_pattern(ANY_STATE)
             .push_ci(CRLF)
             .push_ci(name.as_str())
             .push_optional("\t")
@@ -161,9 +145,9 @@ impl Parser {
             .push_ci(":")
             .push_optional("\t")
             .push_optional(" ")
-            .start_capturing()
+            .with(Action::StartCapture(mid))
             .push_any(1..)
-            .end_capturing()
+            .with(Action::EndCapture(mid))
             .restart_with(CRLF);
 
         self
@@ -177,12 +161,12 @@ impl Parser {
     /// The preface is captured as a match, so the target program can detect the
     /// upgrade and switch to an HTTP/2 parser for the rest of the connection.
     pub fn match_h2_preface(mut self) -> Parser {
+        let mid = self.new_match();
         self.dfa
-            .start_pattern(true)
-            .start_capturing()
+            .start_pattern(INIT_STATE)
+            .with(Action::StartCapture(mid))
             .push(&format!("PRI * HTTP/2.0{}{}SM{}{}", CRLF, CRLF, CRLF, CRLF))
-            .end_capturing()
-            .done();
+            .with(Action::EndCaptureAndDone(mid));
 
         self
     }
@@ -190,7 +174,11 @@ impl Parser {
     /// Configures the parser to stop at the empty line that ends the header
     /// block, so that it never walks into the body of a message.
     fn done_on_hdr_end(mut self) -> Parser {
-        self.dfa.start_pattern(false).push(CRLF).push(CRLF).done();
+        self.dfa
+            .start_pattern(ANY_STATE)
+            .push(CRLF)
+            .push(CRLF)
+            .with(Action::Done);
 
         self
     }
@@ -207,23 +195,25 @@ impl Parser {
         ];
 
         if name == &METHOD {
+            let mid = self.new_match();
             self.dfa
-                .start_pattern(true)
-                .start_capturing()
+                .start_pattern(INIT_STATE)
+                .with(Action::StartCapture(mid))
                 .push_options_ci(&methods)
-                .end_capturing()
+                .with(Action::EndCapture(mid))
                 .push(" ")
                 .push_any(1..)
                 .push_ci(" HTTP/1.1")
                 .restart_with(CRLF);
         } else if name == &PATH {
+            let mid = self.new_match();
             self.dfa
-                .start_pattern(true)
+                .start_pattern(INIT_STATE)
                 .push_options_ci(&methods)
                 .push(" ")
-                .start_capturing()
+                .with(Action::StartCapture(mid))
                 .push_any(1..)
-                .end_capturing()
+                .with(Action::EndCapture(mid))
                 .push_ci(" HTTP/1.1")
                 .restart_with(CRLF);
         } else {
@@ -239,13 +229,14 @@ impl Parser {
     /// Configures the parser to match the status line of a response and capture
     /// its status code.
     fn capture_status_code(mut self) -> Parser {
+        let mid = self.new_match();
+
         self.dfa
-            .start_pattern(true)
+            .start_pattern(INIT_STATE)
             .push_ci("HTTP/1.1 ")
-            .start_capturing()
+            .with(Action::StartCapture(mid))
             .push_any(3..=3)
-            .end_capturing()
-            // the reason phrase is matched but not captured
+            .with(Action::EndCapture(mid))
             .push_any(1..)
             .restart_with(CRLF);
 
@@ -328,15 +319,50 @@ impl Parser {
     /// parser program. This has to happen before the program is loaded, as the
     /// kernel freezes the section afterwards.
     fn inject(&self, skel: &mut OpenParserSkel) -> Result<()> {
-        for (from, to, input, action) in self.dfa.iter_transitions() {
-            let s = from.0 as usize;
-            let data = skel.maps.rodata_data.as_mut().unwrap();
-            let t = new_transition(*to, action, data);
-            trace!(
-                "inject; from={} to={} input={} action={:?}",
-                from.0, to.0, *input as u8 as char, action
+        let Some(data) = skel.maps.rodata_data.as_mut() else {
+            bail!("the parser program has no read-only data to inject into");
+        };
+
+        let num_states = self.dfa.num_states() as usize;
+        if num_states > data.s2ts.len() {
+            bail!(
+                "the patterns take {num_states} states, the parser holds {}",
+                data.s2ts.len()
             );
-            data.s2ts[s][*input as usize] = t;
+        }
+
+        let num_edges = self.dfa.num_edges();
+        if num_edges > data.a2as.len() {
+            bail!(
+                "the patterns take {} edges, the parser holds {}",
+                num_edges,
+                data.a2as.len()
+            );
+        }
+
+        // action index 0 is reserved for the noop action
+        let mut action_idx = HashMap::new();
+        action_idx.insert(None, 0usize);
+
+        for (from, input, to, action) in self.dfa.iter_transitions() {
+            let new_action_idx = action_idx.len();
+            let action = action_idx.entry(action).or_insert(new_action_idx);
+            let action = *action as u16;
+
+            trace!(
+                "inject; from={} to={} input={} action={}",
+                from.0, to.0, input as char, action
+            );
+
+            data.s2ts[from.0 as usize][input as usize] = trans {
+                state: to.0,
+                action,
+            };
+        }
+
+        for (action, i) in action_idx {
+            let Some(action) = action else { continue };
+            data.a2as[i] = action.into();
         }
 
         Ok(())
