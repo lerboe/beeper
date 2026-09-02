@@ -49,8 +49,7 @@ impl Parser {
     ///
     /// Additional configuration must be done through the builder methods before calling `attach`.
     pub fn new() -> Parser {
-        let mut dfa = Dfa::with_reserved_states(S_RESERVED);
-        hpack::insert_representations(&mut dfa);
+        let dfa = hpack::dfa();
 
         Parser {
             dfa,
@@ -157,7 +156,7 @@ impl Parser {
         self.dfa
             .start_pattern(S_NAME)
             .push_bytes(&name_encoded)
-            .with(Action::capture(mid.0));
+            .with(Action::capture(mid));
 
         Ok(self)
     }

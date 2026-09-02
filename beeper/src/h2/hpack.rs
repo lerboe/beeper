@@ -4,10 +4,12 @@ use std::collections::HashMap;
 /// Builds the transitions of every field representation of RFC 7541 into
 /// `dfa`, which has to have been created with [`S_RESERVED`] states reserved
 /// for them.
-pub(super) fn insert_representations(dfa: &mut Dfa<Action>) {
-    insert_field_row(dfa);
-    insert_length_rows(dfa);
-    insert_continuation_rows(dfa);
+pub fn dfa() -> Dfa<Action> {
+    let mut dfa = Dfa::with_reserved_states(S_RESERVED);
+    insert_field_row(&mut dfa);
+    insert_length_rows(&mut dfa);
+    insert_continuation_rows(&mut dfa);
+    dfa
 }
 
 /// Inserts the transitions of the first byte of a representation, see section 6
@@ -230,16 +232,8 @@ pub fn create_header_maps() -> (
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::StateId;
+    use crate::{MatchId, StateId};
     use std::collections::HashSet;
-
-    /// Returns a DFA holding nothing but the representations.
-    fn representations() -> Dfa<Action> {
-        let mut dfa = Dfa::with_reserved_states(S_RESERVED);
-        insert_representations(&mut dfa);
-
-        dfa
-    }
 
     /// Returns the states a representation is walked with. `S_DEAD` and
     /// `S_NAME` are left out, as it is the patterns that give those their
@@ -253,7 +247,7 @@ mod tests {
 
     #[test]
     fn every_representation_state_reads_every_byte() {
-        let dfa = representations();
+        let dfa = dfa();
 
         for state in representation_states() {
             let inputs: HashSet<u8> = dfa
@@ -272,7 +266,7 @@ mod tests {
 
     #[test]
     fn no_transition_leads_to_a_state_without_transitions() {
-        let dfa = representations();
+        let dfa = dfa();
         let from: HashSet<StateId> = dfa.iter_transitions().map(|(from, ..)| from).collect();
 
         for (_, _, to, _) in dfa.iter_transitions() {
@@ -285,7 +279,7 @@ mod tests {
 
     #[test]
     fn every_representation_transition_carries_an_action_of_its_own() {
-        let dfa = representations();
+        let dfa = dfa();
         let states = representation_states();
 
         for (from, input, _, action) in dfa.iter_transitions() {
@@ -302,10 +296,11 @@ mod tests {
 
     #[test]
     fn a_pattern_captures_where_it_ends() {
-        let mut dfa = representations();
+        let mid = MatchId(0);
+        let mut dfa = dfa();
         dfa.start_pattern(S_NAME)
             .push_bytes(b"beep")
-            .with(Action::capture(0));
+            .with(Action::capture(mid));
 
         let captures: Vec<StateId> = dfa
             .iter_transitions()

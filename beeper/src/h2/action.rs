@@ -14,7 +14,7 @@
 //! The state ids and action kinds below must stay in sync with the `S_*` and
 //! `H2A_*` constants of h2/parser.bpf.c.
 
-use crate::{StateId, h2::parser::types::h2_action};
+use crate::{MatchId, StateId, h2::parser::types::h2_action};
 
 /// A field name that matched no pattern.
 pub const S_DEAD: StateId = StateId(2);
@@ -124,8 +124,8 @@ impl Action {
 
     /// Returns the action capturing the value of the field whose name the
     /// automaton just matched, under the id `cid`.
-    pub const fn capture(cid: u16) -> Action {
-        Action::new(Kind::Capture, cid, 0)
+    pub const fn capture(mid: MatchId) -> Action {
+        Action::new(Kind::Capture, mid.0, 0)
     }
 }
 
