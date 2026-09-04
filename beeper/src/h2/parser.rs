@@ -21,6 +21,10 @@ use xbpf::libbpf::{
 
 extern crate plain;
 
+/// The number of ranges a parser can be configured to capture. Must stay in
+/// sync with `MAX_MATCHES` of beeper.h.
+const MAX_MATCHES: u16 = 32;
+
 /// A parser for HTTP/2 messages.
 ///
 /// The builder methods configure which fields the parser captures and which
@@ -147,8 +151,13 @@ impl Parser {
     ///
     /// # Errors
     ///
-    /// Returns an error if `name` cannot be Huffman encoded.
+    /// Returns an error if `name` cannot be Huffman encoded, or if the parser
+    /// already captures as many fields as the parser program has room for.
     pub fn capture_hdr(mut self, name: &HeaderName) -> Result<Parser> {
+        if self.num_matches >= MAX_MATCHES {
+            bail!("a parser captures at most {MAX_MATCHES} fields");
+        }
+
         let mut name_encoded = Vec::new();
         huffman::encode(name.as_str().as_bytes(), &mut name_encoded)?;
 
@@ -339,7 +348,12 @@ impl Parser {
                 );
             }
 
-            data.s2ts[from.0 as usize][input as usize] = trans {
+            let input = input as usize;
+            if input >= data.s2ts[0].len() {
+                bail!("the patterns read inputs the parser has no column for: {input}");
+            }
+
+            data.s2ts[from.0 as usize][input] = trans {
                 state: to.0,
                 action: action as u16,
             };

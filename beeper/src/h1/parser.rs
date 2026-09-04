@@ -1,7 +1,7 @@
 #![allow(unused_imports)]
 use crate::{
     Dfa, MatchId, autoload_and_attach,
-    dfa::{ANY_STATE, INIT_STATE},
+    dfa::{ANY_STATE, INIT_STATE, fmt_input},
     h1::action::Action,
     header::{METHOD, PATH, STATUS},
 };
@@ -15,8 +15,12 @@ use xbpf::libbpf::{
     skel::{OpenSkel, Skel, SkelBuilder},
 };
 
-/// The sequence terminating the lines of a message.
-const CRLF: &str = "\r\n";
+const CR: &str = "\r";
+const LF: &str = "\n";
+
+/// The number of ranges a parser can be configured to capture. Must stay in
+/// sync with `MAX_MATCHES` of beeper.h.
+const MAX_MATCHES: u16 = 32;
 
 /// A parser for HTTP/1.x messages.
 ///
@@ -112,7 +116,17 @@ impl Parser {
     }
 
     /// Returns an unused match id.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the parser is already configured with [`MAX_MATCHES`] matches,
+    /// as the parser program has no room to tell one more apart from them.
     fn new_match(&mut self) -> MatchId {
+        assert!(
+            self.num_matches < MAX_MATCHES,
+            "a parser captures at most {MAX_MATCHES} ranges"
+        );
+
         let id = MatchId(self.num_matches);
         self.num_matches += 1;
         id
@@ -136,19 +150,31 @@ impl Parser {
         }
 
         let mid = self.new_match();
-        self.dfa
-            .start_pattern(ANY_STATE)
-            .push_ci(CRLF)
+        let mut pattern = self.dfa.start_pattern(ANY_STATE);
+        pattern
+            .push(LF)
             .push_ci(name.as_str())
             .push_optional("\t")
             .push_optional(" ")
             .push_ci(":")
             .push_optional("\t")
             .push_optional(" ")
-            .with(Action::StartCapture(mid))
+            .with(Action::StartCapture(mid));
+
+        // the value begins here, and it may be empty
+        let value = pattern.state();
+        pattern
             .push_any(1..)
             .with(Action::EndCapture(mid))
-            .restart_with(CRLF);
+            .push_optional(CR)
+            .restart_with(LF);
+
+        // an empty value ends its line where it would have begun, and there is
+        // nothing in it to capture
+        self.dfa
+            .start_pattern(value)
+            .push_optional(CR)
+            .restart_with(LF);
 
         self
     }
@@ -165,7 +191,10 @@ impl Parser {
         self.dfa
             .start_pattern(INIT_STATE)
             .with(Action::StartCapture(mid))
-            .push(&format!("PRI * HTTP/2.0{}{}SM{}{}", CRLF, CRLF, CRLF, CRLF))
+            .push(&format!(
+                "PRI * HTTP/2.0{}{}{}{}SM{}{}{}{}",
+                CR, LF, CR, LF, CR, LF, CR, LF
+            ))
             .with(Action::EndCaptureAndDone(mid));
 
         self
@@ -176,8 +205,10 @@ impl Parser {
     fn done_on_hdr_end(mut self) -> Parser {
         self.dfa
             .start_pattern(ANY_STATE)
-            .push(CRLF)
-            .push(CRLF)
+            .push_optional(CR)
+            .push(LF)
+            .push_optional(CR)
+            .push(LF)
             .with(Action::Done);
 
         self
@@ -204,7 +235,8 @@ impl Parser {
                 .push(" ")
                 .push_any(1..)
                 .push_ci(" HTTP/1.1")
-                .restart_with(CRLF);
+                .push_optional(CR)
+                .restart_with(LF);
         } else if name == &PATH {
             let mid = self.new_match();
             self.dfa
@@ -215,7 +247,8 @@ impl Parser {
                 .push_any(1..)
                 .with(Action::EndCapture(mid))
                 .push_ci(" HTTP/1.1")
-                .restart_with(CRLF);
+                .push_optional(CR)
+                .restart_with(LF);
         } else {
             panic!(
                 "capture_status_line_hdr called with unsupported header name: {}",
@@ -238,7 +271,8 @@ impl Parser {
             .push_any(3..=3)
             .with(Action::EndCapture(mid))
             .push_any(1..)
-            .restart_with(CRLF);
+            .push_optional(CR)
+            .restart_with(LF);
 
         self
     }
@@ -267,7 +301,7 @@ impl Parser {
         let mut open_skel = skel_builder.open(&mut open_obj)?;
         if tracing::event_enabled!(Level::TRACE) {
             open_skel.progs.parse_msg.set_log_level(1);
-            open_skel.progs.parse_buf.set_log_level(1);
+            open_skel.progs.parse_skb.set_log_level(1);
             open_skel.progs.parse_buf.set_log_level(1);
         }
 
@@ -331,30 +365,35 @@ impl Parser {
             );
         }
 
-        let num_edges = self.dfa.num_edges();
-        if num_edges > data.a2as.len() {
-            bail!(
-                "the patterns take {} edges, the parser holds {}",
-                num_edges,
-                data.a2as.len()
-            );
-        }
-
         // action index 0 is reserved for the noop action
         let mut action_idx = HashMap::new();
         action_idx.insert(None, 0usize);
 
         for (from, input, to, action) in self.dfa.iter_transitions() {
             let new_action_idx = action_idx.len();
-            let action = action_idx.entry(action).or_insert(new_action_idx);
-            let action = *action as u16;
+            let action = *action_idx.entry(action).or_insert(new_action_idx);
+            if action >= data.a2as.len() {
+                bail!(
+                    "the patterns take more actions than the {} the parser holds",
+                    data.a2as.len()
+                );
+            }
+
+            let action = action as u16;
+            let input = input as usize;
+            if input >= data.s2ts[0].len() {
+                bail!("the patterns read inputs the parser has no column for: {input}");
+            }
 
             trace!(
                 "inject; from={} to={} input={} action={}",
-                from.0, to.0, input as char, action
+                from.0,
+                to.0,
+                fmt_input(input as u16),
+                action
             );
 
-            data.s2ts[from.0 as usize][input as usize] = trans {
+            data.s2ts[from.0 as usize][input] = trans {
                 state: to.0,
                 action,
             };

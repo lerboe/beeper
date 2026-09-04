@@ -20,6 +20,20 @@ const METHOD_HEADER: HeaderName = HeaderName::from_static("method");
 const AUTHORITY_HEADER: HeaderName = HeaderName::from_static("authority");
 const PATH_HEADER: HeaderName = HeaderName::from_static("path");
 
+fn huffman_encode(s: &str) -> Vec<u8> {
+    let mut coded = Vec::new();
+    huffman::encode(s.as_bytes(), &mut coded).expect("encode");
+    assert!(
+        coded.len() < 127,
+        "huffman_encode only encodes a one byte length"
+    );
+
+    let mut out = vec![0x80 | coded.len() as u8];
+    out.extend_from_slice(&coded);
+
+    out
+}
+
 fn huffman_decode(val: &[u8]) -> String {
     let mut res = Vec::new();
     huffman::decode(val, &mut res, huffman::DecoderSpeed::OneBit).unwrap();
@@ -148,6 +162,23 @@ fn raw_str(s: &str) -> Vec<u8> {
     assert!(s.len() < 127, "raw_str only encodes a one byte length");
 
     let mut out = vec![s.len() as u8];
+    out.extend_from_slice(s.as_bytes());
+
+    out
+}
+
+/// Renders an HPACK string of any length, spelled out rather than Huffman
+/// coded. The length is written as the two byte integer of section 5.1 of RFC
+/// 7541 whenever it does not fit into the seven bit prefix.
+fn long_raw_str(s: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    if s.len() < 0x7F {
+        out.push(s.len() as u8);
+    } else {
+        assert!(s.len() < 0x7F + 128, "long_raw_str only encodes two bytes");
+        out.push(0x7F);
+        out.push((s.len() - 0x7F) as u8);
+    }
     out.extend_from_slice(s.as_bytes());
 
     out
@@ -1060,7 +1091,10 @@ async fn resolve_index_of_entry_added_after_an_eviction() {
     // decides whether the entries added before it keep the index they were
     // stored under
     client
-        .get(url.clone(), &[(header::USER_AGENT, other_agent_val.clone())])
+        .get(
+            url.clone(),
+            &[(header::USER_AGENT, other_agent_val.clone())],
+        )
         .await;
     assert_match_eq(&prog, 1, Some(&other_agent_val));
 
@@ -1145,5 +1179,244 @@ async fn mark_the_table_as_drifted_when_a_continuation_frame_splits_a_field() {
     assert_eq!(
         info.dirty, 1,
         "a block that breaks inside a field left the table looking trustworthy"
+    );
+}
+
+#[tokio::test]
+async fn update_dynamic_table_size_past_the_width_of_a_u16() {
+    let addr = server::launch().await.expect("launch server");
+
+    let mut open_obj = OpenObject::new();
+    let prog =
+        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
+
+    let _h1 = attach_preface_parser(prog.prog_fd());
+    let h2 = attach_h2_parser(prog.prog_fd(), &[header::ACCEPT]);
+
+    // SETTINGS_HEADER_TABLE_SIZE is a 32 bit parameter, and a size above 64KiB
+    // is one browsers do announce
+    let client = Client::connect(addr, Some(65536)).await;
+    client.get(format!("http://{}", addr), &[]).await;
+
+    let info = h2
+        .dynamic_table_info(client.local_addr, client.remote_addr)
+        .expect("dynamic_table_info");
+    assert_eq!(info.max_size, 65536);
+}
+
+#[tokio::test]
+async fn resolve_a_captured_index_against_the_table_it_was_read_from() {
+    let addr = server::launch().await.expect("launch server");
+
+    let mut open_obj = OpenObject::new();
+    let prog =
+        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
+
+    let _h1 = attach_preface_parser(prog.prog_fd());
+    let _h2 = attach_h2_parser(prog.prog_fd(), &[header::ACCEPT]);
+
+    let authority = addr.to_string();
+    let first = HeaderValue::from_static("first");
+
+    // the first request puts `accept: first` into the dynamic table, where it
+    // is the entry the next block can address with the first dynamic index
+    let mut client = RawClient::connect(addr).await;
+    client
+        .request(raw_request_block(
+            &authority,
+            &[(Some(19), "accept", "first")],
+        ))
+        .await;
+    assert_eq!(
+        prog.get_match(0).expect("get_match").as_deref(),
+        Some(first.as_bytes())
+    );
+
+    // the next block reads that entry by index and then adds one of its own,
+    // which pushes everything below it down by one. The field it adds is a
+    // `user-agent`, which matches no pattern, so nothing of it is captured and
+    // the `accept` read above is still the only capture of the block
+    let mut block = vec![0x82, 0x86, 0x84];
+    block.push(0x01);
+    block.extend_from_slice(&raw_str(&authority));
+    block.push(0x80 | FIRST_DYNAMIC_INDEX);
+    block.push(0x40 | 58);
+    block.extend_from_slice(&raw_str("junk"));
+
+    client.request(block).await;
+
+    assert_eq!(
+        prog.get_match(0).expect("get_match").as_deref(),
+        Some(first.as_bytes()),
+        "the capture followed the index into the entry that took its place"
+    );
+}
+
+#[tokio::test]
+async fn ignore_a_value_that_runs_into_the_frame_behind_it() {
+    let addr = server::launch().await.expect("launch server");
+
+    let mut open_obj = OpenObject::new();
+    let prog =
+        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
+
+    let _h1 = attach_preface_parser(prog.prog_fd());
+    let h2 = attach_h2_parser(prog.prog_fd(), &[header::ACCEPT]);
+
+    let authority = addr.to_string();
+    let mut client = RawClient::connect(addr).await;
+
+    // the same lie as in `ignore_header_field_whose_value_runs_past_the_frame`,
+    // except that a second frame follows in the same write, so the bytes the
+    // value claims are bytes the parser can read -- they just belong to the
+    // frame behind it
+    let mut block = vec![0x82, 0x86, 0x84];
+    block.push(0x01);
+    block.extend_from_slice(&raw_str(&authority));
+    block.push(0x40 | 19);
+    block.push(100);
+    block.extend_from_slice(b"ab");
+
+    let mut out = frame(0x01, 0x05, 1, &block);
+    out.extend_from_slice(&frame(0x01, 0x05, 3, &raw_request_block(&authority, &[])));
+
+    client.send_raw(&out).await;
+
+    // a field is only ever made of the bytes of its own block
+    let info = h2
+        .dynamic_table_info(client.local_addr, client.remote_addr)
+        .expect("dynamic_table_info");
+    assert_eq!(
+        info.count, 0,
+        "a value reaching into the next frame was added to the table"
+    );
+    assert_eq!(info.size, 0);
+}
+
+#[tokio::test]
+async fn size_a_dynamic_table_entry_that_is_longer_than_an_entry_holds() {
+    let addr = server::launch().await.expect("launch server");
+
+    let mut open_obj = OpenObject::new();
+    let prog =
+        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
+
+    let _h1 = attach_preface_parser(prog.prog_fd());
+    let h2 = attach_h2_parser(prog.prog_fd(), &[header::ACCEPT]);
+
+    let authority = addr.to_string();
+    let long = "a".repeat(130);
+    let long_val = HeaderValue::from_str(&long).expect("header value");
+
+    // the entry does not fit into the 128 bytes the mirrored table keeps of a
+    // field, but the peer sizes it by everything it sent, and it is that size
+    // that decides when the two tables evict
+    let mut block = vec![0x82, 0x86, 0x84];
+    block.push(0x01);
+    block.extend_from_slice(&raw_str(&authority));
+    block.push(0x40 | 19);
+    block.extend_from_slice(&long_raw_str(&long));
+
+    let mut client = RawClient::connect(addr).await;
+    client.request(block).await;
+
+    let info = h2
+        .dynamic_table_info(client.local_addr, client.remote_addr)
+        .expect("dynamic_table_info");
+
+    let expected_dt = &[(header::ACCEPT, long_val.clone())];
+    assert_eq!(info.count, expected_dt.len() as u32);
+    assert_eq!(
+        info.size,
+        dynamic_table_size_for_headers(expected_dt),
+        "a field longer than an entry holds was sized by what was kept of it"
+    );
+}
+
+#[tokio::test]
+async fn ignore_an_index_that_only_wraps_into_the_table() {
+    let addr = server::launch().await.expect("launch server");
+
+    let mut open_obj = OpenObject::new();
+    let prog =
+        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
+
+    let _h1 = attach_preface_parser(prog.prog_fd());
+    let _h2 = attach_h2_parser(prog.prog_fd(), &[header::ACCEPT]);
+
+    let authority = addr.to_string();
+    let secret = HeaderValue::from_static("secret");
+
+    let mut client = RawClient::connect(addr).await;
+    client
+        .request(raw_request_block(
+            &authority,
+            &[(Some(19), "accept", "secret")],
+        ))
+        .await;
+    assert_eq!(
+        prog.get_match(0).expect("get_match").as_deref(),
+        Some(secret.as_bytes())
+    );
+
+    // 32830 is the first dynamic index with the sixteenth bit set. No entry
+    // sits there, and an index that far past the end of the table is one a
+    // peer answers with a connection error
+    let idx: u32 = 0x8000 + FIRST_DYNAMIC_INDEX as u32;
+    let mut block = vec![0x82, 0x86, 0x84];
+    block.push(0x01);
+    block.extend_from_slice(&raw_str(&authority));
+    block.push(0xFF);
+    let mut rest = idx - 0x7F;
+    while rest >= 0x80 {
+        block.push(0x80 | (rest & 0x7F) as u8);
+        rest >>= 7;
+    }
+    block.push(rest as u8);
+
+    client.send_raw(&frame(0x01, 0x05, 3, &block)).await;
+
+    assert_eq!(
+        prog.get_match(0).expect("get_match"),
+        None,
+        "an index past the end of the table resolved to an entry inside it"
+    );
+}
+
+#[tokio::test]
+async fn match_a_field_name_by_the_whole_name() {
+    let addr = server::launch().await.expect("launch server");
+
+    let mut open_obj = OpenObject::new();
+    let prog =
+        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
+
+    // `a&b` is a legal field name whose Huffman code starts with the code of
+    // `a`, padding and all: the shorter name is a byte prefix of the longer one
+    let short = HeaderName::from_static("a");
+    let mut coded_short = Vec::new();
+    huffman::encode(short.as_str().as_bytes(), &mut coded_short).expect("encode");
+    let mut coded_long = Vec::new();
+    huffman::encode(b"a&b", &mut coded_long).expect("encode");
+    assert!(coded_long.starts_with(&coded_short));
+
+    let _h1 = attach_preface_parser(prog.prog_fd());
+    let _h2 = attach_h2_parser(prog.prog_fd(), &[short]);
+
+    let authority = addr.to_string();
+    let mut block = vec![0x82, 0x86, 0x84];
+    block.push(0x01);
+    block.extend_from_slice(&raw_str(&authority));
+    block.push(0x40);
+    block.extend_from_slice(&huffman_encode("a&b"));
+    block.extend_from_slice(&raw_str("not-the-one"));
+
+    let mut client = RawClient::connect(addr).await;
+    client.send_raw(&frame(0x01, 0x05, 1, &block)).await;
+
+    assert_eq!(
+        prog.get_match(0).expect("get_match"),
+        None,
+        "a field whose name only starts like the pattern was captured"
     );
 }
