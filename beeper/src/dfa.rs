@@ -10,9 +10,19 @@ pub const INIT_STATE: StateId = StateId(0);
 /// appear anywhere in the header block are anchored here.
 pub const ANY_STATE: StateId = StateId(1);
 
+/// What a transition is matched on: a byte of the message, or [`ANY_INPUT`].
+///
+/// It is wider than a byte so that the two cannot be confused. A pattern is
+/// free to spell out any byte there is, [`ANY_INPUT`] included, and the parser
+/// program reserves a column of its transition table for the latter.
+pub(crate) type Input = u16;
+
 /// The input a state matches any byte with. The parser only follows it if the
 /// state has no transition for the byte it read.
-const ANY_INPUT: u8 = '*' as u8;
+///
+/// It is not a byte, so that a pattern holding the byte it used to be spelled
+/// with, `*`, matches that byte and nothing else.
+const ANY_INPUT: Input = 0x100;
 
 /// A single transition of a [`Dfa`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,13 +47,13 @@ pub struct DfaBuilder<'a, A: Copy + Debug + PartialEq + Eq> {
     /// The state the pattern has been built up to.
     state: StateId,
 
-    /// Strings that may appear before the next input. They are only built into
+    /// Inputs that may appear before the next one. They are only built into
     /// the DFA once that input is known, as each of them has to lead back to
     /// the state it branched off of.
-    optional_prefixes: Vec<(String, bool)>,
+    optional_prefixes: Vec<(Vec<Input>, bool)>,
 
     /// All edges that lead into [`DfaBuilder::state`].
-    last_edges: Vec<(StateId, u8, bool)>,
+    last_edges: Vec<(StateId, Input, bool)>,
 }
 
 impl<A: Copy + Debug + PartialEq + Eq> DfaBuilder<'_, A> {
@@ -56,6 +66,12 @@ impl<A: Copy + Debug + PartialEq + Eq> DfaBuilder<'_, A> {
         }
     }
 
+    /// Returns the state the pattern has been built up to, so that another one
+    /// can be anchored at it with [`Dfa::start_pattern`].
+    pub fn state(&self) -> StateId {
+        self.state
+    }
+
     /// Attaches `action` to every transition that leads into the state the
     /// pattern has been built up to.
     pub fn with(&mut self, action: A) -> &mut Self {
@@ -66,13 +82,10 @@ impl<A: Copy + Debug + PartialEq + Eq> DfaBuilder<'_, A> {
         self.push_optional_prefixes();
 
         for (from, input, case_sensitive) in self.last_edges.clone() {
-            if case_sensitive {
-                self.dfa.add_action(from, input, action);
-            } else {
-                self.dfa
-                    .add_action(from, input.to_ascii_lowercase(), action);
-                self.dfa
-                    .add_action(from, input.to_ascii_uppercase(), action);
+            self.dfa.add_action(from, input, action);
+
+            if !case_sensitive && let Some(other) = other_case(input) {
+                self.dfa.add_action(from, other, action);
             }
         }
 
@@ -81,32 +94,35 @@ impl<A: Copy + Debug + PartialEq + Eq> DfaBuilder<'_, A> {
 
     /// Builds the optional prefixes that were pushed since the last input, each
     /// of them leading back into the state the pattern has been built up to.
+    ///
+    /// TODO: This creates a self-loop, such that the optional prefix can be repeated
+    /// multiple times. This is not intended in all cases.
     fn push_optional_prefixes(&mut self) {
         let start = self.state;
         while let Some((optional, case_sensitive)) = self.optional_prefixes.pop() {
             let mut from = start;
-            for (i, b) in optional.as_bytes().iter().enumerate() {
+            for (i, input) in optional.iter().enumerate() {
                 let to = if i == optional.len() - 1 {
-                    self.last_edges.push((from, *b, case_sensitive));
+                    self.last_edges.push((from, *input, case_sensitive));
                     Some(start)
                 } else {
                     None
                 };
 
-                from = self.push_edge_from(from, *b, to, case_sensitive);
+                from = self.push_edge_from(from, *input, to, case_sensitive);
             }
         }
     }
 
     /// Appends a single input to the pattern, first building the optional
     /// prefixes that were pushed since the last input.
-    fn push_edge(&mut self, input: u8, to: Option<StateId>, case_sensitive: bool) {
+    fn push_edge(&mut self, input: Input, to: Option<StateId>, case_sensitive: bool) {
         self.push_optional_prefixes();
 
         trace!(
             "push_edge; state={:?}, input={}, to={:?}",
             self.state,
-            (input as char).escape_debug(),
+            fmt_input(input),
             to
         );
 
@@ -122,22 +138,15 @@ impl<A: Copy + Debug + PartialEq + Eq> DfaBuilder<'_, A> {
     fn push_edge_from(
         &mut self,
         from: StateId,
-        input: u8,
+        input: Input,
         to: Option<StateId>,
         case_sensitive: bool,
     ) -> StateId {
         let to = to.unwrap_or(self.dfa.next_state(&from, &input));
 
         self.dfa.insert_edge(from, input, to, None);
-        if !case_sensitive {
-            let other_case = if input.is_ascii_lowercase() {
-                input.to_ascii_uppercase()
-            } else {
-                input.to_ascii_lowercase()
-            };
-            if other_case != input {
-                self.dfa.insert_edge(from, other_case, to, None);
-            }
+        if !case_sensitive && let Some(other) = other_case(input) {
+            self.dfa.insert_edge(from, other, to, None);
         }
 
         to
@@ -161,26 +170,28 @@ impl<A: Copy + Debug + PartialEq + Eq> DfaBuilder<'_, A> {
 
     pub fn push_inner(&mut self, input: &[u8], case_sensitive: bool) -> &mut Self {
         for b in input {
-            self.push_edge(*b, None, case_sensitive);
+            self.push_edge(Input::from(*b), None, case_sensitive);
         }
         self
     }
 
-    /// Pushes the [`ANY_INPUT`] character onto the [`Dfa`]. `range`
-    /// specifies the min and max amount of times any character may
+    /// Pushes the [`ANY_INPUT`] transition onto the [`Dfa`]. `range`
+    /// specifies the min and max amount of times any byte may
     /// appear in the matched string.
     pub fn push_any<R: RangeBounds<usize>>(&mut self, range: R) -> &mut Self {
         let min_len = match range.start_bound() {
-            std::ops::Bound::Excluded(n) => *&n.saturating_sub(1),
+            std::ops::Bound::Excluded(n) => n.saturating_add(1),
             std::ops::Bound::Included(n) => *n,
             std::ops::Bound::Unbounded => 0,
         };
 
         let max_len = match range.end_bound() {
-            std::ops::Bound::Excluded(n) => *&n.saturating_sub(1),
+            std::ops::Bound::Excluded(n) => n.saturating_sub(1),
             std::ops::Bound::Included(n) => *n,
             std::ops::Bound::Unbounded => min_len,
         };
+
+        assert!(min_len <= max_len, "Cannot push an empty range");
 
         trace!(
             "push_any; state={:?}, min_len={:?}, max_len={:?}",
@@ -192,9 +203,8 @@ impl<A: Copy + Debug + PartialEq + Eq> DfaBuilder<'_, A> {
         }
 
         // the following transitions are optional and must point to `self.state`
-        for i in 1..max_len - min_len {
-            let prefix = ANY_INPUT.to_string().repeat(i);
-            self.optional_prefixes.push((prefix, true));
+        for i in 1..=max_len - min_len {
+            self.optional_prefixes.push((vec![ANY_INPUT; i], true));
         }
 
         // the loop leads back into the state the repetition ends in, so it is
@@ -207,7 +217,8 @@ impl<A: Copy + Debug + PartialEq + Eq> DfaBuilder<'_, A> {
         self
     }
 
-    /// Same as [`push_options`], but case insensitive.
+    /// Adds a set of case-insensitive patterns to the DFA, one of
+    /// which must match for the DFA to accept an input.
     pub fn push_options_ci(&mut self, inputs: &[&str]) -> &mut Self {
         self.push_options_inner(inputs, false)
     }
@@ -244,7 +255,7 @@ impl<A: Copy + Debug + PartialEq + Eq> DfaBuilder<'_, A> {
                 } else {
                     None
                 };
-                self.push_edge(*b, to, case_sensitive);
+                self.push_edge(Input::from(*b), to, case_sensitive);
             }
 
             last_edges.append(&mut self.last_edges);
@@ -257,17 +268,18 @@ impl<A: Copy + Debug + PartialEq + Eq> DfaBuilder<'_, A> {
 
     /// Appends `input` to the pattern, but allows it to be skipped.
     pub fn push_optional(&mut self, input: &str) -> &mut Self {
-        self.optional_prefixes.push((input.to_string(), true));
+        let optional = input.bytes().map(Input::from).collect();
+        self.optional_prefixes.push((optional, true));
         self
     }
 
     /// Matches the given input string but sets the final state
     /// to the state the DFA would be in if it started from [`ANY_STATE`].
     pub fn restart_with(&mut self, input: &str) {
-        let final_state = input.as_bytes().iter().fold(ANY_STATE, |state, b| {
+        let final_state = input.bytes().map(Input::from).fold(ANY_STATE, |state, b| {
             // next state only inserts a state, we also have to ensure an edge exists
             let next = self.dfa.next_state(&state, &b);
-            self.push_edge_from(state, *b, Some(next), false);
+            self.push_edge_from(state, b, Some(next), false);
             next
         });
 
@@ -283,17 +295,37 @@ impl<A: Copy + Debug + PartialEq + Eq> DfaBuilder<'_, A> {
             } else {
                 None
             };
-            self.push_edge(*b, to, false);
+            self.push_edge(Input::from(*b), to, false);
         }
     }
 }
 
-type EdgeMap<A> = HashMap<StateId, HashMap<u8, Edge<A>>>;
+/// Returns the other case of `input`, or `None` if it is not a letter.
+fn other_case(input: Input) -> Option<Input> {
+    let byte = u8::try_from(input).ok()?;
+    let other = if byte.is_ascii_lowercase() {
+        byte.to_ascii_uppercase()
+    } else {
+        byte.to_ascii_lowercase()
+    };
+
+    (other != byte).then(|| Input::from(other))
+}
+
+/// Renders `input` the way it reads in a trace.
+pub(crate) fn fmt_input(input: Input) -> String {
+    match u8::try_from(input) {
+        Ok(byte) => (byte as char).escape_debug().to_string(),
+        Err(_) => "<any>".to_string(),
+    }
+}
+
+type EdgeMap<A> = HashMap<StateId, HashMap<Input, Edge<A>>>;
 
 /// The DFA the patterns of a [`Parser`](super::Parser) are compiled into.
 ///
 /// It is injected into the BPF parser program as a table of transitions,
-/// indexed by state and input byte, which is why states are shared between
+/// indexed by state and input, which is why states are shared between
 /// patterns wherever possible. A transition names the action it carries by the
 /// index it is held under in [`Dfa::actions`], so that an action can say more
 /// than the 16 bits of a transition have room for.
@@ -324,11 +356,6 @@ impl<A: Copy + Debug + PartialEq + Eq> Dfa<A> {
         self.num_states
     }
 
-    /// Returns the number of edges the DFA has.
-    pub fn num_edges(&self) -> usize {
-        self.edges.len()
-    }
-
     /// Starts a new pattern anchored at `state`, which the caller has to have
     /// reserved with [`Dfa::with_reserved_states`].
     pub fn start_pattern<'a>(&'a mut self, state: StateId) -> DfaBuilder<'a, A> {
@@ -345,7 +372,7 @@ impl<A: Copy + Debug + PartialEq + Eq> Dfa<A> {
 
     /// Queries the edges to retrieve the next state from given state and
     /// input character. Creates a new state if none exists.
-    fn next_state(&mut self, from: &StateId, input: &u8) -> StateId {
+    fn next_state(&mut self, from: &StateId, input: &Input) -> StateId {
         self.edges
             .get(from)
             .and_then(|es| es.get(input).map(|edge| edge.to))
@@ -363,7 +390,7 @@ impl<A: Copy + Debug + PartialEq + Eq> Dfa<A> {
     /// Panics if `from` already has an edge for `input` that leads somewhere
     /// else, as that would make the automaton non-deterministic, or if it
     /// carries an action `action` cannot be combined with.
-    pub fn insert_edge(&mut self, from: StateId, input: u8, to: StateId, action: Option<A>) {
+    pub fn insert_edge(&mut self, from: StateId, input: Input, to: StateId, action: Option<A>) {
         let edges = self.edges.entry(from).or_default();
         let Some(old) = edges.get_mut(&input) else {
             let _ = edges.insert(input, Edge { to, action });
@@ -393,8 +420,9 @@ impl<A: Copy + Debug + PartialEq + Eq> Dfa<A> {
     ///
     /// # Panics
     ///
-    /// Panics if the edge does not exist, or already has an action assigned.
-    fn add_action(&mut self, from: StateId, input: u8, action: A) {
+    /// Panics if the edge does not exist, or already carries an action `action`
+    /// cannot be combined with.
+    fn add_action(&mut self, from: StateId, input: Input, action: A) {
         let Some(edges) = self.edges.get_mut(&from) else {
             panic!("State not found");
         };
@@ -403,13 +431,22 @@ impl<A: Copy + Debug + PartialEq + Eq> Dfa<A> {
             panic!("Edge not found");
         };
 
+        if let Some(old_action) = edge.action {
+            assert!(
+                old_action == action,
+                "Cannot {action:?} and {old_action:?} on the same transition"
+            );
+        }
+
         edge.action = Some(action);
     }
 
     /// Returns an iterator over the transitions of the DFA, each paired with
     /// the id of the action it carries: its own if it has one, and the one of
     /// the state it leads to otherwise.
-    pub fn iter_transitions(&self) -> impl Iterator<Item = (StateId, u8, StateId, Option<A>)> + '_ {
+    pub fn iter_transitions(
+        &self,
+    ) -> impl Iterator<Item = (StateId, Input, StateId, Option<A>)> + '_ {
         self.edges.iter().flat_map(move |(from, edges)| {
             edges
                 .iter()

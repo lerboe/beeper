@@ -386,6 +386,14 @@ static __always_inline u32 _get_dynamic_table_index(const struct dynamic_table_i
     return (end_idx - idx) + STATIC_TABLE_SIZE;
 }
 
+// Whether `idx` names an entry either table holds. HPACK numbers the static
+// table from 1 and carries on into the dynamic one, so everything above the
+// entry added last is out of range, and section 2.3.3 of RFC 7541 has a peer
+// answer such an index with a decoding error rather than with an entry.
+static __always_inline bool _is_valid_hpack_index(const struct dynamic_table_info *dt_info __arg_nonnull, u32 idx) {
+    return idx > 0 && idx <= STATIC_TABLE_SIZE + dt_info->count;
+}
+
 // Resolves the match `m` into the bytes it refers to, either in the message
 // itself or, if the peer only referenced the field by index, in the static or
 // the dynamic table. `is_key` selects the name of a table entry over its value.
@@ -403,12 +411,17 @@ static __always_inline void _extract_match(const struct msg_ctx *ctx, const stru
     if (m->idx > STATIC_TABLE_SIZE) {
         struct dynamic_table_info *dt_info = bpf_map_lookup_elem(&dynamic_table_info, &ctx->conn);
         if (dt_info == NULL) return;
+        if (!_is_valid_hpack_index(dt_info, m->idx)) return;
 
         u32 idx = _get_dynamic_table_index(dt_info, m->idx);
         struct dynamic_table_key key = _new_dynamic_table_key(&ctx->conn, idx);
         entry = bpf_map_lookup_elem(&dynamic_table, &key);
     }
     else {
+        // the static table is an array, so it answers for every index below its
+        // size, index 0 included, which HPACK does not use
+        if (m->idx == 0) return;
+
         u32 key = m->idx;
         entry = bpf_map_lookup_elem(&static_table, &key);
     }
@@ -451,6 +464,11 @@ static __always_inline void _next(u16 state, u8 input, u16 *next_state, u16 *act
 // is one of the first `STATIC_TABLE_SIZE` indices and in the dynamic table of
 // `conn` otherwise. `*hf` is NULL if there is no such entry.
 static __always_inline void _get_table_entry(const struct ip4_conn *conn __arg_nonnull, const struct dynamic_table_info *dt_info __arg_nonnull, u32 idx, struct header_field **hf) {
+    if (!_is_valid_hpack_index(dt_info, idx)) {
+        *hf = NULL;
+        return;
+    }
+
     if (idx > STATIC_TABLE_SIZE) {
         if (dt_info->dirty) {
             *hf = NULL;
@@ -475,20 +493,25 @@ static __always_inline void _get_table_entry(const struct ip4_conn *conn __arg_n
 // by index, and returns the id of the capture it matched, or -1 if the name
 // matches no pattern.
 //
+// A pattern only matches the name it spells out, never a name that merely
+// starts with it: the walk carries on to the last byte of the name and only
+// the capture the last one leads into counts.
+//
 // It is only reached through `_run_action`, so the walk is verified once rather
 // than as part of every byte of the block the parser reads.
 static __always_inline int _match_header_key(const u8 *key __arg_nonnull, u16 key__sz) {
     u16 s = S_NAME;
     u16 j = 0;
+    int mid = -1;
     bpf_for(j, 0, key__sz) {
         u16 a = 0;
         _next(s, key[j], &s, &a);
 
         struct h2_action act = _action(a);
-        if (act.kind == H2A_CAPTURE) return act.val & MAX_MATCH_MASK;
+        mid = (act.kind == H2A_CAPTURE) ? (int)(act.val & MAX_MATCH_MASK) : -1;
     }
 
-    return -1;
+    return mid;
 }
 
 // Returns the state of `conn`'s dynamic table, creating an empty table with the
@@ -571,8 +594,15 @@ __noinline __weak int _add_dynamic_table_entry(const struct msg_ctx *ctx __arg_n
     _extract_match(ctx, val, false, &val_ptr, &val_len, &val_huff);
     if (!val_ptr) return -1;
 
-    key_len = key_len & HEADER_FIELD_MASK;
-    val_len = val_len & HEADER_FIELD_MASK;
+    // an entry only keeps the first `HEADER_FIELD_MAXLEN` bytes of a field, but
+    // it is sized by everything the peer sent, or the two tables would evict at
+    // different points
+    u32 key_wire_len = key_len;
+    u32 val_wire_len = val_len;
+    bool key_cut = (key_len > HEADER_FIELD_MAXLEN);
+    bool val_cut = (val_len > HEADER_FIELD_MAXLEN);
+    bpf_clamp_uminmax(key_len, 0, HEADER_FIELD_MAXLEN);
+    bpf_clamp_uminmax(val_len, 0, HEADER_FIELD_MAXLEN);
 
     int per_cpu_key = 0;
     struct dynamic_table_entry *dt_val = bpf_map_lookup_elem(&dynamic_table_entry, &per_cpu_key);
@@ -591,8 +621,17 @@ __noinline __weak int _add_dynamic_table_entry(const struct msg_ctx *ctx __arg_n
     dt_val->field.key_huff = key_huff;
     dt_val->field.val_huff = val_huff;
 
-    u16 key_len_decoded = key_huff ? hpack_huffman_decoded_len(dt_val->field.key, key_len) : key_len;
-    u16 val_len_decoded = val_huff ? hpack_huffman_decoded_len(dt_val->field.val, val_len) : val_len;
+    // the decoded length of a Huffman coded field can only be counted off the
+    // bytes the entry kept, so a coded field that was truncated is one the
+    // mirrored table can no longer size the way the peer does
+    if ((key_cut && key_huff) || (val_cut && val_huff)) {
+        bpf_debug("dt: a Huffman coded field longer than %d bytes, the table has drifted", HEADER_FIELD_MAXLEN);
+        dt_info->dirty = 1;
+        return -1;
+    }
+
+    u32 key_len_decoded = key_huff ? hpack_huffman_decoded_len(dt_val->field.key, key_len) : key_wire_len;
+    u32 val_len_decoded = val_huff ? hpack_huffman_decoded_len(dt_val->field.val, val_len) : val_wire_len;
     dt_val->size = key_len_decoded + val_len_decoded + 32;
 
     _try_evict_dynamic_table_entries(ctx, dt_info, dt_val->size);
@@ -620,8 +659,9 @@ __noinline __weak int _add_dynamic_table_entry(const struct msg_ctx *ctx __arg_n
 static __always_inline int _parse_stg_from(const struct msg_ctx *ctx, u16 start, u16 end, u16 *s, struct parse_res *pres, u16 *null_prefix) {
     const u8 *data = ctx->data;
     const u8 *data_end = ctx->data_end;
-    u32 len = (u32)(data_end - data) & MAX_BYTES;
-    if (end < len) len = end & MAX_BYTES;
+    u32 len = (u32)(data_end - data);
+    bpf_clamp_uminmax(len, 0, MAX_BYTES);
+    if (end < len) len = end;
     if (data + 9 > data_end) return 0;
 
     u8 type = data[3];
@@ -656,8 +696,8 @@ static __always_inline int _parse_stg_from(const struct msg_ctx *ctx, u16 start,
 
         if (j == 6) {
             if (id == SETTINGS_HEADER_TABLE_SIZE) {
-                dt_info->max_size = (u16)val;
-                bpf_debug("stg: table header size: %u", (u16)val);
+                dt_info->max_size = val;
+                bpf_debug("stg: table header size: %u", val);
             }
             j = 0;
             id = 0;
@@ -753,20 +793,29 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
     // matched. Both representations that carry one are handled here, so that the
     // walk over the entry is only built into the program once
     if (ps->kind == H2A_INDEXED || ps->kind == H2A_IDX_NAME) {
+        u32 idx = ps->v;
+        bool in_range = _is_valid_hpack_index(dt_info, idx);
+
         ps->add_to_dt = (ps->flags & H2F_ADD_DT) != 0;
         ps->cid = -1;
+
+        // an index in range fits into the match it is reported with, one out
+        // of range is reported as 0, which names no entry either
         ps->key = (struct hdr_match) {
-            .idx = v,
+            .idx = in_range ? idx : 0,
             .len = 0,
             .in_msg = false,
             .huff = false,
         };
 
         struct header_field *hf = NULL;
-        _get_table_entry(&ctx->conn, dt_info, v, &hf);
+        _get_table_entry(&ctx->conn, dt_info, idx, &hf);
         if (hf == NULL) return 0;
 
-        int mid = _match_header_key(hf->key, hf->key_len & HEADER_FIELD_MASK);
+        u32 key_len = hf->key_len;
+        bpf_clamp_uminmax(key_len, 0, HEADER_FIELD_MAXLEN);
+
+        int mid = _match_header_key(hf->key, key_len);
         if (mid < 0) return 0;
 
         if (ps->kind == H2A_IDX_NAME) {
@@ -777,7 +826,7 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
         // both halves of the field are in the table, so the value is reported
         // as the index it is to be read back with
         pres->ms[mid & MAX_MATCH_MASK] = (struct hdr_match) {
-            .idx = v,
+            .idx = idx,
             .len = HEADER_FIELD_MASK,
             .in_msg = false,
             .huff = false,
@@ -831,8 +880,8 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
     }
 
     if (ps->kind == H2A_TABLE_SIZE) {
-        bpf_debug("hdr: table size update: %u", v);
-        dt_info->max_size = v;
+        bpf_debug("hdr: table size update: %u", ps->v);
+        dt_info->max_size = ps->v;
         return 0;
     }
 
@@ -858,13 +907,13 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
 static __always_inline int _parse_hdr_from(const struct msg_ctx *ctx, u16 start, u16 end, struct dynamic_table_info *dt_info, struct h2_parse_state *ps, struct parse_res *pres, u16 *null_prefix) {
     const u8 *data = ctx->data;
     const u8 *data_end = ctx->data_end;
-    u32 len = (u32)(data_end - data) & MAX_BYTES;
-    if (end < len) len = end & MAX_BYTES;
+
+    u32 len = (u32)(data_end - data);
+    bpf_clamp_uminmax(len, 0, MAX_BYTES);
+    if (end < len) len = end;
 
     u32 i = 0;
     bpf_for(i, start, len+1) {
-        // the block ends before the message does when the message carries more
-        // than one frame, so the loop cannot lean on the bounds check alone
         if (i >= len) break;
         if (data + i + 1 > data_end) break;
         u8 c = data[i];
@@ -881,13 +930,10 @@ static __always_inline int _parse_hdr_from(const struct msg_ctx *ctx, u16 start,
                 _next(ps->s, c, &ps->s, &a);
 
                 struct h2_action act = _action(a);
-                if (act.kind == H2A_CAPTURE) ps->cid = act.val & MAX_MATCH_MASK;
+                ps->cid = (act.kind == H2A_CAPTURE) ? (s8)(act.val & MAX_MATCH_MASK) : -1;
             }
 
             ps->skip--;
-            // the name ended, so the length of the value comes next. A value
-            // ends on the transition that announced it, which already leads
-            // back to `S_FIELD`
             if (ps->skip == 0 && ps->is_key) ps->s = S_VAL_LEN;
 
             continue;
