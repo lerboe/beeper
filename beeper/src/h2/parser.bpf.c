@@ -20,6 +20,10 @@
 // The number of entries of the HPACK static table, see appendix A of RFC 7541.
 #define STATIC_TABLE_SIZE 61
 
+// The index the entries of a dynamic table are stored under starts above the
+// last static one, so that a stored index names the table it belongs to.
+#define DYNAMIC_TABLE_BASE (STATIC_TABLE_SIZE + 1)
+
 // The identifier of the SETTINGS parameter announcing the size of the dynamic
 // table.
 #define SETTINGS_HEADER_TABLE_SIZE 0x1
@@ -383,7 +387,7 @@ static __always_inline struct dynamic_table_key _new_dynamic_table_key(const str
 // was added last, into the index the entry is stored under.
 static __always_inline u32 _get_dynamic_table_index(const struct dynamic_table_info *dt_info __arg_nonnull, u32 idx) {
     u32 end_idx = STATIC_TABLE_SIZE + dt_info->count + dt_info->deleted;
-    return (end_idx - idx) + STATIC_TABLE_SIZE;
+    return (end_idx - idx) + DYNAMIC_TABLE_BASE;
 }
 
 // Whether `idx` names an entry either table holds. HPACK numbers the static
@@ -408,13 +412,10 @@ static __always_inline void _extract_match(const struct msg_ctx *ctx, const stru
     }
 
     struct dynamic_table_entry *entry = NULL;
-    if (m->idx > STATIC_TABLE_SIZE) {
-        struct dynamic_table_info *dt_info = bpf_map_lookup_elem(&dynamic_table_info, &ctx->conn);
-        if (dt_info == NULL) return;
-        if (!_is_valid_hpack_index(dt_info, m->idx)) return;
-
-        u32 idx = _get_dynamic_table_index(dt_info, m->idx);
-        struct dynamic_table_key key = _new_dynamic_table_key(&ctx->conn, idx);
+    if (m->idx >= DYNAMIC_TABLE_BASE) {
+        // an entry that has been evicted since the match was taken is one the
+        // lookup no longer finds, which is the answer either way
+        struct dynamic_table_key key = _new_dynamic_table_key(&ctx->conn, m->idx);
         entry = bpf_map_lookup_elem(&dynamic_table, &key);
     }
     else {
@@ -538,7 +539,7 @@ static __always_inline struct dynamic_table_info* _get_dynamic_table(const struc
 //
 // An entry that does not fit into the empty table frees all of them, and is
 // then dropped by the caller, which is what the peer does with it as well.
-__noinline __weak u32 _try_evict_dynamic_table_entries(const struct msg_ctx *ctx __arg_nonnull, struct dynamic_table_info *dt_info __arg_nonnull, u32 new_entry_size) {
+static __always_inline u32 _try_evict_dynamic_table_entries(const struct msg_ctx *ctx __arg_nonnull, struct dynamic_table_info *dt_info __arg_nonnull, u32 new_entry_size) {
     bpf_trace("dt: try evicting %dB (%d actual entries)", new_entry_size, dt_info->count);
 
     u32 freed = 0;
@@ -547,7 +548,7 @@ __noinline __weak u32 _try_evict_dynamic_table_entries(const struct msg_ctx *ctx
 
         // entries are stored under the running count of the ones added so far,
         // so the oldest one that is still live sits right above the evicted
-        u32 idx = STATIC_TABLE_SIZE + dt_info->deleted;
+        u32 idx = DYNAMIC_TABLE_BASE + dt_info->deleted;
         struct dynamic_table_key key = _new_dynamic_table_key(&ctx->conn, idx);
         struct dynamic_table_entry *entry = bpf_map_lookup_elem(&dynamic_table, &key);
         if (!entry) {
@@ -608,7 +609,7 @@ __noinline __weak int _add_dynamic_table_entry(const struct msg_ctx *ctx __arg_n
     struct dynamic_table_entry *dt_val = bpf_map_lookup_elem(&dynamic_table_entry, &per_cpu_key);
     if (!dt_val) return -1;
 
-    u32 idx = STATIC_TABLE_SIZE + dt_info->count + dt_info->deleted;
+    u32 idx = DYNAMIC_TABLE_BASE + dt_info->count + dt_info->deleted;
     struct dynamic_table_key dt_key = _new_dynamic_table_key(&ctx->conn, idx);
 
     __builtin_memset(dt_val, 0, sizeof(*dt_val));
@@ -796,13 +797,21 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
         u32 idx = ps->v;
         bool in_range = _is_valid_hpack_index(dt_info, idx);
 
+        u32 slot = 0;
+        if (in_range) {
+            slot = idx > STATIC_TABLE_SIZE ? _get_dynamic_table_index(dt_info, idx) : idx;
+
+            // if we overflow, at least we won't report the wrong header
+            if (slot > 0xffff) slot = 0;
+        }
+
         ps->add_to_dt = (ps->flags & H2F_ADD_DT) != 0;
         ps->cid = -1;
 
-        // an index in range fits into the match it is reported with, one out
-        // of range is reported as 0, which names no entry either
+        // an index that cannot be reported is reported as 0, which names no
+        // entry either
         ps->key = (struct hdr_match) {
-            .idx = in_range ? idx : 0,
+            .idx = slot,
             .len = 0,
             .in_msg = false,
             .huff = false,
@@ -826,7 +835,7 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
         // both halves of the field are in the table, so the value is reported
         // as the index it is to be read back with
         pres->ms[mid & MAX_MATCH_MASK] = (struct hdr_match) {
-            .idx = idx,
+            .idx = slot,
             .len = HEADER_FIELD_MASK,
             .in_msg = false,
             .huff = false,

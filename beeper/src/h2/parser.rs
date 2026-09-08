@@ -252,7 +252,7 @@ impl Parser {
         let skel_builder = ParserSkelBuilder::default();
         let mut open_obj: MaybeUninit<OpenObject> = MaybeUninit::uninit();
         let mut open_skel = skel_builder.open(&mut open_obj)?;
-        if tracing::event_enabled!(Level::TRACE) {
+        if tracing::event_enabled!(target: "bpf", Level::TRACE) {
             open_skel.progs.parse_msg.set_log_level(1);
             open_skel.progs.parse_skb.set_log_level(1);
             open_skel.progs.parse_buf.set_log_level(1);
