@@ -1,13 +1,13 @@
 #![allow(unused_imports)]
 use crate::{
-    Dfa, MatchId, autoload_and_attach,
+    Dfa, MatchId, autoload_and_attach, bench,
     dfa::{ANY_STATE, INIT_STATE, fmt_input},
     h1::action::Action,
     header::{METHOD, PATH, STATUS},
 };
 use anyhow::{Result, bail};
 use http::HeaderName;
-use std::{collections::HashMap, mem::MaybeUninit};
+use std::{collections::HashMap, mem::MaybeUninit, time::Duration};
 use tracing::{Level, debug, trace, warn};
 use types::*;
 use xbpf::libbpf::{
@@ -320,6 +320,8 @@ impl Parser {
             autoload_and_attach(prog, target, func)?;
         }
 
+        open_skel.progs.bench.set_autoload(false);
+
         parser.inject(&mut open_skel)?;
 
         let skel = open_skel.load()?;
@@ -347,6 +349,46 @@ impl Parser {
         debug!("Beeper http/1 attached");
 
         anyhow::Ok(AttachedParser { links })
+    }
+
+    /// Loads the configured parser on its own and times it over `buf`.
+    ///
+    /// Nothing is attached to a target program: the parser walks `buf` `n`
+    /// times inside a single `BPF_PROG_TEST_RUN`, so what is measured is the
+    /// parse and not the syscall around it. Loading a program is privileged, so
+    /// this only works as root.
+    ///
+    /// # Arguments
+    ///
+    /// * `buf` - The message to parse, at most [`bench::BUF_LEN`] bytes of it
+    /// * `n` - How often to parse it
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the parser cannot be loaded, if `buf` is longer than
+    /// the parser can read, or if the parse fails.
+    pub fn bench(self, buf: &[u8], n: u32) -> Result<Duration> {
+        let parser = self.done_on_hdr_end();
+
+        let skel_builder = ParserSkelBuilder::default();
+        let mut open_obj: MaybeUninit<OpenObject> = MaybeUninit::uninit();
+        let mut open_skel = skel_builder.open(&mut open_obj)?;
+
+        for prog in [
+            &mut open_skel.progs.parse_msg,
+            &mut open_skel.progs.parse_skb,
+            &mut open_skel.progs.parse_buf,
+            &mut open_skel.progs.matched,
+            &mut open_skel.progs.extract_match,
+        ] {
+            prog.set_autoload(false);
+        }
+
+        parser.inject(&mut open_skel)?;
+
+        let skel = open_skel.load()?;
+
+        bench::run(&skel.progs.bench, buf, n)
     }
 
     /// Writes the transition table of the DFA into the read-only data of the

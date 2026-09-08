@@ -29,6 +29,10 @@ xbpf = "0.0.2"
 [build-dependencies]
 xbpf = { version = "0.0.2", features = ["build"] }
 
+[[bench]]
+name = "parser"
+harness = false
+
 [dev-dependencies]
 reqwest = "0.13.4"
 tokio = { version = "1.53", features = ["full"] }

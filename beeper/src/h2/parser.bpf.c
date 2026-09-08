@@ -276,7 +276,7 @@ static __always_inline u32 hpack_huffman_decoded_len(const u8 *src, u16 src__sz)
     u32 code = 0, len = 0, n = 0;
     u32 i = 0;
 
-    bpf_for (i, 0, src__sz) {
+    bpf_for(i, 0, src__sz) {
         u8 c = src[i];
         HPACK_HUFF_STEP(c, 7);
         HPACK_HUFF_STEP(c, 6);
@@ -1134,9 +1134,18 @@ int parse_skb(struct __sk_buff *skb, struct parse_res *pres __arg_nonnull, struc
 // Parses the frame `buf_ptr` starts with. A buffer carries no connection of its
 // own, so `conn` has to name the one it belongs to for the dynamic table to be
 // found. Only HEADERS frames are decoded. See `parse_msg` for the return value.
-SEC("freplace")
-int parse_buf(const struct bpf_dynptr *buf_ptr, struct ip4_conn *conn, struct parse_res *pres __arg_nonnull, struct h2_frame *frame __arg_nonnull, u16 *null_prefix) {
-    u8 *data = bpf_dynptr_data(buf_ptr, 0, 9);
+//
+// The slice is taken at `BEEPER_BUF_LEN`, the only length the verifier lets the
+// program ask for, so `buf_ptr` has to hold that many bytes no matter how long
+// the frame in it is, and a frame that does not fit into the slice is turned
+// down.
+//
+// The work sits in a function of its own because libbpf turns down a call that
+// reaches from one program section into another, and `bench` has to call it too.
+__noinline __weak int _parse_buf(const struct bpf_dynptr *buf_ptr, struct ip4_conn *conn, struct parse_res *pres __arg_nonnull, struct h2_frame *frame __arg_nonnull, u16 *null_prefix) {
+    if (conn == NULL) return -1;
+
+    u8 *data = bpf_dynptr_data(buf_ptr, 0, BEEPER_BUF_LEN);
     if (data == NULL) return -1;
 
     u32 len = data[0] << 16 | data[1] << 8 | data[2];
@@ -1152,8 +1161,11 @@ int parse_buf(const struct bpf_dynptr *buf_ptr, struct ip4_conn *conn, struct pa
         return frame_len;
     }
 
-    data = bpf_dynptr_data(buf_ptr, 0, frame_len);
-    if (data == NULL) return -1;
+    if (frame_len > BEEPER_BUF_LEN) return -1;
+
+    // the check above bounds a register the verifier tracks apart from the one
+    // the walk is bounded by, so the bound has to be spelled out again
+    bpf_clamp_uminmax(frame_len, H2_FRAME_HDR_LEN, BEEPER_BUF_LEN);
 
     struct msg_ctx ctx = {
         .data = data,
@@ -1164,7 +1176,16 @@ int parse_buf(const struct bpf_dynptr *buf_ptr, struct ip4_conn *conn, struct pa
     u16 start = 0, end = 0;
     if (_h2_block(ctx.data, ctx.data_end, len, type, flags, &start, &end) < 0) return -1;
 
+    // `end` never points past the frame, but it is read back off the stack as
+    // any u16, and it is what bounds the walk over the slice
+    bpf_clamp_uminmax(end, 0, BEEPER_BUF_LEN);
+
     return _parse_hdr_frame(&ctx, start, end, type, flags, pres, null_prefix);
+}
+
+SEC("freplace")
+int parse_buf(const struct bpf_dynptr *buf_ptr, struct ip4_conn *conn, struct parse_res *pres __arg_nonnull, struct h2_frame *frame __arg_nonnull, u16 *null_prefix) {
+    return _parse_buf(buf_ptr, conn, pres, frame, null_prefix);
 }
 
 // Reads the `idx`th entry of `conn`'s dynamic table into `out`, `idx` counted
@@ -1218,4 +1239,67 @@ int extract_match(const struct sk_msg_md *msg, const struct parse_res *pres __ar
         .ptr = ptr
     };
     return 0;
+}
+
+// What the benchmark program is run with: the frame, the number of bytes of it
+// that user space filled in, and how often it is to be parsed. The buffer is
+// carried in the context rather than in a map so that a single
+// `BPF_PROG_TEST_RUN` says everything about a run. `len` is only there to keep
+// the layout the same as the one of the HTTP/1.x benchmark, as a frame says how
+// long it is in its own header.
+struct bench_args {
+    u32 n;
+    u32 len;
+    u8 buf[BEEPER_BUF_LEN];
+};
+
+// A copy of the frame the benchmark program parses, next to the scratch the
+// parse reports into. `bpf_dynptr_from_mem` only makes a dynptr of a map value,
+// so the frame cannot be parsed out of the context it arrives in, and the
+// results have to live here as well: the 512 bytes of stack a call chain gets
+// are taken up by the parser's own frames.
+struct bench_buf {
+    u8 data[BEEPER_BUF_LEN];
+    struct parse_res pres;
+    struct h2_frame frame;
+    struct ip4_conn conn;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, struct bench_buf);
+} bench_bufs SEC(".maps");
+
+// Parses `args->buf` `args->n` times over, so that user space can time the
+// parser without paying for a syscall per frame. Every pass reports into the
+// same `parse_res`, which the next one overwrites again, and all of them belong
+// to the same, zeroed connection.
+//
+// Returns what the last pass returned, or -1 if the buffer could not be set up.
+SEC("syscall")
+int bench(struct bench_args *args) {
+    u32 key = 0;
+    struct bench_buf *buf = bpf_map_lookup_elem(&bench_bufs, &key);
+    if (buf == NULL) return -1;
+
+    __builtin_memcpy(buf->data, args->buf, BEEPER_BUF_LEN);
+
+    struct bpf_dynptr ptr;
+    if (bpf_dynptr_from_mem(buf->data, BEEPER_BUF_LEN, 0, &ptr) < 0) return -1;
+
+    u32 n = args->n;
+    int res = 0;
+
+    u32 i;
+    bpf_for(i, 0, n) {
+        res = _parse_buf(&ptr, &buf->conn, &buf->pres, &buf->frame, NULL);
+
+        // without this the compiler is free to notice that every pass computes
+        // the same thing and to run only one of them
+        __sink(res);
+    }
+
+    return res;
 }

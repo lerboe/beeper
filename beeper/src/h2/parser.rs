@@ -1,6 +1,6 @@
 #![allow(unused_imports)]
 use crate::{
-    Dfa, MatchId, autoload_and_attach,
+    Dfa, MatchId, autoload_and_attach, bench,
     h2::{action::*, hpack},
 };
 use anyhow::{Result, bail};
@@ -11,6 +11,7 @@ use plain::Plain;
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
 use std::net::SocketAddr;
+use std::time::Duration;
 use tracing::{Level, debug, warn};
 use types::*;
 pub use types::{ip4_addr, ip4_conn};
@@ -274,6 +275,8 @@ impl Parser {
             autoload_and_attach(prog, target, func)?;
         }
 
+        open_skel.progs.bench.set_autoload(false);
+
         self.inject(&mut open_skel)?;
 
         let skel = open_skel.load()?;
@@ -310,6 +313,50 @@ impl Parser {
             dynamic_table_info: MapHandle::from_map_id(id)?,
             links,
         })
+    }
+
+    /// Loads the configured parser on its own and times it over `buf`.
+    ///
+    /// Nothing is attached to a target program: the frame in `buf` is parsed
+    /// `n` times inside a single `BPF_PROG_TEST_RUN`, so what is measured is
+    /// the parse and not the syscall around it. Every pass belongs to the same,
+    /// zeroed connection, and so shares one dynamic table. Loading a program is
+    /// privileged, so this only works as root.
+    ///
+    /// # Arguments
+    ///
+    /// * `buf` - The frame to parse, at most [`bench::BUF_LEN`] bytes of it
+    /// * `n` - How often to parse it
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the parser cannot be loaded, if `buf` is longer than
+    /// the parser can read, or if the parse fails.
+    pub fn bench(self, buf: &[u8], n: u32) -> Result<Duration> {
+        let skel_builder = ParserSkelBuilder::default();
+        let mut open_obj: MaybeUninit<OpenObject> = MaybeUninit::uninit();
+        let mut open_skel = skel_builder.open(&mut open_obj)?;
+
+        for prog in [
+            &mut open_skel.progs.parse_msg,
+            &mut open_skel.progs.parse_skb,
+            &mut open_skel.progs.parse_buf,
+            &mut open_skel.progs.matched,
+            &mut open_skel.progs.extract_match,
+            &mut open_skel.progs.get_dt_entry,
+        ] {
+            prog.set_autoload(false);
+        }
+
+        self.inject(&mut open_skel)?;
+
+        let skel = open_skel.load()?;
+
+        let id = skel.maps.static_table.info()?.info.id;
+        let static_table = MapHandle::from_map_id(id)?;
+        self.populate_static_table(&static_table)?;
+
+        bench::run(&skel.progs.bench, buf, n)
     }
 
     /// Writes the transition table of the DFA and the actions its transitions

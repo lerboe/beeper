@@ -33,6 +33,9 @@ use xbpf::libbpf::{Mut, OpenProgramImpl};
 
 mod dfa;
 
+#[cfg(any(feature = "h1", feature = "h2"))]
+pub mod bench;
+
 #[cfg(feature = "build")]
 pub mod build;
 

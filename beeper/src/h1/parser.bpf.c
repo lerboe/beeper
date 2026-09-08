@@ -102,8 +102,11 @@ static __always_inline int _parse_from(u8 *data, u8 *data_end, u16 start, struct
         return 0;
     }
 
+    // the last index the loop may reach has to stay below `len`: a dynptr
+    // slice is a plain memory region, and the verifier bounds a read into it by
+    // the index alone rather than by the check below
     u32 i;
-    bpf_for(i, start, len+1) {
+    bpf_for(i, start, len) {
         if (data + i + 1 > data_end) break;
         u8 c = data[i];
 
@@ -202,19 +205,31 @@ int parse_skb(struct __sk_buff *skb, struct parse_res *pres __arg_nonnull, u16 *
 // Parses the header block of the first `len` bytes of `buf_ptr`. Unlike a
 // message or a packet, a buffer is contiguous, so there is nothing to pull in
 // and a single pass is enough. See `parse_msg` for the return value.
-SEC("freplace")
-int parse_buf(const struct bpf_dynptr *buf_ptr, u32 len, struct parse_res *pres __arg_nonnull, u16 *null_prefix) {
+//
+// The slice is taken at `BEEPER_BUF_LEN`, the only length the verifier lets the
+// program ask for, so `buf_ptr` has to hold that many bytes no matter how long
+// the message in it is. Anything past `len` is ignored.
+//
+// The work sits in a function of its own because libbpf turns down a call that
+// reaches from one program section into another, and `bench` has to call it too.
+__noinline __weak int _parse_buf(const struct bpf_dynptr *buf_ptr, u32 len, struct parse_res *pres __arg_nonnull, u16 *null_prefix) {
     u32 cidx[MAX_MATCHES] = { 0 };
     u16 s = s_init;
 
-    u8 *data = bpf_dynptr_data(buf_ptr, 0, len);
+    u8 *data = bpf_dynptr_data(buf_ptr, 0, BEEPER_BUF_LEN);
     if (data == NULL) return -1;
 
+    bpf_clamp_uminmax(len, 0, BEEPER_BUF_LEN);
     u8 *data_end = data + len;
 
     int res = _parse_from(data, data_end, 0, pres->ms, cidx, &s, null_prefix);
 
     return res;
+}
+
+SEC("freplace")
+int parse_buf(const struct bpf_dynptr *buf_ptr, u32 len, struct parse_res *pres __arg_nonnull, u16 *null_prefix) {
+    return _parse_buf(buf_ptr, len, pres, null_prefix);
 }
 
 // Returns whether the parser captured a range for the match `idx`.
@@ -247,4 +262,61 @@ int extract_match(const struct sk_msg_md *msg, const struct parse_res *pres __ar
     str->len = m.len;
 
     return 0;
+}
+
+// What the benchmark program is run with: the message, the number of bytes of
+// it that are to be parsed, and how often that is to happen. The buffer is
+// carried in the context rather than in a map so that a single
+// `BPF_PROG_TEST_RUN` says everything about a run.
+struct bench_args {
+    u32 n;
+    u32 len;
+    u8 buf[BEEPER_BUF_LEN];
+};
+
+// A copy of the message the benchmark program parses. `bpf_dynptr_from_mem`
+// only makes a dynptr of a map value, so the message cannot be parsed out of
+// the context it arrives in.
+struct bench_buf {
+    u8 data[BEEPER_BUF_LEN];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, struct bench_buf);
+} bench_bufs SEC(".maps");
+
+// Parses `args->buf` `args->n` times over, so that user space can time the
+// parser without paying for a syscall per message. Every pass reports into the
+// same `parse_res`, which the next one overwrites again.
+//
+// Returns what the last pass returned, or -1 if the buffer could not be set up.
+SEC("syscall")
+int bench(struct bench_args *args) {
+    u32 key = 0;
+    struct bench_buf *buf = bpf_map_lookup_elem(&bench_bufs, &key);
+    if (buf == NULL) return -1;
+
+    __builtin_memcpy(buf->data, args->buf, BEEPER_BUF_LEN);
+
+    struct bpf_dynptr ptr;
+    if (bpf_dynptr_from_mem(buf->data, BEEPER_BUF_LEN, 0, &ptr) < 0) return -1;
+
+    struct parse_res pres = { 0 };
+    u32 len = args->len;
+    u32 n = args->n;
+    int res = 0;
+
+    u32 i;
+    bpf_for(i, 0, n) {
+        res = _parse_buf(&ptr, len, &pres, NULL);
+
+        // without this the compiler is free to notice that every pass computes
+        // the same thing and to run only one of them
+        __sink(res);
+    }
+
+    return res;
 }

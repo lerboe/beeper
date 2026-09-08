@@ -18,6 +18,12 @@ char LICENSE[] SEC("license") = "GPL";
 // bounds the parsing loop.
 #define MAX_BYTES 0x7FFF
 
+// The number of bytes a parser reads out of a dynptr at once. The verifier only
+// hands out a slice whose length it knows at load time, so a buffer parsed with
+// `parse_buf` has to hold at least this many bytes, even when the message in it
+// is shorter.
+#define BEEPER_BUF_LEN 1024
+
 // The number of matches a `parse_res` holds, i.e. the number of ranges a parser
 // can be configured to capture.
 #define MAX_MATCHES 32
@@ -167,7 +173,9 @@ struct trans {
     }
 
 // Creates `name`, a stub for the HTTP/1.x buffer parser
-// (`h1::Parser::replace_parse_buf`).
+// (`h1::Parser::replace_parse_buf`). The buffer behind `buf_ptr` has to be at
+// least `BEEPER_BUF_LEN` bytes long, `len` says how many of them carry the
+// message.
 #define BEEPER_H1_PARSE_BUF(name)                                                                 \
     __noinline int name(const struct bpf_dynptr *buf_ptr, u32 len,                                 \
                         struct parse_res *pres __arg_nonnull, u16 *null_prefix) {                  \
@@ -222,7 +230,9 @@ struct trans {
     }
 
 // Creates `name`, a stub for the HTTP/2 buffer parser
-// (`h2::Parser::replace_parse_buf`).
+// (`h2::Parser::replace_parse_buf`). The buffer behind `buf_ptr` has to be at
+// least `BEEPER_BUF_LEN` bytes long, and a frame that does not fit into that
+// many is turned down.
 #define BEEPER_H2_PARSE_BUF(name)                                                                 \
     __noinline int name(const struct bpf_dynptr *buf_ptr, struct ip4_conn *conn,                   \
                         struct parse_res *pres __arg_nonnull,                                      \
