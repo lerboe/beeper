@@ -42,11 +42,12 @@ struct h1_action {
     u8 mid;
 };
 
-// these restrictions are needed to make the verifier happy. All three are
-// masked onto an index, so all three have to be powers of two.
+// these restrictions are needed to make the verifier happy. `MAX_STATES` and
+// `MAX_ACTIONS` are masked onto an index, so both have to be powers of two.
 #define MAX_STATES 512
-#define MAX_TRANS 128
 #define MAX_ACTIONS 256
+#define MAX_TRANS 257
+#define ANY_TRANS 256
 
 // The transition table of the DFA, indexed by state and input byte, and the
 // actions its transitions carry. User space fills both in before the program is
@@ -65,11 +66,12 @@ static __always_inline struct h1_action _action(u16 id) {
 // none either, back to `s_any`.
 static __always_inline void _next(u16 state, u8 input, u16 *next_state, u16 *action) {
     state &= MAX_STATES - 1;
-    input &= MAX_TRANS - 1;
 
+    // `input` is a byte and the row holds a column for every one of them, so it
+    // needs no bound of its own
     struct trans t = s2ts[state][input];
     if (t.state == 0 && t.action == 0) {
-        t = s2ts[state]['*'];
+        t = s2ts[state][ANY_TRANS];
         if (t.state == 0 && t.action == 0) {
             *next_state = s_any;
             *action = 0;
@@ -93,9 +95,10 @@ static __always_inline void _next(u16 state, u8 input, u16 *next_state, u16 *act
 // Returns the number of bytes it consumed once the DFA is done, or minus the
 // number of bytes it looked at if the data ran out first.
 static __always_inline int _parse_from(u8 *data, u8 *data_end, u16 start, struct hdr_match *ms, u32* cidx, u16* s, u16 *null_prefix) {
-    u32 len = (u32)(data_end - data) & MAX_BYTES;
+    u32 len = (u32)(data_end - data);
+    bpf_clamp_uminmax(len, 0, MAX_BYTES);
 
-    if (len-start == 0) {
+    if (start >= len) {
         return 0;
     }
 

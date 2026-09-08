@@ -1,4 +1,4 @@
-use crate::{Dfa, h2::action::*};
+use crate::{Dfa, dfa::Input, h2::action::*};
 use std::collections::HashMap;
 
 /// Builds the transitions of every field representation of RFC 7541 into
@@ -15,7 +15,8 @@ pub fn dfa() -> Dfa<Action> {
 /// Inserts the transitions of the first byte of a representation, see section 6
 /// of RFC 7541.
 fn insert_field_row(dfa: &mut Dfa<Action>) {
-    let mut edge = |input: u8, to, action| dfa.insert_edge(S_FIELD, input, to, Some(action));
+    let mut edge =
+        |input: u8, to, action| dfa.insert_edge(S_FIELD, Input::from(input), to, Some(action));
 
     // an indexed field, 7 bit prefix. The index 0 is not used
     edge(0x80, S_DEAD, Action::new(Kind::Err, 0, 0));
@@ -91,11 +92,11 @@ fn insert_length_rows(dfa: &mut Dfa<Action>) {
         for (base, flags, cont) in [(0x00u8, 0, cont), (0x80u8, F_HUFF, cont_huff)] {
             for len in 0..0x7F {
                 let action = Action::new(kind, len, flags);
-                dfa.insert_edge(from, base | len as u8, to, Some(action));
+                dfa.insert_edge(from, Input::from(base | len as u8), to, Some(action));
             }
 
             let action = Action::new(Kind::IntStart, 0x7F, 0);
-            dfa.insert_edge(from, base | 0x7F, cont, Some(action));
+            dfa.insert_edge(from, Input::from(base | 0x7F), cont, Some(action));
         }
     }
 }
@@ -118,10 +119,10 @@ fn insert_continuation_rows(dfa: &mut Dfa<Action>) {
     for (from, kind, to, flags) in rows {
         for input in 0..0x80u8 {
             let action = Action::new(kind, 0, flags | F_CONT);
-            dfa.insert_edge(from, input, to, Some(action));
+            dfa.insert_edge(from, Input::from(input), to, Some(action));
 
             let action = Action::new(Kind::IntCont, 0, 0);
-            dfa.insert_edge(from, 0x80 | input, from, Some(action));
+            dfa.insert_edge(from, Input::from(0x80 | input), from, Some(action));
         }
     }
 }
@@ -250,7 +251,7 @@ mod tests {
         let dfa = dfa();
 
         for state in representation_states() {
-            let inputs: HashSet<u8> = dfa
+            let inputs: HashSet<Input> = dfa
                 .iter_transitions()
                 .filter(|(from, ..)| *from == state)
                 .map(|(_, input, _, _)| input)
