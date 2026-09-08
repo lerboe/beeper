@@ -35,6 +35,15 @@ struct Edge<A: PartialEq + Eq> {
     action: Option<A>,
 }
 
+/// An input of a pattern that may be skipped.
+struct OptionalPrefix {
+    inputs: Vec<Input>,
+    case_sensitive: bool,
+
+    /// Whether it may appear more than once in a row.
+    repeat: bool,
+}
+
 /// Builds a single pattern into a [`Dfa`].
 ///
 /// The builder walks the DFA from the state the pattern is anchored at,
@@ -49,8 +58,12 @@ pub struct DfaBuilder<'a, A: Copy + Debug + PartialEq + Eq> {
 
     /// Inputs that may appear before the next one. They are only built into
     /// the DFA once that input is known, as each of them has to lead back to
-    /// the state it branched off of.
-    optional_prefixes: Vec<(Vec<Input>, bool)>,
+    /// the state it branched off of, or be joined with it.
+    optional_prefixes: Vec<OptionalPrefix>,
+
+    /// The states the optional prefixes that were pushed since the last input
+    /// end in. The next input has to be pushed from each of them as well.
+    optional_states: Vec<StateId>,
 
     /// All edges that lead into [`DfaBuilder::state`].
     last_edges: Vec<(StateId, Input, bool)>,
@@ -62,6 +75,7 @@ impl<A: Copy + Debug + PartialEq + Eq> DfaBuilder<'_, A> {
             dfa,
             state,
             optional_prefixes: Vec::new(),
+            optional_states: Vec::new(),
             last_edges: Vec::new(),
         }
     }
@@ -92,24 +106,39 @@ impl<A: Copy + Debug + PartialEq + Eq> DfaBuilder<'_, A> {
         self
     }
 
-    /// Builds the optional prefixes that were pushed since the last input, each
-    /// of them leading back into the state the pattern has been built up to.
-    ///
-    /// TODO: This creates a self-loop, such that the optional prefix can be repeated
-    /// multiple times. This is not intended in all cases.
+    /// Builds the optional prefixes that were pushed since the last input. One
+    /// that may repeat loops back into the state it branches off of, one that
+    /// may not ends in a state of its own, recorded in
+    /// [`DfaBuilder::optional_states`].
     fn push_optional_prefixes(&mut self) {
-        let start = self.state;
-        while let Some((optional, case_sensitive)) = self.optional_prefixes.pop() {
-            let mut from = start;
-            for (i, input) in optional.iter().enumerate() {
-                let to = if i == optional.len() - 1 {
-                    self.last_edges.push((from, *input, case_sensitive));
-                    Some(start)
-                } else {
-                    None
-                };
+        for prefix in std::mem::take(&mut self.optional_prefixes) {
+            let OptionalPrefix {
+                inputs,
+                case_sensitive,
+                repeat,
+            } = prefix;
 
-                from = self.push_edge_from(from, *input, to, case_sensitive);
+            // a prefix may be skipped, so it branches off of every state the
+            // prefixes before it may end in as well
+            let mut sources = vec![self.state];
+            sources.extend_from_slice(&self.optional_states);
+
+            for source in sources {
+                let mut from = source;
+                for (i, input) in inputs.iter().enumerate() {
+                    let to = if i == inputs.len() - 1 {
+                        self.last_edges.push((from, *input, case_sensitive));
+                        repeat.then_some(source)
+                    } else {
+                        None
+                    };
+
+                    from = self.push_edge_from(from, *input, to, case_sensitive);
+                }
+
+                if !repeat && from != self.state && !self.optional_states.contains(&from) {
+                    self.optional_states.push(from);
+                }
             }
         }
     }
@@ -127,8 +156,17 @@ impl<A: Copy + Debug + PartialEq + Eq> DfaBuilder<'_, A> {
         );
 
         let start = self.state;
-        self.state = self.push_edge_from(start, input, to, case_sensitive);
+        let to = self.push_edge_from(start, input, to, case_sensitive);
         self.last_edges = vec![(start, input, case_sensitive)];
+
+        // the optional prefixes that lead into these states may be skipped, so
+        // the input has to follow them just like it follows `start`
+        for from in std::mem::take(&mut self.optional_states) {
+            self.push_edge_from(from, input, Some(to), case_sensitive);
+            self.last_edges.push((from, input, case_sensitive));
+        }
+
+        self.state = to;
     }
 
     /// Inserts an edge for both the lower and the upper case of `input`,
@@ -202,9 +240,14 @@ impl<A: Copy + Debug + PartialEq + Eq> DfaBuilder<'_, A> {
             self.push_edge(ANY_INPUT, None, true);
         }
 
-        // the following transitions are optional and must point to `self.state`
-        for i in 1..=max_len - min_len {
-            self.optional_prefixes.push((vec![ANY_INPUT; i], true));
+        // the following transitions are optional, and none of them may repeat,
+        // so that they cannot stand for more than `max_len` bytes together
+        for _ in 0..max_len - min_len {
+            self.optional_prefixes.push(OptionalPrefix {
+                inputs: vec![ANY_INPUT],
+                case_sensitive: true,
+                repeat: false,
+            });
         }
 
         // the loop leads back into the state the repetition ends in, so it is
@@ -266,10 +309,14 @@ impl<A: Copy + Debug + PartialEq + Eq> DfaBuilder<'_, A> {
         self
     }
 
-    /// Appends `input` to the pattern, but allows it to be skipped.
+    /// Appends `input` to the pattern, but allows it to be skipped. If `repeat`
+    /// is set, it may also appear more than once in a row.
     pub fn push_optional(&mut self, input: &str, repeat: bool) -> &mut Self {
-        let optional = input.bytes().map(Input::from).collect();
-        self.optional_prefixes.push((optional, true));
+        self.optional_prefixes.push(OptionalPrefix {
+            inputs: input.bytes().map(Input::from).collect(),
+            case_sensitive: true,
+            repeat,
+        });
         self
     }
 
