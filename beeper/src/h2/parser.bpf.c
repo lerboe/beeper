@@ -580,7 +580,7 @@ static __always_inline u32 _try_evict_dynamic_table_entries(const struct msg_ctx
 //
 // Returns 0 if the entry was added, -1 if it could not be resolved or does not
 // fit into the table even when emptied, in which case the peer drops it too.
-__noinline __weak int _add_dynamic_table_entry(const struct msg_ctx *ctx __arg_nonnull, struct dynamic_table_info *dt_info __arg_nonnull, const struct hdr_match *key __arg_nonnull, const struct hdr_match *val __arg_nonnull) {
+static __always_inline int _add_dynamic_table_entry(const struct msg_ctx *ctx __arg_nonnull, struct dynamic_table_info *dt_info __arg_nonnull, const struct hdr_match *key __arg_nonnull, const struct hdr_match *val __arg_nonnull) {
     if (dt_info->dirty) return -1;
 
     u8 *key_ptr = NULL;
