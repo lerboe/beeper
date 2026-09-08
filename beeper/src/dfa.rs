@@ -267,7 +267,7 @@ impl<A: Copy + Debug + PartialEq + Eq> DfaBuilder<'_, A> {
     }
 
     /// Appends `input` to the pattern, but allows it to be skipped.
-    pub fn push_optional(&mut self, input: &str) -> &mut Self {
+    pub fn push_optional(&mut self, input: &str, repeat: bool) -> &mut Self {
         let optional = input.bytes().map(Input::from).collect();
         self.optional_prefixes.push((optional, true));
         self
@@ -452,5 +452,68 @@ impl<A: Copy + Debug + PartialEq + Eq> Dfa<A> {
                 .iter()
                 .map(move |(input, edge)| (*from, *input, edge.to, edge.action))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+
+    fn matches_input<A: Copy + Debug + PartialEq + Eq>(
+        dfa: &Dfa<A>,
+        from: StateId,
+        input: &[u8],
+    ) -> bool {
+        let mut state = from;
+        for &byte in input {
+            let Some(edge) = dfa
+                .edges
+                .get(&state)
+                .and_then(|edges| edges.get(&(byte as u16)))
+            else {
+                return false;
+            };
+            state = edge.to;
+        }
+        true
+    }
+
+    fn dfa_with_optional_input(repeatable: bool) -> Dfa<()> {
+        let mut dfa: Dfa<()> = Dfa::new();
+        dfa.start_pattern(INIT_STATE)
+            .push_ci("aaa")
+            .push_optional("b", repeatable)
+            .push_ci("c");
+        dfa
+    }
+
+    #[test]
+    fn non_repeatable_optional_input_cannot_be_repeated() {
+        let dfa = dfa_with_optional_input(false);
+        assert!(matches_input(&dfa, INIT_STATE, b"aaa"));
+        assert!(matches_input(&dfa, INIT_STATE, b"aaab"));
+        assert!(matches_input(&dfa, INIT_STATE, b"aaabc"));
+        assert!(!matches_input(&dfa, INIT_STATE, b"aaabbc"));
+    }
+
+    #[test]
+    fn repeatable_optional_input_can_be_repeated() {
+        let dfa = dfa_with_optional_input(true);
+        assert!(matches_input(&dfa, INIT_STATE, b"aaa"));
+        assert!(matches_input(&dfa, INIT_STATE, b"aaab"));
+        assert!(matches_input(&dfa, INIT_STATE, b"aaabc"));
+        assert!(matches_input(&dfa, INIT_STATE, b"aaabbc"));
+    }
+
+    #[test]
+    fn optional_input_is_optional() {
+        let dfa = dfa_with_optional_input(true);
+        assert!(matches_input(&dfa, INIT_STATE, b"aaa"));
+        assert!(matches_input(&dfa, INIT_STATE, b"aaac"));
+
+        let dfa = dfa_with_optional_input(false);
+        assert!(matches_input(&dfa, INIT_STATE, b"aaa"));
+        assert!(matches_input(&dfa, INIT_STATE, b"aaac"));
     }
 }

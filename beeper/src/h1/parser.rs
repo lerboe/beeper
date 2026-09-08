@@ -154,11 +154,11 @@ impl Parser {
         pattern
             .push(LF)
             .push_ci(name.as_str())
-            .push_optional("\t")
-            .push_optional(" ")
+            .push_optional("\t", true)
+            .push_optional(" ", true)
             .push_ci(":")
-            .push_optional("\t")
-            .push_optional(" ")
+            .push_optional("\t", true)
+            .push_optional(" ", true)
             .with(Action::StartCapture(mid));
 
         // the value begins here, and it may be empty
@@ -166,14 +166,14 @@ impl Parser {
         pattern
             .push_any(1..)
             .with(Action::EndCapture(mid))
-            .push_optional(CR)
+            .push_optional(CR, false)
             .restart_with(LF);
 
         // an empty value ends its line where it would have begun, and there is
         // nothing in it to capture
         self.dfa
             .start_pattern(value)
-            .push_optional(CR)
+            .push_optional(CR, false)
             .restart_with(LF);
 
         self
@@ -205,9 +205,9 @@ impl Parser {
     fn done_on_hdr_end(mut self) -> Parser {
         self.dfa
             .start_pattern(ANY_STATE)
-            .push_optional(CR)
+            .push_optional(CR, false)
             .push(LF)
-            .push_optional(CR)
+            .push_optional(CR, false)
             .push(LF)
             .with(Action::Done);
 
@@ -235,7 +235,7 @@ impl Parser {
                 .push(" ")
                 .push_any(1..)
                 .push_ci(" HTTP/1.1")
-                .push_optional(CR)
+                .push_optional(CR, false)
                 .restart_with(LF);
         } else if name == &PATH {
             let mid = self.new_match();
@@ -247,7 +247,7 @@ impl Parser {
                 .push_any(1..)
                 .with(Action::EndCapture(mid))
                 .push_ci(" HTTP/1.1")
-                .push_optional(CR)
+                .push_optional(CR, false)
                 .restart_with(LF);
         } else {
             panic!(
@@ -271,7 +271,7 @@ impl Parser {
             .push_any(3..=3)
             .with(Action::EndCapture(mid))
             .push_any(1..)
-            .push_optional(CR)
+            .push_optional(CR, false)
             .restart_with(LF);
 
         self
