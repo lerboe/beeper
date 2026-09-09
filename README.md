@@ -75,6 +75,8 @@ fn main() {
 }
 ```
 
+Please refer to the [example](example) for the full code.
+
 ## Build
 
 To build and test Beeper, you need to install the following packages:
