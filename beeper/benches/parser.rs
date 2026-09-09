@@ -1,11 +1,11 @@
 //! Times how long a parser takes to walk a single message in the kernel.
 //!
-//! Both parsers are configured to capture the same three fields — the user
-//! agent, the content length and the path of the request — and are then run
-//! over a request carrying them. Every round loads the parser afresh and hands
-//! it to a `SEC("syscall")` program that parses the message [`PASSES`] times,
-//! so what the numbers say is what a parse costs and not what the syscall
-//! around it costs.
+//! Both parsers are configured to capture the same six fields — the path of
+//! the request, its host, referer, date, user agent and content length — and
+//! are then run over a request carrying them. Every round loads the parser
+//! afresh and hands it to a `SEC("syscall")` program that parses the message
+//! [`PASSES`] times, so what the numbers say is what a parse costs and not what
+//! the syscall around it costs.
 //!
 //! Run it with `cargo bench`. Loading a BPF program takes `CAP_BPF` and
 //! `CAP_PERFMON`, so on a host that does not hand those to ordinary users the
@@ -17,36 +17,47 @@
 
 use beeper::{h1, h2, header::PATH};
 use httlib_huffman as huffman;
-use http::header::{CONTENT_LENGTH, USER_AGENT};
+use http::header::{CONTENT_LENGTH, DATE, HOST, REFERER, USER_AGENT};
 use std::time::Duration;
 
 /// How often a run parses the message. The whole run is a single
 /// `BPF_PROG_TEST_RUN`, so this is what keeps the syscall out of the result.
-const PASSES: u32 = 50_000;
+const PASSES: u32 = 1_000_000;
 
 /// How many runs the reported numbers are taken over.
 const ROUNDS: u32 = 10;
 
-/// The index of `:authority` in the HPACK static table, see appendix A of RFC
-/// 7541. The fields below it are the ones this benchmark sends.
-const AUTHORITY_INDEX: u8 = 1;
+/// The index of `:path` in the HPACK static table, see appendix A of RFC 7541.
+/// The fields below it are the ones this benchmark sends.
 const PATH_INDEX: u8 = 4;
 const ACCEPT_INDEX: u8 = 19;
 const CONTENT_LENGTH_INDEX: u8 = 28;
+const DATE_INDEX: u8 = 33;
+const HOST_INDEX: u8 = 38;
+const REFERER_INDEX: u8 = 51;
 const USER_AGENT_INDEX: u8 = 58;
+
+/// The values the fields of the request carry.
+const HOST_VALUE: &str = "example.com";
+const REFERER_VALUE: &str = "http://example.com/";
+const DATE_VALUE: &str = "Tue, 09 Sep 2026 08:00:00 GMT";
 
 /// The request the HTTP/1.1 parser is timed on.
 fn h1_msg() -> Vec<u8> {
-    concat!(
-        "GET /index.html HTTP/1.1\r\n",
-        "Host: example.com\r\n",
-        "User-Agent: beeper/0.1\r\n",
-        "Content-Length: 0\r\n",
-        "Accept: */*\r\n",
-        "\r\n",
+    format!(
+        concat!(
+            "GET /index.html HTTP/1.1\r\n",
+            "Host: {}\r\n",
+            "User-Agent: beeper/0.1\r\n",
+            "Referer: {}\r\n",
+            "Date: {}\r\n",
+            "Content-Length: 0\r\n",
+            "Accept: */*\r\n",
+            "\r\n",
+        ),
+        HOST_VALUE, REFERER_VALUE, DATE_VALUE
     )
-    .as_bytes()
-    .to_vec()
+    .into_bytes()
 }
 
 /// Renders an HPACK string, Huffman coded the way a client sends it.
@@ -83,8 +94,10 @@ fn h2_frame() -> Vec<u8> {
     // an indexed `:method: GET` and an indexed `:scheme: http`
     let mut block = vec![0x82, 0x86];
     block.extend_from_slice(&hpack_field(PATH_INDEX, "/index.html"));
-    block.extend_from_slice(&hpack_field(AUTHORITY_INDEX, "example.com"));
+    block.extend_from_slice(&hpack_field(HOST_INDEX, HOST_VALUE));
     block.extend_from_slice(&hpack_field(USER_AGENT_INDEX, "beeper/0.1"));
+    block.extend_from_slice(&hpack_field(REFERER_INDEX, REFERER_VALUE));
+    block.extend_from_slice(&hpack_field(DATE_INDEX, DATE_VALUE));
     block.extend_from_slice(&hpack_field(CONTENT_LENGTH_INDEX, "0"));
     block.extend_from_slice(&hpack_field(ACCEPT_INDEX, "*/*"));
 
@@ -105,6 +118,9 @@ fn h1_round(msg: &[u8]) -> Duration {
         .capture_hdr(&USER_AGENT)
         .capture_hdr(&CONTENT_LENGTH)
         .capture_hdr(&PATH)
+        .capture_hdr(&DATE)
+        .capture_hdr(&HOST)
+        .capture_hdr(&REFERER)
         .bench(msg, PASSES)
         .expect("bench the http/1.1 parser")
 }
@@ -118,6 +134,12 @@ fn h2_round(frame: &[u8]) -> Duration {
         .expect("capture the content length")
         .capture_hdr(&PATH)
         .expect("capture the path")
+        .capture_hdr(&DATE)
+        .expect("capture the date")
+        .capture_hdr(&HOST)
+        .expect("capture the host")
+        .capture_hdr(&REFERER)
+        .expect("capture the referer")
         .bench(frame, PASSES)
         .expect("bench the http/2 parser")
 }
