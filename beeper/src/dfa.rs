@@ -22,7 +22,7 @@ pub(crate) type Input = u16;
 ///
 /// It is not a byte, so that a pattern holding the byte it used to be spelled
 /// with, `*`, matches that byte and nothing else.
-const ANY_INPUT: Input = 0x100;
+pub(crate) const ANY_INPUT: Input = 0x100;
 
 /// A single transition of a [`Dfa`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

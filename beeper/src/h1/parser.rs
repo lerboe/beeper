@@ -1,13 +1,18 @@
 #![allow(unused_imports)]
 use crate::{
-    Dfa, MatchId, autoload_and_attach, bench,
-    dfa::{ANY_STATE, INIT_STATE, fmt_input},
+    Dfa, MatchId, StateId, autoload_and_attach, bench,
+    dfa::{ANY_INPUT, ANY_STATE, INIT_STATE, Input, fmt_input},
     h1::action::Action,
     header::{METHOD, PATH, STATUS},
 };
 use anyhow::{Result, bail};
 use http::HeaderName;
-use std::{collections::HashMap, mem::MaybeUninit, time::Duration};
+use std::{
+    cmp::Reverse,
+    collections::{HashMap, HashSet},
+    mem::MaybeUninit,
+    time::Duration,
+};
 use tracing::{Level, debug, trace, warn};
 use types::*;
 use xbpf::libbpf::{
@@ -394,22 +399,20 @@ impl Parser {
     /// Writes the transition table of the DFA into the read-only data of the
     /// parser program. This has to happen before the program is loaded, as the
     /// kernel freezes the section afterwards.
+    ///
+    /// The table is written sparsely: a state only takes up the columns it has
+    /// a transition for, and the rows are laid over each other wherever they
+    /// leave those free. See `s2es` of the parser program.
     fn inject(&self, skel: &mut OpenParserSkel) -> Result<()> {
         let Some(data) = skel.maps.rodata_data.as_mut() else {
             bail!("the parser program has no read-only data to inject into");
         };
 
-        let num_states = self.dfa.num_states() as usize;
-        if num_states > data.s2ts.len() {
-            bail!(
-                "the patterns take {num_states} states, the parser holds {}",
-                data.s2ts.len()
-            );
-        }
-
         // action index 0 is reserved for the noop action
         let mut action_idx = HashMap::new();
         action_idx.insert(None, 0usize);
+
+        let mut rows: Vec<Row> = vec![Vec::new(); self.dfa.num_states() as usize];
 
         for (from, input, to, action) in self.dfa.iter_transitions() {
             let new_action_idx = action_idx.len();
@@ -421,9 +424,7 @@ impl Parser {
                 );
             }
 
-            let action = action as u16;
-            let input = input as usize;
-            if input >= data.s2ts[0].len() {
+            if input > ANY_INPUT {
                 bail!("the patterns read inputs the parser has no column for: {input}");
             }
 
@@ -431,15 +432,26 @@ impl Parser {
                 "inject; from={} to={} input={} action={}",
                 from.0,
                 to.0,
-                fmt_input(input as u16),
+                fmt_input(input),
                 action
             );
 
-            data.s2ts[from.0 as usize][input] = trans {
-                state: to.0,
-                action,
-            };
+            rows[from.0 as usize].push((input, to, action as u16));
         }
+
+        let offs = pack(&rows, data.s2es.len())?;
+        if offs[ANY_STATE.0 as usize] != ANY_ROW {
+            bail!("the state matching no pattern was laid down out of place");
+        }
+
+        for (from, row) in rows.iter().enumerate() {
+            for (input, to, action) in row {
+                let off = offs[from];
+                data.s2es[off + *input as usize] = edge(off, offs[to.0 as usize], *action);
+            }
+        }
+
+        data.s_init = offs[INIT_STATE.0 as usize] as u16;
 
         for (action, i) in action_idx {
             let Some(action) = action else { continue };
@@ -448,6 +460,75 @@ impl Parser {
 
         Ok(())
     }
+}
+
+/// The row [`ANY_STATE`] is laid down at. The parser program compares against
+/// it on every byte, so it is fixed rather than left to [`pack`]. Must stay in
+/// sync with `s_any` of the parser program.
+const ANY_ROW: usize = 1;
+
+/// The widest row [`edge`] has room to name. Must stay in sync with
+/// `E_ROW_MASK` of the parser program.
+const MAX_ROW: usize = 0xFFF;
+
+/// The transitions a single state takes, as the input they match, the state
+/// they lead to and the index of the action they carry.
+type Row = Vec<(Input, StateId, u16)>;
+
+/// Packs a transition into the word the parser program reads it back out of:
+/// the row it leaves, the row it leads to and the index of the action it
+/// carries. Must stay in sync with the `E_*` macros of the parser program.
+fn edge(row: usize, to: usize, action: u16) -> u32 {
+    row as u32 | (to as u32) << 12 | u32::from(action) << 24
+}
+
+/// Lays the rows of `rows` into a table of `len` slots, overlapping them
+/// wherever they leave each other's columns free, and returns the offset every
+/// state was laid down at.
+///
+/// The offsets are distinct even for a state without transitions, as an offset
+/// is what the parser program tells states apart by.
+///
+/// # Errors
+///
+/// Returns an error if the rows do not fit into `len` slots.
+fn pack(rows: &[Row], len: usize) -> Result<Vec<usize>> {
+    let len = len.min(MAX_ROW + 1);
+
+    // `ANY_STATE` goes down first, so that it lands on `ANY_ROW`, and the
+    // widest row after it: a narrow one is easier to fit into what the wide
+    // ones leave free than the other way around
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    let any = ANY_STATE.0 as usize;
+    order.sort_by_key(|state| (*state != any, Reverse(rows[*state].len()), *state));
+
+    let mut offs = vec![0; rows.len()];
+    let mut taken = vec![false; len];
+    let mut used = HashSet::new();
+
+    // offset 0 is left out: it is what a free slot names as its row, which
+    // also puts `ANY_STATE` on `ANY_ROW`
+    for state in order {
+        let fits = |off: &usize| {
+            !used.contains(off)
+                && rows[state]
+                    .iter()
+                    .all(|(input, _, _)| taken.get(off + *input as usize).is_some_and(|t| !t))
+        };
+
+        let Some(off) = (1..len).find(fits) else {
+            bail!("the patterns take more transitions than the {len} the parser holds");
+        };
+
+        for (input, _, _) in &rows[state] {
+            taken[off + *input as usize] = true;
+        }
+
+        used.insert(off);
+        offs[state] = off;
+    }
+
+    Ok(offs)
 }
 
 /// A [`Parser`] attached to a target program.

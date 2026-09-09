@@ -4,13 +4,17 @@
 #include <bpf/bpf_helpers.h>
 
 // The parser for HTTP/1.x messages. It walks a message byte by byte, following
-// the transitions user space injected into `s2ts`, and runs the action every
+// the transitions user space injected into `s2es`, and runs the action every
 // one of them carries.
 
-// The state a message is parsed from.
-const u16 s_init = 0;
+// The row of the state a message is parsed from. User space fills it in with
+// the offset it laid that state down at, see `s2es`.
+volatile const u16 s_init = 0;
 
-// The state input that matches no pattern leads back to.
+// The row of the state input that matches no pattern leads back to. It is
+// compared against on every byte, so user space always lays that state down at
+// this offset rather than reporting where it put it, which spares the walk a
+// load. Must stay in sync with `ANY_ROW` of h1/parser.rs.
 const u16 s_any = 1;
 
 // What the parser does upon taking a transition. Must stay in sync with the
@@ -42,17 +46,36 @@ struct h1_action {
     u8 mid;
 };
 
-// these restrictions are needed to make the verifier happy. `MAX_STATES` and
+// these restrictions are needed to make the verifier happy. `MAX_EDGES` and
 // `MAX_ACTIONS` are masked onto an index, so both have to be powers of two.
-#define MAX_STATES 512
 #define MAX_ACTIONS 256
-#define MAX_TRANS 257
-#define ANY_TRANS 256
+#define MAX_EDGES 4096
 
-// The transition table of the DFA, indexed by state and input byte, and the
-// actions its transitions carry. User space fills both in before the program is
-// loaded, after which they are read-only.
-volatile const struct trans s2ts[MAX_STATES][MAX_TRANS];
+// The column a state matches any byte it has no transition of its own for with.
+#define ANY_INPUT 256
+
+// How a transition is packed into the word holding it. Must stay in sync with
+// `edge` of h1/parser.rs.
+//
+// The row the transition leaves is kept alongside it because rows overlap: a
+// slot only answers for the row that claims it, and a row is never 0, so a free
+// slot answers for none.
+#define E_ROW_MASK 0xFFF
+#define E_STATE_SHIFT 12
+#define E_ACTION_SHIFT 24
+
+// The transition table of the DFA and the actions its transitions carry. User
+// space fills both in before the program is loaded, after which they are
+// read-only.
+//
+// A row holds a column for every byte and one for `ANY_INPUT`, but hardly any
+// of them are taken, so the rows are laid over each other wherever they leave
+// each other's columns free: the transition a state takes on `input` sits at
+// `row + input`, where `row` is the offset user space laid that state down at
+// and is what a walk carries instead of the id of the state. That leaves a
+// table small enough to stay in a cache, which is what a walk over a message
+// would otherwise spend most of its time waiting for.
+volatile const u32 s2es[MAX_EDGES];
 volatile const struct h1_action a2as[MAX_ACTIONS];
 
 // Reads the action a transition carries. Transition 0 is the one a state
@@ -61,26 +84,25 @@ static __always_inline struct h1_action _action(u16 id) {
     return a2as[id & (MAX_ACTIONS - 1)];
 }
 
-// Follows the transition `input` takes out of `state`. A state that has no
-// transition for `input` falls back to the one matching any byte, and if it has
-// none either, back to `s_any`.
+// Follows the transition `input` takes out of the state laid down at `state`. A
+// state that has no transition for `input` falls back to the one matching any
+// byte, and if it has none either, back to `s_any`.
 static __always_inline void _next(u16 state, u8 input, u16 *next_state, u16 *action) {
-    state &= MAX_STATES - 1;
-
-    // `input` is a byte and the row holds a column for every one of them, so it
-    // needs no bound of its own
-    struct trans t = s2ts[state][input];
-    if (t.state == 0 && t.action == 0) {
-        t = s2ts[state][ANY_TRANS];
-        if (t.state == 0 && t.action == 0) {
+    // an index that leaves the table wraps around rather than being turned
+    // down, and lands on no slot the row could claim: a slot of a row sits
+    // within `ANY_INPUT` of it, and the table is wider than that
+    u32 e = s2es[(state + input) & (MAX_EDGES - 1)];
+    if ((e & E_ROW_MASK) != state) {
+        e = s2es[(state + ANY_INPUT) & (MAX_EDGES - 1)];
+        if ((e & E_ROW_MASK) != state) {
             *next_state = s_any;
             *action = 0;
             return;
         }
     }
 
-    *next_state = t.state;
-    *action = t.action;
+    *next_state = (e >> E_STATE_SHIFT) & E_ROW_MASK;
+    *action = e >> E_ACTION_SHIFT;
 }
 
 // Walks the DFA over `data`, starting at offset `start` and in state `*s`, and
