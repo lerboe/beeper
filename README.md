@@ -22,6 +22,59 @@ HTTP/1.1      | ✅      | 6.8
 HTTP/2        | ✅      | 6.8
 gRPC          | WIP     | 
 
+## Usage
+
+First, in the Rust program, create a new parser instance, add the desired headers that it should parse, and attach it to an existing eBPF program:
+```rust
+use beeper::h2;
+
+let h2 = h2::Parser::new()
+    .capture_hdr(&beeper::header::PATH)?
+    .capture_hdr(&http::header::CONTENT_LENGTH)?
+    .replace_parse_msg("parse_h2")
+    .replace_extract("extract_h2_match")
+    .attach(prog_fd)?;
+```
+
+Next, in your eBPF program, import the `beeper.h` header, define the stub functions, and call them with the input buffer:
+```c
+#include "beeper.h"
+
+// stub funcs
+BEEPER_EXTRACT_MATCH(extract_h2_match)
+BEEPER_H2_PARSE_MSG(parse_h2)
+
+// the header matches occur in the same order as configured in user space
+#define H2_PATH_MID 0
+#define H2_CONTENT_LENGTH_MID 1
+
+SEC("sk_msg")
+int msg_verdict(struct sk_msg_md *msg) {
+    struct parse_res pres = { 0 };
+    struct h2_frame frame = { 0 };
+    int msg_len = parse_h2(msg, &pres, &frame);
+    if (msg_len >= 0) {
+        struct hdr_str path = { 0 };
+        if (extract_h2_match(msg, &pres, H2_PATH_MID, &path) == 0) {
+            // note that path can be Huffman-encoded
+        }
+    }
+}
+```
+
+Finally, to make this all compile, Beeper relies on [xbpf](https://github.com/lerboe/xbpf). Add the following to `build.rs`:
+```rust
+use beeper::build::clang_args;
+use xbpf::build::Builder;
+
+fn main() {
+    Builder::new()
+        .clang_arg(clang_args().iter())
+        .export_headers()
+        .build();
+}
+```
+
 ## Build
 
 To build and test Beeper, you need to install the following packages:
