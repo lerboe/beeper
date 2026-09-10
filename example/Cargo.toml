@@ -24,10 +24,10 @@ tower-http = { version = "0.7", features = ["fs", "trace", "set-status"] }
 libc = "0.2.189"
 anyhow = "1.0.104"
 as-bytes = "0.2.0"
-xbpf = "0.0.2"
+xbpf = "0.0.3"
 
 [build-dependencies]
-xbpf = { version = "0.0.2", features = ["build"] }
+xbpf = { version = "0.0.3", features = ["build"] }
 beeper = { path = "../beeper", features = ["build"] }
 
 [dev-dependencies]

@@ -191,7 +191,7 @@ dependencies = [
  "tokio",
  "tracing",
  "utils",
- "xbpf",
+ "xbpf 0.0.3",
 ]
 
 [[package]]
@@ -474,7 +474,7 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
- "xbpf",
+ "xbpf 0.0.3",
 ]
 
 [[package]]
@@ -2099,7 +2099,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "xbpf",
+ "xbpf 0.0.2",
 ]
 
 [[package]]
@@ -2399,6 +2399,20 @@ name = "xbpf"
 version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "949de5d58a5cafbb99e59ad4855cb57cf353d7384e334f9fa155667a3a449bf1"
+dependencies = [
+ "glob",
+ "libbpf-cargo",
+ "libbpf-rs 0.27.0",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "xbpf"
+version = "0.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4279f972c12786565d3e9ce5fc9c2412a773fc260bca14df836b91a347b0781"
 dependencies = [
  "glob",
  "libbpf-cargo",
