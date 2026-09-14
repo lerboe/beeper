@@ -15,8 +15,8 @@ tokio = { version = "1.53", features = ["full"] }
 bpf-tracing = "0.0.5"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-xbpf = "0.0.2"
+xbpf = "0.0.3"
 
 [build-dependencies]
-xbpf = { version = "0.0.2", features = ["build"] }
+xbpf = { version = "0.0.3", features = ["build"] }
 beeper = { path = "../beeper", features = ["build"] }
