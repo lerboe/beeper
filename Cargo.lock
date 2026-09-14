@@ -191,7 +191,7 @@ dependencies = [
  "tokio",
  "tracing",
  "utils",
- "xbpf 0.0.3",
+ "xbpf",
 ]
 
 [[package]]
@@ -449,7 +449,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -474,7 +474,7 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
- "xbpf 0.0.3",
+ "xbpf",
 ]
 
 [[package]]
@@ -1279,7 +1279,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1426,7 +1426,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1483,7 +1483,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1793,7 +1793,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2099,7 +2099,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "xbpf 0.0.2",
+ "xbpf",
 ]
 
 [[package]]
@@ -2233,7 +2233,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2393,20 +2393,6 @@ name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
-
-[[package]]
-name = "xbpf"
-version = "0.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "949de5d58a5cafbb99e59ad4855cb57cf353d7384e334f9fa155667a3a449bf1"
-dependencies = [
- "glob",
- "libbpf-cargo",
- "libbpf-rs 0.27.0",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
 
 [[package]]
 name = "xbpf"
