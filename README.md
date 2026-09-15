@@ -15,7 +15,7 @@
 [doi-url]: https://doi.org/10.48550/arXiv.2605.31084
 
 <p align="center">
-    <img src="https://github.com/lerboe/beeper/raw/main/beeper" alt="beeper" width="500">
+    <img src="https://github.com/lerboe/beeper/raw/main/beeper.png" alt="beeper" width="500">
 </p>
 
 Beeper (BEEline's ParsER) is an application-layer parser for eBPF. It allows you to process L7 protocols directly in the kernel, which can accelerate user space applications significantly. It achieves this by constructing an Aho-Corasick-like DFA in user space, reducing the parsing complexity to an eBPF-compatible level. With Beeper, you can for example monitor application-layer traffic, redirect it based on its payload, or respond to it, directly from the kernel. For more information, please have a look at the [full paper][doi-url].
