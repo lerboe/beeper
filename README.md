@@ -18,13 +18,17 @@
     <img src="https://github.com/lerboe/beeper/raw/main/beeper.png" alt="beeper" width="500">
 </p>
 
-Beeper (BEEline's ParsER) is an application-layer parser for eBPF. It allows you to process L7 protocols directly in the kernel, which can accelerate user space applications significantly. It achieves this by constructing an Aho-Corasick-like DFA in user space, reducing the parsing complexity to an eBPF-compatible level. With Beeper, you can for example monitor application-layer traffic, redirect it based on its payload, or respond to it, directly from the kernel. For more information, please have a look at the [full paper][doi-url].
+Beeper (BEEline's ParsER) is an application-layer parser for eBPF. It allows you to process L7 protocols directly in the kernel, which can accelerate user space applications significantly. It achieves this by constructing an Aho-Corasick-like DFA in user space, reducing the parsing complexity to an eBPF-compatible level. With beeper, you can for example monitor application-layer traffic, redirect it based on its payload, or respond to it, directly from the kernel. For more information, please have a look at the [full paper][doi-url].
 
 Protocol      | Status  | Minimal Kernel Version
 ------------- | ------- | ----------------------
 HTTP/1.1      | ✅      | 6.8
 HTTP/2        | ✅      | 6.8
 gRPC          | WIP     | 
+
+## Use cases
+
+[hyper-fast-path](https://github.com/lerboe/hyper-fast-path) uses beeper to serve static assets from the kernel. This improves the throughput of HTTP servers by up to 2.8x.
 
 ## Usage
 
@@ -66,7 +70,7 @@ int msg_verdict(struct sk_msg_md *msg) {
 }
 ```
 
-Finally, to make this all compile, Beeper relies on [xbpf](https://github.com/lerboe/xbpf). Add the following to `build.rs`:
+Finally, to make this all compile, beeper relies on [xbpf](https://github.com/lerboe/xbpf). Add the following to `build.rs`:
 ```rust
 use beeper::build::clang_args;
 use xbpf::build::Builder;
@@ -79,17 +83,17 @@ fn main() {
 }
 ```
 
-Please refer to the [example](example) for the full code.
+Please refer to the [example](example) for a simple HTTP monitoring tool.
 
 ## Build
 
-To build and test Beeper, you need to install the following packages:
+To build and test beeper, you need to install the following packages:
 
 ```bash
 sudo apt install clang-18 llvm-18 libelf-dev zlib1g-dev linux-headers-`uname -r` linux-tools-`uname -r` 
 ```
 
-You should now be able to compile and test Beeper as follows:
+You should now be able to compile and test beeper as follows:
 
 ```bash
 RUST_LOG=trace cargo test
