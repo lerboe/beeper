@@ -6,29 +6,15 @@ publish = false
 
 [dependencies]
 axum = { version = "0.8.9", features = ["http2"] }
-clap = { version = "4", features = ["derive"] }
-# h2 is patched to allow beeper to modify the dynamic table
-h2 = "0.4.16"
-http = "1.5"
-http-body-util = "0.1"
-hyper = { version = "1", features = ["http1", "server"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
-bytes = "1"
 beeper = { path = "../beeper", features = ["h1", "h2"] }
+http = "1.5"
 tokio = { version = "1.53", features = ["full"] }
-httlib-huffman = "0.3.4"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-tower = "0.5"
-tower-http = { version = "0.7", features = ["fs", "trace", "set-status"] }
 libc = "0.2.189"
 anyhow = "1.0.104"
-as-bytes = "0.2.0"
 xbpf = "0.0.3"
 
 [build-dependencies]
 xbpf = { version = "0.0.3", features = ["build"] }
 beeper = { path = "../beeper", features = ["build"] }
-
-[dev-dependencies]
-anyhow = "1.0.104"

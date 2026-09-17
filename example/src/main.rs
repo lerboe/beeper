@@ -1,93 +1,55 @@
-//! A static file server whose requests can be answered from the kernel.
+//! A minimal server whose traffic is monitored from eBPF.
 
-use axum::http::StatusCode;
-use clap::Parser;
-use example::{listener::BeeperListener, server};
-use fast_path::FastPath;
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
+use axum::{Router, http::HeaderMap, http::header::ACCEPT_LANGUAGE, routing::get};
+use monitor::Monitor;
+use std::net::SocketAddr;
 use tokio::net::TcpListener;
-use tower_http::{
-    services::{ServeDir, ServeFile},
-    set_status::SetStatus,
-    trace::TraceLayer,
-};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use xbpf::OpenObject;
 
-mod fast_path;
+mod monitor;
 
-/// A static file server that can answer its smaller assets from eBPF.
-#[derive(Parser)]
-#[command(about, long_about = None)]
-struct Args {
-    /// Disable the eBPF fast path.
-    #[arg(long)]
-    no_fastpath: bool,
+/// Greets the client in the language its `Accept-Language` header asks for,
+/// German or French, and in English otherwise.
+async fn greet(headers: HeaderMap) -> &'static str {
+    let lang = headers
+        .get(ACCEPT_LANGUAGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .unwrap_or("")
+        .trim();
 
-    /// The address to listen on.
-    #[arg(short, long, default_value = "127.0.0.1:8080")]
-    addr: SocketAddr,
-}
-
-/// All assets that are served with the fast path.
-fn fastpath_routes(assets_dir: &str) -> HashMap<String, PathBuf> {
-    [
-        "/style.css",
-        "/script.js",
-        "/honeycomb.png",
-        "/rings.png",
-        "/stripes.png",
-    ]
-    .into_iter()
-    .map(|path| {
-        let file = PathBuf::from(format!("{assets_dir}{path}"));
-        (path.to_string(), file)
-    })
-    .collect()
+    if lang.starts_with("de") {
+        "Hallo Welt"
+    } else if lang.starts_with("fr") {
+        "Bonjour le monde"
+    } else {
+        "Hello World"
+    }
 }
 
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
-
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                format!(
-                    "{}=debug,bpf=trace,tower_http=debug",
-                    env!("CARGO_CRATE_NAME")
-                )
-                .into()
+                format!("{}=debug,bpf=trace", env!("CARGO_CRATE_NAME")).into()
             }),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let assets_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/assets");
-    let index_html = SetStatus::new(
-        ServeFile::new(format!("{assets_dir}/index.html")),
-        StatusCode::NOT_FOUND,
-    );
-    let serve_dir = ServeDir::new(assets_dir).not_found_service(index_html);
+    let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
 
-    let app = axum::Router::new()
-        .fallback_service(serve_dir)
-        .layer(TraceLayer::new_for_http());
-
-    // the fast path has to outlive the server, and nothing of it is loaded
-    // unless it was asked for
+    // the monitor has to outlive the server, and nothing of it is loaded
+    // unless it is attached
     let mut open_obj = OpenObject::new();
-    let _fastpath = if args.no_fastpath {
-        tracing::info!("Running without the eBPF fast path");
-        None
-    } else {
-        let routes = fastpath_routes(assets_dir);
-        Some(FastPath::attach(args.addr, &mut open_obj, routes).expect("attach"))
-    };
+    let _monitor = Monitor::attach(addr, &mut open_obj).expect("attach monitor");
 
-    let listener = TcpListener::bind(args.addr).await.unwrap();
-    let listener = BeeperListener::new(listener);
-    tracing::debug!("listening on {}", listener.local_addr().unwrap());
+    let app = Router::new().fallback(get(greet));
 
-    server::serve(listener, app).await;
+    let listener = TcpListener::bind(addr).await.unwrap();
+    tracing::info!("listening on {}", listener.local_addr().unwrap());
+
+    axum::serve(listener, app).await.unwrap();
 }

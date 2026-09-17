@@ -95,41 +95,6 @@ You should now be able to compile and test Beeper as follows:
 RUST_LOG=trace cargo test
 ```
 
-## Running the Example
-
-Once you can build Beeper, you can also run the example. It is a simple HTTP server, with Beeper attached to it. It will serve some static files directly from the kernel. To run it, first start the server:
-```bash
-cargo run --bin example
-```
-
-Then, in another terminal, make a request to the server:
-```bash
-curl -vv http://127.0.0.1:8080/index.html
-```
-
-In the logs of the server, you should find a line that indicates that the request was served directly from the kernel:
-```
-Served request
-```
-
-To benchmark the server, run the following:
-```bash
-# server accelerated with beeper
-RUST_LOG= cargo run -r --bin example
-# baseline: server without the fastpath
-RUST_LOG= cargo run -r --bin example -- --no-fastpath
-```
-
-In a new window, you can now run the load test:
-```bash
-cargo install oha
-
-# to test http1 performance
-oha -c 100 -q 1000 -z 30s --latency-correction --urls-from-file example/load.txt
-# to test http2 performance
-oha -c 100 -q 1000 -z 30s --http2 --latency-correction --urls-from-file example/load.txt
-```
-
 ## Citation
 
 If you use this library to conduct your own research, please cite the full paper as follows:
