@@ -11,7 +11,7 @@ repository = "https://github.com/lerboe/beeper"
 readme = "README.md"
 keywords = ["ebpf", "bpf", "libbpf", "l7", "http"]
 description = "Application-Layer Parsing in eBPF"
-categories = ["network-programming"]
+categories = ["os", "os::linux-apis", "network-programming"]
 
 [patch.crates-io]
 h2 = { git = "https://github.com/lerboe/h2" }
