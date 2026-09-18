@@ -2,7 +2,10 @@
 //! with.
 #![allow(unused_imports)]
 use anyhow::Result;
-use beeper::{h1, h2, header::PATH, header::STATUS};
+use beeper::{
+    h1, h2,
+    pseudo_header::{PATH, STATUS},
+};
 use http::header::ACCEPT_LANGUAGE;
 use std::{
     io::{Error, ErrorKind},

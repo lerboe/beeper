@@ -13,7 +13,7 @@
 //! ```no_run
 //! # fn main() -> anyhow::Result<()> {
 //! # let prog_fd = 0;
-//! use beeper::{h1, header::PATH};
+//! use beeper::{h1, pseudo_header::PATH};
 //!
 //! let parser = h1::Parser::new()
 //!     .capture_hdr(&PATH)
@@ -48,13 +48,17 @@ pub mod h2;
 /// of a message. They are spelled without the leading colon of their HTTP/2
 /// counterparts so that a single [`http::HeaderName`] addresses the same field
 /// in both protocols.
-pub mod header {
+pub mod pseudo_header {
     /// The method of a request, e.g. `GET`.
     pub const METHOD: http::HeaderName = http::HeaderName::from_static("method");
     /// The path a request is addressed to, e.g. `/index.html`.
     pub const PATH: http::HeaderName = http::HeaderName::from_static("path");
     /// The status code of a response, e.g. `200`.
     pub const STATUS: http::HeaderName = http::HeaderName::from_static("status");
+    /// The authority of a request, e.g. `example.com`.
+    pub const AUTHORITY: http::HeaderName = http::HeaderName::from_static("authority");
+    /// The scheme of a request, e.g. `example.com`.
+    pub const SCHEME: http::HeaderName = http::HeaderName::from_static("scheme");
 }
 
 /// Points `prog` at the function it replaces in the target program.

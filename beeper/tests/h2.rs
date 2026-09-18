@@ -1,10 +1,9 @@
-use std::{net::SocketAddr, time::Duration};
-
 use ::h2::{RecvStream, client};
 use beeper::{h1, h2};
 use bytes::Bytes;
 use httlib_huffman as huffman;
 use http::{HeaderName, HeaderValue, Request, Response, header};
+use std::{net::SocketAddr, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -42,7 +41,12 @@ fn huffman_decode(val: &[u8]) -> String {
 
 fn dynamic_table_size_for_headers(headers: &[(HeaderName, HeaderValue)]) -> u32 {
     headers.iter().fold(0, |acc, (k, v)| {
-        acc + (k.as_str().len() + v.len() + 32) as u32
+        // pseudo-headers are addressed without the colon they carry on the wire
+        let colon = matches!(
+            k.as_str(),
+            "authority" | "method" | "path" | "scheme" | "status"
+        );
+        acc + (k.as_str().len() + colon as usize + v.len() + 32) as u32
     })
 }
 

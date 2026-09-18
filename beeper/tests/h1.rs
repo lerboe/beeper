@@ -1,4 +1,4 @@
-use beeper::h1;
+use beeper::{h1, pseudo_header};
 use http::{HeaderName, HeaderValue, header};
 use reqwest::Client;
 use std::net::SocketAddr;
@@ -247,7 +247,7 @@ async fn parse_status_line_only() {
     let _h1 = attach_h1_parser(
         prog.prog_fd(),
         true,
-        &[beeper::header::PATH, beeper::header::METHOD],
+        &[pseudo_header::PATH, pseudo_header::METHOD],
     );
 
     let client = build_client();
@@ -274,7 +274,7 @@ async fn parse_status_line_and_subsequent_header() {
     let _h1 = attach_h1_parser(
         prog.prog_fd(),
         true,
-        &[beeper::header::PATH, header::CONTENT_LENGTH],
+        &[pseudo_header::PATH, header::CONTENT_LENGTH],
     );
 
     let body = "Hello, world!";
@@ -303,7 +303,7 @@ async fn parse_status_code() {
     let _h1 = attach_h1_parser(
         prog.prog_fd(),
         true,
-        &[beeper::header::STATUS, header::CONTENT_LENGTH],
+        &[pseudo_header::STATUS, header::CONTENT_LENGTH],
     );
 
     let body = "Hello, world!";

@@ -25,6 +25,15 @@ extern crate plain;
 /// sync with `MAX_MATCHES` of beeper.h.
 const MAX_MATCHES: u16 = 32;
 
+/// Returns `name` as HTTP/2 spells it, i.e. with the leading colon of a
+/// pseudo-header, see [`crate::header`].
+fn wire_name(name: &HeaderName) -> String {
+    match name.as_str() {
+        "authority" | "method" | "path" | "scheme" | "status" => format!(":{name}"),
+        name => name.to_string(),
+    }
+}
+
 /// A parser for HTTP/2 messages.
 ///
 /// The builder methods configure which fields the parser captures and which
@@ -159,7 +168,7 @@ impl Parser {
         }
 
         let mut name_encoded = Vec::new();
-        huffman::encode(name.as_str().as_bytes(), &mut name_encoded)?;
+        huffman::encode(wire_name(name).as_bytes(), &mut name_encoded)?;
 
         let mid = self.new_match();
         self.dfa

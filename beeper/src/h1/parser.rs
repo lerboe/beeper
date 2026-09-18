@@ -3,7 +3,7 @@ use crate::{
     Dfa, MatchId, autoload_and_attach,
     dfa::{ANY_STATE, INIT_STATE, fmt_input},
     h1::action::Action,
-    header::{METHOD, PATH, STATUS},
+    pseudo_header::{METHOD, PATH, STATUS},
 };
 use anyhow::{Result, bail};
 use http::HeaderName;
