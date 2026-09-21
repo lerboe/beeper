@@ -552,6 +552,7 @@ fn delete_if_present(map: &MapHandle, key: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pseudo_header::{METHOD, PATH, STATUS};
 
     fn hdr(i: u8) -> HeaderName {
         HeaderName::from_bytes(format!("x-{i}").as_bytes()).unwrap()
@@ -573,13 +574,16 @@ mod tests {
 
     #[test]
     fn the_same_header_is_captured_under_one_match_id() {
-        let mut parser = Parser::new();
-        let first = parser.capture_hdr(&hdr(0)).expect("capture header");
-        let second = parser.capture_hdr(&hdr(0)).expect("capture header again");
+        // a pseudo-header is matched under the name `wire_name` gives it
+        for name in [hdr(0), METHOD, PATH, STATUS] {
+            let mut parser = Parser::new();
+            let first = parser.capture_hdr(&name).expect("capture header");
+            let second = parser.capture_hdr(&name).expect("capture header again");
 
-        assert_eq!(
-            first, second,
-            "capturing a header twice handed out two ids for one range"
-        );
+            assert_eq!(
+                first, second,
+                "capturing {name} twice handed out two ids for one range"
+            );
+        }
     }
 }

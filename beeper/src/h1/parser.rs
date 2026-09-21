@@ -504,13 +504,16 @@ mod tests {
 
     #[test]
     fn the_same_header_is_captured_under_one_match_id() {
-        let mut parser = Parser::new();
-        let first = parser.capture_hdr(&hdr(0)).expect("capture header");
-        let second = parser.capture_hdr(&hdr(0)).expect("capture header again");
+        // the status line fields are each captured by a path of their own
+        for name in [hdr(0), METHOD, PATH, STATUS] {
+            let mut parser = Parser::new();
+            let first = parser.capture_hdr(&name).expect("capture header");
+            let second = parser.capture_hdr(&name).expect("capture header again");
 
-        assert_eq!(
-            first, second,
-            "capturing a header twice handed out two ids for one range"
-        );
+            assert_eq!(
+                first, second,
+                "capturing {name} twice handed out two ids for one range"
+            );
+        }
     }
 }
