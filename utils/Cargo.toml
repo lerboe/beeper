@@ -12,7 +12,7 @@ beeper = { path = "../beeper", features = ["h1", "h2"] }
 bytes = "1.12.1"
 libc = "0.2.189"
 tokio = { version = "1.53", features = ["full"] }
-bpf-tracing = "0.0.5"
+bpf-tracing = "0.0.7"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 xbpf = "0.0.3"
