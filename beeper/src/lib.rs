@@ -11,7 +11,7 @@
 //! [`h2`] builder:
 //!
 //! ```no_run
-//! # fn main() -> anyhow::Result<()> {
+//! # fn main() -> Result<(), beeper::Error> {
 //! # let prog_fd = 0;
 //! use beeper::{MessageBuffer, h1, pseudo_header::PATH};
 //!
@@ -32,6 +32,7 @@
 pub(crate) use dfa::Dfa;
 use httlib_huffman::EncoderError;
 use std::fmt::Display;
+use xbpf::libbpf;
 
 mod dfa;
 
@@ -51,8 +52,8 @@ pub enum MessageBuffer {
     DynPtr,
 }
 
-/// The ways configuring a parser can fail.
-#[derive(Debug, PartialEq)]
+/// The ways a parser can fail.
+#[derive(Debug)]
 pub enum Error {
     /// The parser is already configured with as many captures as the parser
     /// program has room for. The limit is carried along.
@@ -61,13 +62,47 @@ pub enum Error {
     /// A header name could not be Huffman encoded, so there is no way to match
     /// it on the wire.
     InvalidEncoding(EncoderError),
+
+    /// The parsers exceeds the number of states or actions that can be loaded
+    /// into eBPF.
+    ParserExceedsStateLimit,
+
+    /// The parser program could not be loaded into the kernel, or not attached
+    /// to the program it should replace a function of.
+    Bpf(libbpf::Error),
+
+    /// An entry read back from one of the parser's maps is not laid out the
+    /// way the parser program writes it.
+    MalformedTableEntry(plain::Error),
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::InvalidEncoding(err) => Some(err),
+            Error::Bpf(err) => Some(err),
+            Error::MatchLimitExceeded(_)
+            | Error::ParserExceedsStateLimit
+            | Error::MalformedTableEntry(_) => None,
+        }
+    }
+}
 
 impl From<EncoderError> for Error {
     fn from(err: EncoderError) -> Error {
         Error::InvalidEncoding(err)
+    }
+}
+
+impl From<libbpf::Error> for Error {
+    fn from(err: libbpf::Error) -> Error {
+        Error::Bpf(err)
+    }
+}
+
+impl From<plain::Error> for Error {
+    fn from(err: plain::Error) -> Error {
+        Error::MalformedTableEntry(err)
     }
 }
 
@@ -79,6 +114,13 @@ impl Display for Error {
             }
             Error::InvalidEncoding(err) => {
                 write!(f, "the header name cannot be Huffman encoded: {err}")
+            }
+            Error::ParserExceedsStateLimit => {
+                write!(f, "the patterns do not fit into the parser program")
+            }
+            Error::Bpf(err) => write!(f, "the parser program cannot be loaded: {err}"),
+            Error::MalformedTableEntry(err) => {
+                write!(f, "the parser wrote a table entry back malformed: {err:?}")
             }
         }
     }

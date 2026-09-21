@@ -644,6 +644,7 @@ async fn parse_header_field_incremental_indexing_not_huffman_encoded() {
     ];
     let info = h2
         .dynamic_table_info(client.local_addr, client.remote_addr)
+        .expect("connection is known")
         .expect("dynamic_table_info");
 
     assert_eq!(info.count, expected_dt.len() as u32);
@@ -711,6 +712,7 @@ async fn ignore_frame_that_ends_before_it_claims_to() {
 
     let before = h2
         .dynamic_table_info(client.local_addr, client.remote_addr)
+        .expect("connection is known")
         .expect("dynamic_table_info");
     assert_eq!(before.count, 1);
 
@@ -734,6 +736,7 @@ async fn ignore_frame_that_ends_before_it_claims_to() {
 
     let after = h2
         .dynamic_table_info(client.local_addr, client.remote_addr)
+        .expect("connection is known")
         .expect("dynamic_table_info");
     assert_eq!(after.count, before.count);
     assert_eq!(after.size, before.size);
@@ -765,6 +768,7 @@ async fn ignore_header_field_indexed_past_the_end_of_the_table() {
 
     let info = h2
         .dynamic_table_info(client.local_addr, client.remote_addr)
+        .expect("connection is known")
         .expect("dynamic_table_info");
     assert_eq!(info.count, 0);
 }
@@ -799,6 +803,7 @@ async fn ignore_header_field_whose_value_runs_past_the_frame() {
     // and it is no more welcome in the table than it is in a capture
     let info = h2
         .dynamic_table_info(client.local_addr, client.remote_addr)
+        .expect("connection is known")
         .expect("dynamic_table_info");
     assert_eq!(info.count, 0);
     assert_eq!(info.size, 0);
@@ -846,6 +851,7 @@ async fn update_dynamic_table_size() {
 
     let max_size = h2
         .dynamic_table_info(client.local_addr, client.remote_addr)
+        .expect("connection is known")
         .expect("dynamic_table_info")
         .max_size;
     assert_eq!(max_size, 1234);
@@ -877,6 +883,7 @@ async fn evict_header_field_from_dynamic_table() {
 
     let info = h2
         .dynamic_table_info(client.local_addr, client.remote_addr)
+        .expect("connection is known")
         .expect("dynamic_table_info");
 
     let authority = addr.to_string();
@@ -902,6 +909,7 @@ async fn evict_header_field_from_dynamic_table() {
     // this should add the user-agent to the dynamic table, but not evict TEST_HEADER
     let info = h2
         .dynamic_table_info(client.local_addr, client.remote_addr)
+        .expect("connection is known")
         .expect("dynamic_table_info");
     let expected_dt = &[
         (TEST_HEADER_NAME, test_header_val.clone()),
@@ -926,6 +934,7 @@ async fn evict_header_field_from_dynamic_table() {
     // this should evict the authority, the oldest entry, and nothing more
     let info = h2
         .dynamic_table_info(client.local_addr, client.remote_addr)
+        .expect("connection is known")
         .expect("dynamic_table_info");
     let expected_dt = &[
         (TEST_HEADER_NAME, test_header_val.clone()),
@@ -1009,6 +1018,7 @@ async fn parse_padded_header_frame() {
 
     let info = h2
         .dynamic_table_info(client.local_addr, client.remote_addr)
+        .expect("connection is known")
         .expect("dynamic_table_info");
 
     let expected_dt = &[
@@ -1053,6 +1063,7 @@ async fn parse_header_frame_that_carries_a_priority() {
 
     let info = h2
         .dynamic_table_info(client.local_addr, client.remote_addr)
+        .expect("connection is known")
         .expect("dynamic_table_info");
 
     let expected_dt = &[(header::ACCEPT.as_str(), accept_val.clone())];
@@ -1096,6 +1107,7 @@ async fn resolve_index_of_entry_added_after_an_eviction() {
 
     let info = h2
         .dynamic_table_info(client.local_addr, client.remote_addr)
+        .expect("connection is known")
         .expect("dynamic_table_info");
     assert_eq!(
         info.deleted, 1,
@@ -1146,6 +1158,7 @@ async fn parse_header_block_split_over_a_continuation_frame() {
 
     let info = h2
         .dynamic_table_info(client.local_addr, client.remote_addr)
+        .expect("connection is known")
         .expect("dynamic_table_info");
 
     let expected_dt = &[(header::ACCEPT.as_str(), accept_val.clone())];
@@ -1184,6 +1197,7 @@ async fn mark_the_table_as_drifted_when_a_continuation_frame_splits_a_field() {
 
     let info = h2
         .dynamic_table_info(client.local_addr, client.remote_addr)
+        .expect("connection is known")
         .expect("dynamic_table_info");
     assert_eq!(
         info.dirty, 1,
@@ -1206,6 +1220,7 @@ async fn update_dynamic_table_size_past_the_width_of_a_u16() {
 
     let info = h2
         .dynamic_table_info(client.local_addr, client.remote_addr)
+        .expect("connection is known")
         .expect("dynamic_table_info");
     assert_eq!(info.max_size, 65536);
 }
@@ -1285,6 +1300,7 @@ async fn ignore_a_value_that_runs_into_the_frame_behind_it() {
     // a field is only ever made of the bytes of its own block
     let info = h2
         .dynamic_table_info(client.local_addr, client.remote_addr)
+        .expect("connection is known")
         .expect("dynamic_table_info");
     assert_eq!(
         info.count, 0,
@@ -1319,6 +1335,7 @@ async fn size_a_dynamic_table_entry_that_is_longer_than_an_entry_holds() {
 
     let info = h2
         .dynamic_table_info(client.local_addr, client.remote_addr)
+        .expect("connection is known")
         .expect("dynamic_table_info");
 
     let expected_dt = &[(header::ACCEPT.as_str(), long_val.clone())];
@@ -1485,6 +1502,7 @@ async fn update_dynamic_table_size_in_skb() {
     let (local, remote) = conn_at(Hook::Skb, client.local_addr, client.remote_addr);
     let max_size = h2
         .dynamic_table_info(local, remote)
+        .expect("connection is known")
         .expect("dynamic_table_info")
         .max_size;
     assert_eq!(max_size, 1234);
@@ -1523,6 +1541,7 @@ async fn parse_every_frame_of_a_single_write_in_skb() {
     let (local, remote) = conn_at(Hook::Skb, client.local_addr, client.remote_addr);
     let info = h2
         .dynamic_table_info(local, remote)
+        .expect("connection is known")
         .expect("dynamic_table_info");
     assert_eq!(info.count, 2);
 }
@@ -1582,12 +1601,13 @@ async fn forget_a_connection(hook: Hook) {
     let (local, remote) = conn_at(hook, client.local_addr, client.remote_addr);
     let info = h2
         .dynamic_table_info(local, remote)
+        .expect("connection is known")
         .expect("dynamic_table_info");
     assert_eq!(info.count, 1);
 
     h2.forget_conn(local, remote).expect("forget_conn");
     assert!(
-        h2.dynamic_table_info(local, remote).is_err(),
+        h2.dynamic_table_info(local, remote).is_none(),
         "the dynamic table of a forgotten connection is still there"
     );
 
@@ -1601,6 +1621,7 @@ async fn forget_a_connection(hook: Hook) {
 
     let info = h2
         .dynamic_table_info(local, remote)
+        .expect("connection is known")
         .expect("dynamic_table_info");
     assert_eq!(info.count, 0);
 }

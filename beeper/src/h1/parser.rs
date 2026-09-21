@@ -5,7 +5,6 @@ use crate::{
     h1::action::Action,
     pseudo_header::{METHOD, PATH, STATUS},
 };
-use anyhow::{Result, bail};
 use http::HeaderName;
 use std::{collections::HashMap, mem::MaybeUninit};
 use tracing::{Level, debug, trace, warn};
@@ -332,7 +331,7 @@ impl Parser {
     /// Returns an error if the parser cannot be loaded, or if one of the
     /// functions it should replace does not exist in the target program with a
     /// matching signature.
-    pub fn attach(self, target: i32) -> Result<AttachedParser> {
+    pub fn attach(self, target: i32) -> Result<AttachedParser, Error> {
         let parser = self.done_on_hdr_end();
 
         let skel_builder = ParserSkelBuilder::default();
@@ -370,7 +369,7 @@ impl Parser {
                 MessageBuffer::Msg => &mut open_skel.progs.extract_match_msg,
                 MessageBuffer::Skb => &mut open_skel.progs.extract_match_skb,
                 MessageBuffer::DynPtr => {
-                    bail!(
+                    todo!(
                         "the parser extracts a match from a msg or an skb, not from a {msg_buf:?}"
                     )
                 }
@@ -403,7 +402,7 @@ impl Parser {
                 MessageBuffer::Msg => skel.progs.extract_match_msg.attach()?,
                 MessageBuffer::Skb => skel.progs.extract_match_skb.attach()?,
                 MessageBuffer::DynPtr => {
-                    bail!(
+                    todo!(
                         "the parser extracts a match from a msg or an skb, not from a {msg_buf:?}"
                     )
                 }
@@ -418,17 +417,18 @@ impl Parser {
     /// Writes the transition table of the DFA into the read-only data of the
     /// parser program. This has to happen before the program is loaded, as the
     /// kernel freezes the section afterwards.
-    fn inject(&self, skel: &mut OpenParserSkel) -> Result<()> {
+    fn inject(&self, skel: &mut OpenParserSkel) -> Result<(), Error> {
         let Some(data) = skel.maps.rodata_data.as_mut() else {
-            bail!("the parser program has no read-only data to inject into");
+            panic!("the parser program has no read-only data to inject into");
         };
 
         let num_states = self.dfa.num_states() as usize;
         if num_states > data.s2ts.len() {
-            bail!(
+            warn!(
                 "the patterns take {num_states} states, the parser holds {}",
                 data.s2ts.len()
             );
+            return Err(Error::ParserExceedsStateLimit);
         }
 
         // action index 0 is reserved for the noop action
@@ -439,16 +439,18 @@ impl Parser {
             let new_action_idx = action_idx.len();
             let action = *action_idx.entry(action).or_insert(new_action_idx);
             if action >= data.a2as.len() {
-                bail!(
+                warn!(
                     "the patterns take more actions than the {} the parser holds",
                     data.a2as.len()
                 );
+                return Err(Error::ParserExceedsStateLimit);
             }
 
             let action = action as u16;
             let input = input as usize;
             if input >= data.s2ts[0].len() {
-                bail!("the patterns read inputs the parser has no column for: {input}");
+                warn!("the patterns read inputs the parser has no column for: {input}");
+                return Err(Error::ParserExceedsStateLimit);
             }
 
             trace!(
@@ -499,10 +501,10 @@ mod tests {
             assert_eq!(u8::from(mid), i);
         }
 
-        assert_eq!(
+        assert!(matches!(
             parser.capture_hdr(&hdr(MAX_MATCHES)),
-            Err(Error::MatchLimitExceeded(MAX_MATCHES as usize))
-        );
+            Err(Error::MatchLimitExceeded(limit)) if limit == MAX_MATCHES as usize
+        ));
     }
 
     #[test]

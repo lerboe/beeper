@@ -3,7 +3,6 @@ use crate::{
     Dfa, Error, MatchId, MessageBuffer,
     h2::{action::*, hpack},
 };
-use anyhow::{Result, bail};
 use as_bytes::AsBytes;
 use httlib_huffman as huffman;
 use http::HeaderName;
@@ -193,8 +192,8 @@ impl Parser {
     /// # Errors
     ///
     /// Returns an error if an entry cannot be encoded or written to the map.
-    fn populate_static_table(&self, static_table: &MapHandle) -> Result<()> {
-        let insert = |idx: u32, key: &str, val: Option<&str>| {
+    fn populate_static_table(&self, static_table: &MapHandle) -> Result<(), Error> {
+        let insert = |idx: u32, key: &str, val: Option<&str>| -> Result<(), Error> {
             let mut hf_key = Vec::new();
             huffman::encode(key.as_bytes(), &mut hf_key)?;
 
@@ -223,7 +222,7 @@ impl Parser {
 
             static_table.update(&idx, &hf, MapFlags::ANY)?;
 
-            anyhow::Ok(())
+            Ok(())
         };
 
         let (st_keys, st_hfs) = hpack::create_header_maps();
@@ -258,7 +257,7 @@ impl Parser {
     /// Returns an error if the parser cannot be loaded, or if one of the
     /// functions it should replace does not exist in the target program with a
     /// matching signature.
-    pub fn attach(self, target: i32) -> Result<AttachedParser> {
+    pub fn attach(self, target: i32) -> Result<AttachedParser, Error> {
         let skel_builder = ParserSkelBuilder::default();
         let mut open_obj: MaybeUninit<OpenObject> = MaybeUninit::uninit();
         let mut open_skel = skel_builder.open(&mut open_obj)?;
@@ -294,7 +293,7 @@ impl Parser {
                 MessageBuffer::Msg => &mut open_skel.progs.extract_match_msg,
                 MessageBuffer::Skb => &mut open_skel.progs.extract_match_skb,
                 MessageBuffer::DynPtr => {
-                    bail!(
+                    todo!(
                         "the parser extracts a match from a msg or an skb, not from a {msg_buf:?}"
                     )
                 }
@@ -333,7 +332,7 @@ impl Parser {
                 MessageBuffer::Msg => skel.progs.extract_match_msg.attach()?,
                 MessageBuffer::Skb => skel.progs.extract_match_skb.attach()?,
                 MessageBuffer::DynPtr => {
-                    bail!(
+                    todo!(
                         "the parser extracts a match from a msg or an skb, not from a {msg_buf:?}"
                     )
                 }
@@ -370,17 +369,18 @@ impl Parser {
     ///
     /// Returns an error if the patterns do not fit into the tables the parser
     /// program reserves for them.
-    fn inject(&self, skel: &mut OpenParserSkel) -> Result<()> {
+    fn inject(&self, skel: &mut OpenParserSkel) -> Result<(), Error> {
         let Some(data) = skel.maps.rodata_data.as_mut() else {
-            bail!("the parser program has no read-only data to inject into");
+            panic!("the parser program has no read-only data to inject into");
         };
 
         let num_states = self.dfa.num_states() as usize;
         if num_states > data.s2ts.len() {
-            bail!(
+            warn!(
                 "the patterns take {num_states} states, the parser holds {}",
                 data.s2ts.len()
             );
+            return Err(Error::ParserExceedsStateLimit);
         }
 
         // action index 0 is reserved for the noop action
@@ -391,15 +391,17 @@ impl Parser {
             let new_action_idx = action_idx.len();
             let action = *action_idx.entry(action).or_insert(new_action_idx);
             if action >= data.a2as.len() {
-                bail!(
+                warn!(
                     "the patterns take more actions than the {} the parser holds",
                     data.a2as.len()
                 );
+                return Err(Error::ParserExceedsStateLimit);
             }
 
             let input = input as usize;
             if input >= data.s2ts[0].len() {
-                bail!("the patterns read inputs the parser has no column for: {input}");
+                warn!("the patterns read inputs the parser has no column for: {input}");
+                return Err(Error::ParserExceedsStateLimit);
             }
 
             data.s2ts[from.0 as usize][input] = trans {
@@ -487,25 +489,25 @@ impl AttachedParser {
         &self,
         local: SocketAddr,
         remote: SocketAddr,
-    ) -> Result<DynamicTableInfo> {
+    ) -> Option<Result<DynamicTableInfo, Error>> {
         let conn = ip4_conn {
             local: local.into(),
             remote: remote.into(),
         };
 
         let key = unsafe { conn.as_bytes() };
-        let val = self.dynamic_table_info.lookup(key, MapFlags::empty())?;
-        let Some(val) = val else {
-            bail!("no dynamic table info for connection");
+        let val = match self.dynamic_table_info.lookup(key, MapFlags::empty()) {
+            Ok(val) => val?,
+            Err(err) => return Some(Err(err.into())),
         };
 
         let info: Result<&DynamicTableInfo, _> = plain::from_bytes(&val);
         match info {
-            Ok(info) => Ok(info.clone()),
-            Err(e) => bail!("failed to parse dynamic table info: {:?}", e),
+            Ok(info) => Some(Ok(info.clone())),
+            Err(err) => Some(Err(err.into())),
         }
     }
-    pub fn forget_conn(&self, local: SocketAddr, remote: SocketAddr) -> Result<()> {
+    pub fn forget_conn(&self, local: SocketAddr, remote: SocketAddr) -> Result<(), Error> {
         let conn = ip4_conn {
             local: local.into(),
             remote: remote.into(),
@@ -513,10 +515,7 @@ impl AttachedParser {
         let key = unsafe { conn.as_bytes() };
 
         if let Some(val) = self.dynamic_table_info.lookup(key, MapFlags::empty())? {
-            let info: &DynamicTableInfo = match plain::from_bytes(&val) {
-                Ok(info) => info,
-                Err(e) => bail!("failed to parse dynamic table info: {:?}", e),
-            };
+            let info: &DynamicTableInfo = plain::from_bytes(&val)?;
 
             // entries are stored under the running count of the ones added, the
             // evicted ones below `deleted` are already gone
@@ -535,7 +534,7 @@ impl AttachedParser {
     }
 }
 
-fn delete_if_present(map: &MapHandle, key: &[u8]) -> Result<()> {
+fn delete_if_present(map: &MapHandle, key: &[u8]) -> Result<(), Error> {
     match map.delete(key) {
         Err(e) if e.kind() != ErrorKind::NotFound => Err(e.into()),
         _ => Ok(()),
@@ -559,10 +558,10 @@ mod tests {
             assert_eq!(u8::from(mid), i);
         }
 
-        assert_eq!(
+        assert!(matches!(
             parser.capture_hdr(&hdr(MAX_MATCHES)),
-            Err(Error::MatchLimitExceeded(MAX_MATCHES as usize))
-        );
+            Err(Error::MatchLimitExceeded(limit)) if limit == MAX_MATCHES as usize
+        ));
     }
 
     #[test]
