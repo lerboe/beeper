@@ -94,7 +94,7 @@ static __always_inline void _next(u16 state, u8 input, u16 *next_state, u16 *act
 //
 // Returns the number of bytes it consumed once the DFA is done, or minus the
 // number of bytes it looked at if the data ran out first.
-static __always_inline int _parse_from(u8 *data, u8 *data_end, u16 start, struct hdr_match *ms, u32* cidx, u16* s, u16 *null_prefix) {
+static __always_inline int _parse_from(u8 *data, u8 *data_end, u16 start, struct hdr_match *ms, u32* cidx, u16* s, struct null_prefix *null_prefix) {
     u32 len = (u32)(data_end - data);
     bpf_clamp_uminmax(len, 0, MAX_BYTES);
 
@@ -108,8 +108,8 @@ static __always_inline int _parse_from(u8 *data, u8 *data_end, u16 start, struct
         u8 c = data[i];
 
         // skb clears the TLS header, but does not remove it
-        if (null_prefix && c == '\0' && i == *null_prefix) {
-            *null_prefix = i + 1;
+        if (null_prefix && c == '\0' && i == null_prefix->len) {
+            null_prefix->len = i + 1;
             continue;
         }
 
@@ -175,35 +175,36 @@ int parse_msg(struct sk_msg_md *msg, struct parse_res *pres __arg_nonnull) {
     return res;
 }
 
-// Parses the header block of the packet, pulling it in entirely if the linear
-// part of the sk_buff is not enough. See `parse_msg` for the return value.
+// Parses the header block of the message that starts `off` bytes into the
+// packet. The captured ranges are offsets into the
+// sk_buff, the return value is counted from the start of the message. See
+// `parse_msg` for the return value.
 SEC("freplace")
-int parse_skb(struct __sk_buff *skb, struct parse_res *pres __arg_nonnull, u16 *null_prefix) {
-    u32 cidx[MAX_MATCHES] = { 0 };
-    u16 s = s_init;
+int parse_skb(struct __sk_buff *skb, u32 off, struct parse_res *pres __arg_nonnull, struct null_prefix *null_prefix) {
+    if (off >= MAX_BYTES || off >= skb->len) return 0;
+
     u8 *data = (u8 *)(long)skb->data;
     u8 *data_end = (u8 *)(long)skb->data_end;
-    int res = _parse_from(data, data_end, 0, pres->ms, cidx, &s, null_prefix);
+    if (data + skb->len > data_end) {
+        if (bpf_skb_pull_data(skb, skb->len) < 0) return -1;
 
-    if (res < 0 && skb->len > -res) {
-        if (bpf_skb_pull_data(skb, skb->len) < 0) {
-            return res;
-        }
-
-        u8 *data = (u8 *)(long)skb->data;
-        u8 *data_end = (u8 *)(long)skb->data_end;
-
-        res = _parse_from(data, data_end, -res, pres->ms, cidx, &s, null_prefix);
+        data = (u8 *)(long)skb->data;
+        data_end = (u8 *)(long)skb->data_end;
     }
 
-    return res;
+    u32 cidx[MAX_MATCHES] = { 0 };
+    u16 s = s_init;
+    int res = _parse_from(data, data_end, off, pres->ms, cidx, &s, null_prefix);
+
+    // `_parse_from` counts from the start of the sk_buff
+    return res > 0 ? res - (int)off : res + (int)off;
 }
 
 // Parses the header block of the first `len` bytes of `buf_ptr`. Unlike a
 // message or a packet, a buffer is contiguous, so there is nothing to pull in
 // and a single pass is enough. See `parse_msg` for the return value.
 SEC("freplace")
-int parse_buf(const struct bpf_dynptr *buf_ptr, u32 len, struct parse_res *pres __arg_nonnull, u16 *null_prefix) {
+int parse_buf(const struct bpf_dynptr *buf_ptr, u32 len, struct parse_res *pres __arg_nonnull, struct null_prefix *null_prefix) {
     u32 cidx[MAX_MATCHES] = { 0 };
     u16 s = s_init;
 
@@ -219,7 +220,7 @@ int parse_buf(const struct bpf_dynptr *buf_ptr, u32 len, struct parse_res *pres 
 
 // Returns whether the parser captured a range for the match `idx`.
 SEC("freplace")
-bool matched(const struct sk_msg_md *msg, const struct parse_res *pres __arg_nonnull, u8 idx) {
+bool matched(const struct parse_res *pres __arg_nonnull, u8 idx) {
     if (idx >= MAX_MATCHES) return false;
 
     struct hdr_match m = pres->ms[idx & MAX_MATCH_MASK];
@@ -232,7 +233,7 @@ bool matched(const struct sk_msg_md *msg, const struct parse_res *pres __arg_non
 // Returns 0 on success, -1 if nothing was captured for `idx` or if the range
 // lies outside of the part of the message the program can read.
 SEC("freplace")
-int extract_match(const struct sk_msg_md *msg, const struct parse_res *pres __arg_nonnull, u8 idx, struct hdr_str* str __arg_nonnull) {
+int extract_match_msg(const struct sk_msg_md *msg, const struct parse_res *pres __arg_nonnull, u8 idx, struct hdr_str* str __arg_nonnull) {
     if (idx >= MAX_MATCHES) return -1;
 
     struct hdr_match m = pres->ms[idx & MAX_MATCH_MASK];
@@ -240,6 +241,27 @@ int extract_match(const struct sk_msg_md *msg, const struct parse_res *pres __ar
 
     u8 *data = (u8 *)(long)msg->data;
     u8 *data_end = (u8 *)(long)msg->data_end;
+
+    if (data + m.idx + m.len > data_end) return -1;
+
+    str->ptr = data + m.idx;
+    str->len = m.len;
+
+    return 0;
+}
+
+// Same as `extract_match`, for a match taken out of an sk_buff. The range
+// points into `skb`, so it is only valid until the program invalidates its data
+// pointers.
+SEC("freplace")
+int extract_match_skb(const struct __sk_buff *skb, const struct parse_res *pres __arg_nonnull, u8 idx, struct hdr_str* str __arg_nonnull) {
+    if (idx >= MAX_MATCHES) return -1;
+
+    struct hdr_match m = pres->ms[idx & MAX_MATCH_MASK];
+    if (m.len == 0) return -1;
+
+    u8 *data = (u8 *)(long)skb->data;
+    u8 *data_end = (u8 *)(long)skb->data_end;
 
     if (data + m.idx + m.len > data_end) return -1;
 

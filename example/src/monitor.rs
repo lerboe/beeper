@@ -3,7 +3,7 @@
 #![allow(unused_imports)]
 use anyhow::Result;
 use beeper::{
-    h1, h2,
+    MessageBuffer, h1, h2,
     pseudo_header::{PATH, STATUS},
 };
 use http::header::ACCEPT_LANGUAGE;
@@ -81,13 +81,13 @@ impl<'obj> Monitor<'obj> {
             .capture_hdr(&PATH)
             .capture_hdr(&ACCEPT_LANGUAGE)
             .capture_hdr(&STATUS)
-            .replace_parse_msg("parse_h1")
-            .replace_matched("matched_h1")
-            .replace_extract("extract_h1_match")
+            .parse_fn("parse_h1", MessageBuffer::Msg)
+            .matched_fn("matched_h1")
+            .extract_fn("extract_h1_match", MessageBuffer::Msg)
             .attach(prog_fd)?;
 
         let h2 = h2::Parser::new()
-            .replace_parse_msg("parse_h2")
+            .parse_fn("parse_h2", MessageBuffer::Msg)
             .attach(prog_fd)?;
 
         tracing::debug!("Monitor attached");

@@ -1,6 +1,6 @@
 #![allow(unused_imports)]
 use crate::{
-    Dfa, MatchId, autoload_and_attach,
+    Dfa, MatchId, MessageBuffer,
     dfa::{ANY_STATE, INIT_STATE, fmt_input},
     h1::action::Action,
     pseudo_header::{METHOD, PATH, STATUS},
@@ -34,11 +34,14 @@ pub struct Parser {
     /// The number of matches occuring in the patterns.
     num_matches: u16,
 
-    parse_msg_fn: Option<String>,
-    parse_buf_fn: Option<String>,
-    parse_skb_fn: Option<String>,
-    extract_fn: Option<String>,
+    /// The parse function name for each message buffer.
+    parse_fns: HashMap<MessageBuffer, String>,
+
+    /// The matched function name. It is agnostic to the message buffer.
     matched_fn: Option<String>,
+
+    /// The extract function name for each message buffer.
+    extract_fns: HashMap<MessageBuffer, String>,
 }
 
 xbpf::include_bpf!("h1/parser");
@@ -52,11 +55,9 @@ impl Parser {
         Parser {
             dfa: Dfa::new(),
             num_matches: 0,
-            parse_msg_fn: None,
-            parse_buf_fn: None,
-            parse_skb_fn: None,
-            extract_fn: None,
+            parse_fns: HashMap::new(),
             matched_fn: None,
+            extract_fns: HashMap::new(),
         }
     }
 
@@ -66,30 +67,9 @@ impl Parser {
     /// # Arguments
     ///
     /// * `parse_fn` - The name of the function to replace in the target program
-    pub fn replace_parse_msg<S: ToString>(mut self, parse_fn: S) -> Parser {
-        self.parse_msg_fn = Some(parse_fn.to_string());
-        self
-    }
-
-    /// Specifies the function template in the target program to be replaced with a parser
-    /// reading from a `sk_buff`. The function will not be replaced until `attach` is called.
-    ///
-    /// # Arguments
-    ///
-    /// * `parse_fn` - The name of the function to replace in the target program
-    pub fn replace_parse_skb<S: ToString>(mut self, parse_fn: S) -> Parser {
-        self.parse_skb_fn = Some(parse_fn.to_string());
-        self
-    }
-
-    /// Specifies the function template in the target program to be replaced with a parser
-    /// reading from a dynptr. The function will not be replaced until `attach` is called.
-    ///
-    /// # Arguments
-    ///
-    /// * `parse_fn` - The name of the function to replace in the target program
-    pub fn replace_parse_buf<S: ToString>(mut self, parse_fn: S) -> Parser {
-        self.parse_buf_fn = Some(parse_fn.to_string());
+    /// * `msg_buf` - The type of buffer to parse
+    pub fn parse_fn<S: ToString>(mut self, parse_fn: S, msg_buf: MessageBuffer) -> Parser {
+        self.parse_fns.insert(msg_buf, parse_fn.to_string());
         self
     }
 
@@ -99,7 +79,7 @@ impl Parser {
     /// # Arguments
     ///
     /// * `matched_fn` - The name of the matched callback function in the target program
-    pub fn replace_matched<S: ToString>(mut self, matched_fn: S) -> Parser {
+    pub fn matched_fn<S: ToString>(mut self, matched_fn: S) -> Parser {
         self.matched_fn = Some(matched_fn.to_string());
         self
     }
@@ -110,8 +90,9 @@ impl Parser {
     /// # Arguments
     ///
     /// * `extract_fn` - The name of the extract callback function in the target program
-    pub fn replace_extract<S: ToString>(mut self, extract_fn: S) -> Parser {
-        self.extract_fn = Some(extract_fn.to_string());
+    /// * `msg_buf` - The type of buffer to extract the match from
+    pub fn extract_fn<S: ToString>(mut self, extract_fn: S, msg_buf: MessageBuffer) -> Parser {
+        self.extract_fns.insert(msg_buf, extract_fn.to_string());
         self
     }
 
@@ -279,8 +260,9 @@ impl Parser {
 
     /// Loads the configured parser and attaches it to the target program.
     ///
-    /// Every function configured with one of the `replace_*` methods is
-    /// replaced in the target program, the remaining parser programs are left
+    /// Every function configured with [`Parser::parse_fn`],
+    /// [`Parser::matched_fn`] or [`Parser::extract_fn`] is replaced in the
+    /// target program, the remaining parser programs are left
     /// unloaded. The parser always stops at the end of the header block, no
     /// matter which patterns were configured.
     ///
@@ -293,7 +275,7 @@ impl Parser {
     /// Returns an error if the parser cannot be loaded, or if one of the
     /// functions it should replace does not exist in the target program with a
     /// matching signature.
-    pub fn attach<'obj>(self, target: i32) -> Result<AttachedParser> {
+    pub fn attach(self, target: i32) -> Result<AttachedParser> {
         let parser = self.done_on_hdr_end();
 
         let skel_builder = ParserSkelBuilder::default();
@@ -305,19 +287,35 @@ impl Parser {
             open_skel.progs.parse_buf.set_log_level(1);
         }
 
-        let progs = vec![
-            (&mut open_skel.progs.parse_msg, parser.parse_msg_fn.clone()),
-            (&mut open_skel.progs.parse_skb, parser.parse_skb_fn.clone()),
-            (&mut open_skel.progs.parse_buf, parser.parse_buf_fn.clone()),
-            (&mut open_skel.progs.matched, parser.matched_fn.clone()),
-            (
-                &mut open_skel.progs.extract_match,
-                parser.extract_fn.clone(),
-            ),
-        ];
+        // only the programs the parser was configured with are loaded
+        for mut prog in open_skel.open_object_mut().progs_mut() {
+            prog.set_autoload(false);
+        }
 
-        for (prog, func) in progs {
-            autoload_and_attach(prog, target, func)?;
+        for (msg_buf, func) in &parser.parse_fns {
+            let prog = match msg_buf {
+                MessageBuffer::Msg => &mut open_skel.progs.parse_msg,
+                MessageBuffer::Skb => &mut open_skel.progs.parse_skb,
+                MessageBuffer::DynPtr => &mut open_skel.progs.parse_buf,
+            };
+            prog.set_autoload(true);
+            prog.set_attach_target(target, Some(func.clone()))?;
+        }
+
+        if let Some(func) = &parser.matched_fn {
+            let prog = &mut open_skel.progs.matched;
+            prog.set_autoload(true);
+            prog.set_attach_target(target, Some(func.clone()))?;
+        }
+
+        for (msg_buf, func) in &parser.extract_fns {
+            let prog = match msg_buf {
+                MessageBuffer::Msg => &mut open_skel.progs.extract_match_msg,
+                MessageBuffer::Skb => &mut open_skel.progs.extract_match_skb,
+                MessageBuffer::DynPtr => bail!("the parser extracts a match from a msg or an skb, not from a {msg_buf}"),
+            };
+            prog.set_autoload(true);
+            prog.set_attach_target(target, Some(func.clone()))?;
         }
 
         parser.inject(&mut open_skel)?;
@@ -326,27 +324,30 @@ impl Parser {
         xbpf::tracing::try_init(skel.object())?;
 
         let mut links = Vec::new();
-        if parser.parse_msg_fn.is_some() {
-            links.push(skel.progs.parse_msg.attach()?);
-        }
-        if parser.parse_skb_fn.is_some() {
-            links.push(skel.progs.parse_skb.attach()?);
-        }
-        if parser.parse_buf_fn.is_some() {
-            links.push(skel.progs.parse_buf.attach()?);
+
+        for msg_buf in parser.parse_fns.keys() {
+            links.push(match msg_buf {
+                MessageBuffer::Msg => skel.progs.parse_msg.attach()?,
+                MessageBuffer::Skb => skel.progs.parse_skb.attach()?,
+                MessageBuffer::DynPtr => skel.progs.parse_buf.attach()?,
+            });
         }
 
         if parser.matched_fn.is_some() {
             links.push(skel.progs.matched.attach()?);
         }
 
-        if parser.extract_fn.is_some() {
-            links.push(skel.progs.extract_match.attach()?);
+        for msg_buf in parser.extract_fns.keys() {
+            links.push(match msg_buf {
+                MessageBuffer::Msg => skel.progs.extract_match_msg.attach()?,
+                MessageBuffer::Skb => skel.progs.extract_match_skb.attach()?,
+                MessageBuffer::DynPtr => bail!("the parser extracts a match from a msg or an skb, not from a {msg_buf}"),
+            });
         }
 
         debug!("Beeper http/1 attached");
 
-        anyhow::Ok(AttachedParser { links })
+        Ok(AttachedParser { links })
     }
 
     /// Writes the transition table of the DFA into the read-only data of the

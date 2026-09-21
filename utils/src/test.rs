@@ -8,7 +8,7 @@
 
 use anyhow::Result;
 use as_bytes::AsBytes;
-use beeper::h2::Parser;
+use beeper::{MessageBuffer, h2::Parser};
 use std::{
     io::{Error, ErrorKind},
     mem::MaybeUninit,
@@ -39,11 +39,40 @@ pub enum Direction {
     Upstream,
 }
 
+/// The hook the program parses messages at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hook {
+    /// `sk_msg`, as the messages are sent.
+    Msg,
+
+    /// `sk_skb`, as the messages arrive.
+    Skb,
+}
+
+impl Hook {
+    pub fn to_string(&self) -> &str {
+        match self {
+            Hook::Msg => "msg",
+            Hook::Skb => "skb",
+        }
+    }
+}
+
+impl From<Hook> for MessageBuffer {
+    fn from(hook: Hook) -> Self {
+        match hook {
+            Hook::Msg => MessageBuffer::Msg,
+            Hook::Skb => MessageBuffer::Skb,
+        }
+    }
+}
+
 /// The test program, attached to a socket map and a cgroup.
 ///
 /// It stays attached until it is dropped.
 pub struct TestProgram<'obj> {
     skel: ProgSkel<'obj>,
+    hook: Hook,
     #[allow(dead_code)]
     sockops: Link,
 }
@@ -65,6 +94,15 @@ impl<'obj> TestProgram<'obj> {
         open_obj: &'obj mut MaybeUninit<libbpf_rs::OpenObject>,
         direction: Direction,
     ) -> Result<Self> {
+        Self::attach_to(address, open_obj, direction, Hook::Msg)
+    }
+
+    pub fn attach_to<A: ToSocketAddrs>(
+        address: A,
+        open_obj: &'obj mut MaybeUninit<libbpf_rs::OpenObject>,
+        direction: Direction,
+        hook: Hook,
+    ) -> Result<Self> {
         let address = address
             .to_socket_addrs()?
             .next()
@@ -74,6 +112,8 @@ impl<'obj> TestProgram<'obj> {
         let mut open_skel = skel_builder.open(open_obj)?;
         if tracing::event_enabled!(Level::TRACE) {
             open_skel.progs.msg_verdict.set_log_level(1);
+            open_skel.progs.skb_parser.set_log_level(1);
+            open_skel.progs.skb_verdict.set_log_level(1);
         }
 
         let ip4 = match address {
@@ -87,6 +127,7 @@ impl<'obj> TestProgram<'obj> {
         open_skel.maps.rodata_data.as_mut().unwrap().ip4 = ip4;
         open_skel.maps.rodata_data.as_mut().unwrap().port = address.port() as u32;
         open_skel.maps.rodata_data.as_mut().unwrap().parse_resp = direction == Direction::Upstream;
+        open_skel.maps.rodata_data.as_mut().unwrap().hook_skb = hook == Hook::Skb;
 
         let skel = open_skel.load()?;
         let sock_map_fd = skel.maps.sock_map.as_fd().as_raw_fd();
@@ -103,11 +144,21 @@ impl<'obj> TestProgram<'obj> {
             .into_raw_fd();
 
         let sockops = skel.progs.monitor_sockets.attach_cgroup(cgroup_fd)?;
-        skel.progs.msg_verdict.attach_sockmap(sock_map_fd)?;
+        match hook {
+            Hook::Msg => skel.progs.msg_verdict.attach_sockmap(sock_map_fd)?,
+            Hook::Skb => {
+                skel.progs.skb_parser.attach_sockmap(sock_map_fd)?;
+                skel.progs.skb_verdict.attach_sockmap(sock_map_fd)?;
+            }
+        }
 
         debug!("Test program attached");
 
-        Ok(Self { sockops, skel })
+        Ok(Self {
+            sockops,
+            skel,
+            hook,
+        })
     }
 
     /// Returns the number of connections that were upgraded to HTTP/2, i.e. the
@@ -137,8 +188,22 @@ impl<'obj> TestProgram<'obj> {
         }
     }
 
+    /// Returns the match ids the parser reported a capture for in the last
+    /// message it parsed, one bit per id.
+    pub fn last_matches(&self) -> u32 {
+        self.skel.maps.bss_data.as_ref().unwrap().last_matches
+    }
+
+    pub fn last_dt_counts(&self) -> (u32, u32) {
+        let bss = self.skel.maps.bss_data.as_ref().unwrap();
+        (bss.last_dt_count_before, bss.last_dt_count)
+    }
+
     /// Returns the file descriptor of the program a parser attaches to.
     pub fn prog_fd(&self) -> i32 {
-        self.skel.progs.msg_verdict.as_fd().as_raw_fd()
+        match self.hook {
+            Hook::Msg => self.skel.progs.msg_verdict.as_fd().as_raw_fd(),
+            Hook::Skb => self.skel.progs.skb_verdict.as_fd().as_raw_fd(),
+        }
     }
 }

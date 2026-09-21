@@ -1,5 +1,5 @@
 use ::h2::{RecvStream, client};
-use beeper::{h1, h2};
+use beeper::{h1, h2, pseudo_header};
 use bytes::Bytes;
 use httlib_huffman as huffman;
 use http::{HeaderName, HeaderValue, Request, Response, header};
@@ -10,14 +10,11 @@ use tokio::{
 };
 use utils::{
     server,
-    test::{Direction, TestProgram},
+    test::{Direction, Hook, TestProgram},
 };
 use xbpf::OpenObject;
 
 const TEST_HEADER: HeaderName = HeaderName::from_static("testheader");
-const METHOD_HEADER: HeaderName = HeaderName::from_static("method");
-const AUTHORITY_HEADER: HeaderName = HeaderName::from_static("authority");
-const PATH_HEADER: HeaderName = HeaderName::from_static("path");
 
 fn huffman_encode(s: &str) -> Vec<u8> {
     let mut coded = Vec::new();
@@ -316,26 +313,58 @@ impl RawClient {
     }
 }
 
-fn attach_preface_parser(prog_fd: i32) -> h1::AttachedParser {
+fn attach_h1_parser(prog_fd: i32, hook: Hook) -> h1::AttachedParser {
+    let suffix = hook.to_string();
     h1::Parser::new()
         .match_h2_preface()
-        .replace_parse_msg("parse_h1")
-        .replace_matched("matched_h1")
-        .replace_extract("extract_h1_match")
+        .matched_fn("matched_h1")
+        .parse_fn(format!("parse_h1_{suffix}"), hook.into())
+        .matched_fn("matched_h1")
+        .extract_fn(format!("extract_h1_match_{suffix}"), hook.into())
         .attach(prog_fd)
         .expect("attach parser")
 }
 
-fn attach_h2_parser(prog_fd: i32, hdrs: &[HeaderName]) -> h2::AttachedParser {
+fn attach_h2_parser(prog_fd: i32, hook: Hook, hdrs: &[HeaderName]) -> h2::AttachedParser {
     let mut h2 = h2::Parser::new();
     for hdr in hdrs {
         h2 = h2.capture_hdr(hdr).expect(&format!("capture {:?}", hdr));
     }
 
-    h2.replace_parse_msg("parse_h2")
-        .replace_extract("extract_h2_match")
+    let suffix = hook.to_string();
+    h2.parse_fn(format!("parse_h2_{suffix}"), hook.into())
+        .extract_fn(format!("extract_h2_match_{suffix}"), hook.into())
         .attach(prog_fd)
         .expect("attach parser")
+}
+
+/// Attaches the test program at `hook` along with the parsers that go with it.
+fn attach_at<'obj>(
+    addr: SocketAddr,
+    open_obj: &'obj mut OpenObject,
+    hook: Hook,
+    hdrs: &[HeaderName],
+) -> (TestProgram<'obj>, h1::AttachedParser, h2::AttachedParser) {
+    let prog = TestProgram::attach_to(addr, open_obj, Direction::Downstream, hook)
+        .expect("attach program");
+
+    let h1 = attach_h1_parser(prog.prog_fd(), hook);
+    let h2 = attach_h2_parser(prog.prog_fd(), hook, hdrs);
+
+    (prog, h1, h2)
+}
+
+/// The addresses the parser at `hook` keys the connection of `client` with:
+/// `sk_msg` runs on the client's socket, `sk_skb` on the server's.
+fn conn_at(
+    hook: Hook,
+    local_addr: SocketAddr,
+    remote_addr: SocketAddr,
+) -> (SocketAddr, SocketAddr) {
+    match hook {
+        Hook::Msg => (local_addr, remote_addr),
+        Hook::Skb => (remote_addr, local_addr),
+    }
 }
 
 #[tokio::test]
@@ -345,8 +374,8 @@ async fn parse_header_field_indexed_in_static_table() {
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
 
-    let _h1 = attach_preface_parser(prog.prog_fd());
-    let _h2 = attach_h2_parser(prog.prog_fd(), &[METHOD_HEADER]);
+    let _h1 = attach_h1_parser(prog.prog_fd(), Hook::Msg);
+    let _h2 = attach_h2_parser(prog.prog_fd(), Hook::Msg, &[pseudo_header::METHOD]);
 
     let client = Client::connect(addr, None).await;
     client.get(format!("http://{}", addr), &[]).await;
@@ -360,11 +389,7 @@ async fn parse_header_field_no_indexing_name_indexed_in_static_table() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let prog =
-        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
-
-    let _h1 = attach_preface_parser(prog.prog_fd());
-    let _h2 = attach_h2_parser(prog.prog_fd(), &[header::AUTHORIZATION]);
+    let (prog, _h1, _h2) = attach_at(addr, &mut open_obj, Hook::Msg, &[header::AUTHORIZATION]);
 
     let auth_val = HeaderValue::from_static("Basic YmVlbGluZTpiZWVsaW5l"); // beeper:beeper in base64
 
@@ -384,11 +409,7 @@ async fn parse_header_field_never_indexing_name_indexed_in_static_table() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let prog =
-        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
-
-    let _h1 = attach_preface_parser(prog.prog_fd());
-    let _h2 = attach_h2_parser(prog.prog_fd(), &[TEST_HEADER]);
+    let (prog, _h1, _h2) = attach_at(addr, &mut open_obj, Hook::Msg, &[TEST_HEADER]);
 
     let mut test_header_val = HeaderValue::from_static("my secret");
     test_header_val.set_sensitive(true);
@@ -409,11 +430,7 @@ async fn parse_header_field_never_indexing_new_name() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let prog =
-        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
-
-    let _h1 = attach_preface_parser(prog.prog_fd());
-    let _h2 = attach_h2_parser(prog.prog_fd(), &[TEST_HEADER]);
+    let (prog, _h1, _h2) = attach_at(addr, &mut open_obj, Hook::Msg, &[TEST_HEADER]);
 
     let mut test_header_val = HeaderValue::from_static("my secret");
     test_header_val.set_sensitive(true);
@@ -434,11 +451,12 @@ async fn parse_header_field_incremental_indexing_name_indexed_in_static_table() 
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let prog =
-        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
-
-    let _h1 = attach_preface_parser(prog.prog_fd());
-    let _h2 = attach_h2_parser(prog.prog_fd(), &[header::USER_AGENT, PATH_HEADER]);
+    let (prog, _h1, _h2) = attach_at(
+        addr,
+        &mut open_obj,
+        Hook::Msg,
+        &[header::USER_AGENT, pseudo_header::PATH],
+    );
 
     let user_agent_val = HeaderValue::from_static("beeper");
     let path = "/bee/1234";
@@ -465,11 +483,12 @@ async fn parse_header_field_incremental_indexing_new_name() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let prog =
-        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
-
-    let _h1 = attach_preface_parser(prog.prog_fd());
-    let _h2 = attach_h2_parser(prog.prog_fd(), &[TEST_HEADER, PATH_HEADER]);
+    let (prog, _h1, _h2) = attach_at(
+        addr,
+        &mut open_obj,
+        Hook::Msg,
+        &[TEST_HEADER, pseudo_header::PATH],
+    );
 
     let test_header_val = HeaderValue::from_static("beeper");
     let path = "/bee/1234";
@@ -491,12 +510,10 @@ async fn parse_header_field_incremental_indexing_indexed_in_dynamic_table() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let prog =
-        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
-
-    let _h1 = attach_preface_parser(prog.prog_fd());
-    let _h2 = attach_h2_parser(
-        prog.prog_fd(),
+    let (prog, _h1, _h2) = attach_at(
+        addr,
+        &mut open_obj,
+        Hook::Msg,
         &[header::USER_AGENT, header::ACCEPT_LANGUAGE],
     );
 
@@ -574,11 +591,7 @@ async fn parse_header_field_incremental_indexing_not_huffman_encoded() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let prog =
-        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
-
-    let _h1 = attach_preface_parser(prog.prog_fd());
-    let h2 = attach_h2_parser(prog.prog_fd(), &[header::ACCEPT]);
+    let (prog, _h1, h2) = attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT]);
 
     let accept_val = HeaderValue::from_static("*/*");
     let test_header_val = HeaderValue::from_static("in-the-hive");
@@ -622,11 +635,7 @@ async fn resolve_index_of_entry_that_was_not_huffman_encoded() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let prog =
-        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
-
-    let _h1 = attach_preface_parser(prog.prog_fd());
-    let _h2 = attach_h2_parser(prog.prog_fd(), &[header::ACCEPT]);
+    let (prog, _h1, _h2) = attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT]);
 
     let accept_val = HeaderValue::from_static("*/*");
 
@@ -663,11 +672,7 @@ async fn ignore_frame_that_ends_before_it_claims_to() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let prog =
-        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
-
-    let _h1 = attach_preface_parser(prog.prog_fd());
-    let h2 = attach_h2_parser(prog.prog_fd(), &[header::ACCEPT]);
+    let (prog, _h1, h2) = attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT]);
 
     let mut client = RawClient::connect(addr).await;
 
@@ -716,11 +721,7 @@ async fn ignore_header_field_indexed_past_the_end_of_the_table() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let prog =
-        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
-
-    let _h1 = attach_preface_parser(prog.prog_fd());
-    let h2 = attach_h2_parser(prog.prog_fd(), &[header::ACCEPT]);
+    let (prog, _h1, h2) = attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT]);
 
     let mut client = RawClient::connect(addr).await;
 
@@ -749,11 +750,7 @@ async fn ignore_header_field_whose_value_runs_past_the_frame() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let prog =
-        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
-
-    let _h1 = attach_preface_parser(prog.prog_fd());
-    let h2 = attach_h2_parser(prog.prog_fd(), &[header::ACCEPT]);
+    let (prog, _h1, h2) = attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT]);
 
     let mut client = RawClient::connect(addr).await;
 
@@ -787,11 +784,7 @@ async fn parse_frame_after_an_unknown_one() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let prog =
-        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
-
-    let _h1 = attach_preface_parser(prog.prog_fd());
-    let _h2 = attach_h2_parser(prog.prog_fd(), &[header::ACCEPT]);
+    let (prog, _h1, _h2) = attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT]);
 
     let mut client = RawClient::connect(addr).await;
 
@@ -820,11 +813,7 @@ async fn update_dynamic_table_size() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let prog =
-        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
-
-    let _h1 = attach_preface_parser(prog.prog_fd());
-    let h2 = attach_h2_parser(prog.prog_fd(), &[]);
+    let (_prog, _h1, h2) = attach_at(addr, &mut open_obj, Hook::Msg, &[]);
 
     let client = Client::connect(addr, Some(1234)).await;
     client.get(format!("http://{}", addr), &[]).await;
@@ -841,11 +830,12 @@ async fn evict_header_field_from_dynamic_table() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let prog =
-        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
-
-    let _h1 = attach_preface_parser(prog.prog_fd());
-    let h2 = attach_h2_parser(prog.prog_fd(), &[TEST_HEADER, header::USER_AGENT]);
+    let (prog, _h1, h2) = attach_at(
+        addr,
+        &mut open_obj,
+        Hook::Msg,
+        &[TEST_HEADER, header::USER_AGENT],
+    );
 
     let test_header_val = HeaderValue::from_static("asdfqwerasdfqwerasdfqwerasdfqwer");
     let user_agent_val = HeaderValue::from_static("test-agent");
@@ -867,7 +857,7 @@ async fn evict_header_field_from_dynamic_table() {
     let expected_dt = &[
         (TEST_HEADER, test_header_val.clone()),
         (
-            AUTHORITY_HEADER,
+            pseudo_header::AUTHORITY,
             HeaderValue::from_str(&authority.as_str()).unwrap(),
         ),
     ];
@@ -890,7 +880,7 @@ async fn evict_header_field_from_dynamic_table() {
     let expected_dt = &[
         (TEST_HEADER, test_header_val.clone()),
         (
-            AUTHORITY_HEADER,
+            pseudo_header::AUTHORITY,
             HeaderValue::from_str(&authority.as_str()).unwrap(),
         ),
         (header::USER_AGENT, user_agent_val.clone()),
@@ -955,11 +945,7 @@ async fn parse_padded_header_frame() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let prog =
-        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
-
-    let _h1 = attach_preface_parser(prog.prog_fd());
-    let h2 = attach_h2_parser(prog.prog_fd(), &[header::ACCEPT]);
+    let (prog, _h1, h2) = attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT]);
 
     let authority = addr.to_string();
     let padded_val = HeaderValue::from_static("padded");
@@ -1015,11 +1001,7 @@ async fn parse_header_frame_that_carries_a_priority() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let prog =
-        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
-
-    let _h1 = attach_preface_parser(prog.prog_fd());
-    let h2 = attach_h2_parser(prog.prog_fd(), &[header::ACCEPT]);
+    let (prog, _h1, h2) = attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT]);
 
     let authority = addr.to_string();
     let accept_val = HeaderValue::from_static("after-the-priority");
@@ -1059,11 +1041,12 @@ async fn resolve_index_of_entry_added_after_an_eviction() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let prog =
-        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
-
-    let _h1 = attach_preface_parser(prog.prog_fd());
-    let h2 = attach_h2_parser(prog.prog_fd(), &[TEST_HEADER, header::USER_AGENT]);
+    let (prog, _h1, h2) = attach_at(
+        addr,
+        &mut open_obj,
+        Hook::Msg,
+        &[TEST_HEADER, header::USER_AGENT],
+    );
 
     let long_val = HeaderValue::from_static("asdfqwerasdfqwerasdfqwerasdfqwer");
     let agent_val = HeaderValue::from_static("test-agent");
@@ -1115,11 +1098,7 @@ async fn parse_header_block_split_over_a_continuation_frame() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let prog =
-        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
-
-    let _h1 = attach_preface_parser(prog.prog_fd());
-    let h2 = attach_h2_parser(prog.prog_fd(), &[header::ACCEPT]);
+    let (prog, _h1, h2) = attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT]);
 
     let authority = addr.to_string();
     let accept_val = HeaderValue::from_static("in-the-continuation");
@@ -1154,11 +1133,7 @@ async fn mark_the_table_as_drifted_when_a_continuation_frame_splits_a_field() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let prog =
-        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
-
-    let _h1 = attach_preface_parser(prog.prog_fd());
-    let h2 = attach_h2_parser(prog.prog_fd(), &[header::ACCEPT]);
+    let (prog, _h1, h2) = attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT]);
 
     let authority = addr.to_string();
     let accept_val = HeaderValue::from_static("across-the-break");
@@ -1191,11 +1166,7 @@ async fn update_dynamic_table_size_past_the_width_of_a_u16() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let prog =
-        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
-
-    let _h1 = attach_preface_parser(prog.prog_fd());
-    let h2 = attach_h2_parser(prog.prog_fd(), &[header::ACCEPT]);
+    let (_prog, _h1, h2) = attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT]);
 
     // SETTINGS_HEADER_TABLE_SIZE is a 32 bit parameter, and a size above 64KiB
     // is one browsers do announce
@@ -1213,11 +1184,7 @@ async fn resolve_a_captured_index_against_the_table_it_was_read_from() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let prog =
-        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
-
-    let _h1 = attach_preface_parser(prog.prog_fd());
-    let _h2 = attach_h2_parser(prog.prog_fd(), &[header::ACCEPT]);
+    let (prog, _h1, _h2) = attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT]);
 
     let authority = addr.to_string();
     let first = HeaderValue::from_static("first");
@@ -1261,11 +1228,7 @@ async fn ignore_a_value_that_runs_into_the_frame_behind_it() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let prog =
-        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
-
-    let _h1 = attach_preface_parser(prog.prog_fd());
-    let h2 = attach_h2_parser(prog.prog_fd(), &[header::ACCEPT]);
+    let (_prog, _h1, h2) = attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT]);
 
     let authority = addr.to_string();
     let mut client = RawClient::connect(addr).await;
@@ -1302,11 +1265,7 @@ async fn size_a_dynamic_table_entry_that_is_longer_than_an_entry_holds() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let prog =
-        TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
-
-    let _h1 = attach_preface_parser(prog.prog_fd());
-    let h2 = attach_h2_parser(prog.prog_fd(), &[header::ACCEPT]);
+    let (_prog, _h1, h2) = attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT]);
 
     let authority = addr.to_string();
     let long = "a".repeat(130);
@@ -1345,8 +1304,8 @@ async fn ignore_an_index_that_only_wraps_into_the_table() {
     let prog =
         TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
 
-    let _h1 = attach_preface_parser(prog.prog_fd());
-    let _h2 = attach_h2_parser(prog.prog_fd(), &[header::ACCEPT]);
+    let _h1 = attach_h1_parser(prog.prog_fd(), Hook::Msg);
+    let _h2 = attach_h2_parser(prog.prog_fd(), Hook::Msg, &[header::ACCEPT]);
 
     let authority = addr.to_string();
     let secret = HeaderValue::from_static("secret");
@@ -1404,8 +1363,8 @@ async fn match_a_field_name_by_the_whole_name() {
     huffman::encode(b"a&b", &mut coded_long).expect("encode");
     assert!(coded_long.starts_with(&coded_short));
 
-    let _h1 = attach_preface_parser(prog.prog_fd());
-    let _h2 = attach_h2_parser(prog.prog_fd(), &[short]);
+    let _h1 = attach_h1_parser(prog.prog_fd(), Hook::Msg);
+    let _h2 = attach_h2_parser(prog.prog_fd(), Hook::Msg, &[short]);
 
     let authority = addr.to_string();
     let mut block = vec![0x82, 0x86, 0x84];
@@ -1423,4 +1382,192 @@ async fn match_a_field_name_by_the_whole_name() {
         None,
         "a field whose name only starts like the pattern was captured"
     );
+}
+
+#[tokio::test]
+async fn parse_header_field_indexed_in_static_table_in_skb() {
+    let addr = server::launch().await.expect("launch server");
+
+    let mut open_obj = OpenObject::new();
+    let (prog, _h1, _h2) = attach_at(addr, &mut open_obj, Hook::Skb, &[pseudo_header::METHOD]);
+
+    // the preface and the client's SETTINGS usually arrive together, so the
+    // frames behind the preface start in the middle of an sk_buff
+    let client = Client::connect(addr, None).await;
+    client.get(format!("http://{}", addr), &[]).await;
+
+    let method_val = HeaderValue::from_static("GET");
+    assert_match_eq(&prog, 0, Some(&method_val));
+}
+
+#[tokio::test]
+async fn parse_header_field_incremental_indexing_indexed_in_dynamic_table_in_skb() {
+    let addr = server::launch().await.expect("launch server");
+
+    let mut open_obj = OpenObject::new();
+    let (prog, _h1, _h2) = attach_at(
+        addr,
+        &mut open_obj,
+        Hook::Skb,
+        &[header::USER_AGENT, header::ACCEPT_LANGUAGE],
+    );
+
+    let user_agent_val = HeaderValue::from_static("beeper");
+    let lang_val = HeaderValue::from_static("sumsum");
+    let hdrs = [
+        (header::USER_AGENT, user_agent_val.clone()),
+        (header::ACCEPT_LANGUAGE, lang_val.clone()),
+    ];
+
+    let client = Client::connect(addr, None).await;
+    client.get(format!("http://{}", addr), &hdrs).await;
+    assert_match_eq(&prog, 0, Some(&user_agent_val));
+    assert_match_eq(&prog, 1, Some(&lang_val));
+
+    // the second time around both are sent as indices into the dynamic table
+    client.get(format!("http://{}", addr), &hdrs).await;
+    assert_match_eq(&prog, 0, Some(&user_agent_val));
+    assert_match_eq(&prog, 1, Some(&lang_val));
+}
+
+#[tokio::test]
+async fn update_dynamic_table_size_in_skb() {
+    let addr = server::launch().await.expect("launch server");
+
+    let mut open_obj = OpenObject::new();
+    let (_prog, _h1, h2) = attach_at(addr, &mut open_obj, Hook::Skb, &[]);
+
+    let client = Client::connect(addr, Some(1234)).await;
+    client.get(format!("http://{}", addr), &[]).await;
+
+    let (local, remote) = conn_at(Hook::Skb, client.local_addr, client.remote_addr);
+    let max_size = h2
+        .dynamic_table_info(local, remote)
+        .expect("dynamic_table_info")
+        .max_size;
+    assert_eq!(max_size, 1234);
+}
+
+#[tokio::test]
+async fn parse_every_frame_of_a_single_write_in_skb() {
+    let addr = server::launch().await.expect("launch server");
+
+    let mut open_obj = OpenObject::new();
+    let (prog, _h1, h2) = attach_at(addr, &mut open_obj, Hook::Skb, &[header::ACCEPT]);
+
+    let authority = addr.to_string();
+    let mut client = RawClient::connect(addr).await;
+    client
+        .request_all(&[
+            (
+                0,
+                raw_request_block(&authority, &[(Some(19), "accept", "text/plain")]),
+            ),
+            (
+                0,
+                raw_request_block(&authority, &[(Some(19), "accept", "text/html")]),
+            ),
+        ])
+        .await;
+
+    assert_eq!(
+        prog.get_match(0).expect("get_match").as_deref(),
+        Some(b"text/html".as_slice()),
+        "the second frame of the sk_buff was not parsed where it starts"
+    );
+
+    // both add their field to the table, so both have to have been parsed
+    let (local, remote) = conn_at(Hook::Skb, client.local_addr, client.remote_addr);
+    let info = h2
+        .dynamic_table_info(local, remote)
+        .expect("dynamic_table_info");
+    assert_eq!(info.count, 2);
+}
+
+/// Adds a field to the dynamic table, then sends a frame the parser skips and
+/// checks that the frame still reports the table it found.
+async fn report_the_dynamic_table_on_a_skipped_frame(hook: Hook) {
+    let addr = server::launch().await.expect("launch server");
+
+    let mut open_obj = OpenObject::new();
+    let (prog, _h1, _h2) = attach_at(addr, &mut open_obj, hook, &[header::ACCEPT]);
+
+    let mut client = RawClient::connect(addr).await;
+    client
+        .request(raw_request_block(
+            &addr.to_string(),
+            &[(Some(19), "accept", "*/*")],
+        ))
+        .await;
+    assert_eq!(prog.last_dt_counts(), (0, 1));
+
+    // PING, which the server answers, so that the parser has seen it by the
+    // time the answer is in
+    client.send_raw(&frame(0x06, 0, 0, &[0; 8])).await;
+    client.read_frame(0x06).await;
+
+    assert_eq!(prog.last_dt_counts(), (1, 1));
+}
+
+#[tokio::test]
+async fn report_the_dynamic_table_on_a_skipped_frame_in_msg() {
+    report_the_dynamic_table_on_a_skipped_frame(Hook::Msg).await;
+}
+
+#[tokio::test]
+async fn report_the_dynamic_table_on_a_skipped_frame_in_skb() {
+    report_the_dynamic_table_on_a_skipped_frame(Hook::Skb).await;
+}
+
+/// Fills the dynamic table of a connection, forgets the connection and checks
+/// that nothing of it is left.
+async fn forget_a_connection(hook: Hook) {
+    let addr = server::launch().await.expect("launch server");
+
+    let mut open_obj = OpenObject::new();
+    let (prog, _h1, h2) = attach_at(addr, &mut open_obj, hook, &[header::ACCEPT]);
+
+    let authority = addr.to_string();
+    let mut client = RawClient::connect(addr).await;
+    client
+        .request(raw_request_block(
+            &authority,
+            &[(Some(19), "accept", "*/*")],
+        ))
+        .await;
+
+    let (local, remote) = conn_at(hook, client.local_addr, client.remote_addr);
+    let info = h2
+        .dynamic_table_info(local, remote)
+        .expect("dynamic_table_info");
+    assert_eq!(info.count, 1);
+
+    h2.forget_conn(local, remote).expect("forget_conn");
+    assert!(
+        h2.dynamic_table_info(local, remote).is_err(),
+        "the dynamic table of a forgotten connection is still there"
+    );
+
+    // forgetting a connection the parser knows nothing about is not an error
+    h2.forget_conn(local, remote).expect("forget_conn twice");
+
+    // the connection starts over from an empty table, into which the entry the
+    // client still references cannot be resolved
+    client.request(vec![0x82, 0x86, 0x84, 0xBE]).await;
+    assert_eq!(prog.get_match(0).expect("get_match"), None);
+
+    let info = h2
+        .dynamic_table_info(local, remote)
+        .expect("dynamic_table_info");
+    assert_eq!(info.count, 0);
+}
+
+#[tokio::test]
+async fn forget_a_connection_in_msg() {
+    forget_a_connection(Hook::Msg).await;
+}
+
+#[tokio::test]
+async fn forget_a_connection_in_skb() {
+    forget_a_connection(Hook::Skb).await;
 }

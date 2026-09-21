@@ -111,6 +111,15 @@ struct header_field {
     u8 val_huff;
 };
 
+/// The number of NULL bytes in front of the HTTP message.
+///
+/// kTLS will zero out the TLS header, but will not strip it. This struct
+/// is used to indicate the length of this prefix. This struct is necessary
+/// because freplace only allows struct arguments.
+struct null_prefix {
+    u16 len;
+};
+
 // A single transition of the DFA a parser walks: the state it leads to, and the
 // action to run upon entering that state. The action is a bit field, see the
 // `a_*` constants of the parser programs for its encoding.
@@ -122,7 +131,7 @@ struct trans {
 // Stubs for the parser programs beeper attaches with `freplace`.
 //
 // A program that uses a beeper parser declares the functions it passes to the
-// `replace_*` builder methods with these macros. Each one expands to a global
+// `parse_fn`, `matched_fn` and `extract_fn` builder methods with these macros. Each one expands to a global
 // (`__noinline`) function with the exact signature the corresponding parser
 // program expects.
 
@@ -131,8 +140,8 @@ struct trans {
 #endif
 
 // Creates `name`, a stub for the HTTP/1.x message parser
-// (`h1::Parser::replace_parse_msg`).
-#define BEEPER_H1_PARSE_MSG(name)                                                                 \
+// (`h1::Parser::parse_fn`, `MessageBuffer::Msg`).
+#define BEEPER_H1_PARSE_MSG(name)                                                                  \
     __noinline int name(struct sk_msg_md *msg, struct parse_res *pres __arg_nonnull) {             \
         int ret = -1;                                                                              \
                                                                                                    \
@@ -148,13 +157,14 @@ struct trans {
     }
 
 // Creates `name`, a stub for the HTTP/1.x sk_buff parser
-// (`h1::Parser::replace_parse_skb`).
-#define BEEPER_H1_PARSE_SKB(name)                                                                 \
-    __noinline int name(struct __sk_buff *skb, struct parse_res *pres __arg_nonnull,               \
-                        u16 *null_prefix) {                                                        \
+// (`h1::Parser::parse_fn`, `MessageBuffer::Skb`).
+#define BEEPER_H1_PARSE_SKB(name)                                                                  \
+    __noinline int name(struct __sk_buff *skb, u32 off, struct parse_res *pres __arg_nonnull,      \
+                        struct null_prefix *null_prefix) {                                         \
         int ret = -1;                                                                              \
                                                                                                    \
         __sink(skb);                                                                               \
+        __sink(off);                                                                               \
         __sink(pres);                                                                              \
         __sink(null_prefix);                                                                       \
         __sink(ret);                                                                               \
@@ -167,10 +177,10 @@ struct trans {
     }
 
 // Creates `name`, a stub for the HTTP/1.x buffer parser
-// (`h1::Parser::replace_parse_buf`).
-#define BEEPER_H1_PARSE_BUF(name)                                                                 \
+// (`h1::Parser::parse_fn`, `MessageBuffer::DynPtr`).
+#define BEEPER_H1_PARSE_BUF(name)                                                                  \
     __noinline int name(const struct bpf_dynptr *buf_ptr, u32 len,                                 \
-                        struct parse_res *pres __arg_nonnull, u16 *null_prefix) {                  \
+                        struct parse_res *pres __arg_nonnull, struct null_prefix *null_prefix) {   \
         int ret = -1;                                                                              \
                                                                                                    \
         __sink(buf_ptr);                                                                           \
@@ -183,8 +193,8 @@ struct trans {
     }
 
 // Creates `name`, a stub for the HTTP/2 message parser
-// (`h2::Parser::replace_parse_msg`).
-#define BEEPER_H2_PARSE_MSG(name)                                                                 \
+// (`h2::Parser::parse_fn`, `MessageBuffer::Msg`).
+#define BEEPER_H2_PARSE_MSG(name)                                                                  \
     __noinline int name(struct sk_msg_md *msg, struct parse_res *pres __arg_nonnull,               \
                         struct h2_frame *frame __arg_nonnull) {                                    \
         int ret = -1;                                                                              \
@@ -202,13 +212,14 @@ struct trans {
     }
 
 // Creates `name`, a stub for the HTTP/2 sk_buff parser
-// (`h2::Parser::replace_parse_skb`).
-#define BEEPER_H2_PARSE_SKB(name)                                                                 \
-    __noinline int name(struct __sk_buff *skb, struct parse_res *pres __arg_nonnull,               \
-                        struct h2_frame *frame __arg_nonnull, u16 *null_prefix) {                  \
+// (`h2::Parser::parse_fn`, `MessageBuffer::Skb`).
+#define BEEPER_H2_PARSE_SKB(name)                                                                  \
+    __noinline int name(struct __sk_buff *skb, u32 off, struct parse_res *pres __arg_nonnull,      \
+                        struct h2_frame *frame __arg_nonnull, struct null_prefix *null_prefix) {   \
         int ret = -1;                                                                              \
                                                                                                    \
         __sink(skb);                                                                               \
+        __sink(off);                                                                               \
         __sink(pres);                                                                              \
         __sink(frame);                                                                             \
         __sink(null_prefix);                                                                       \
@@ -222,11 +233,12 @@ struct trans {
     }
 
 // Creates `name`, a stub for the HTTP/2 buffer parser
-// (`h2::Parser::replace_parse_buf`).
-#define BEEPER_H2_PARSE_BUF(name)                                                                 \
+// (`h2::Parser::parse_fn`, `MessageBuffer::DynPtr`).
+#define BEEPER_H2_PARSE_BUF(name)                                                                  \
     __noinline int name(const struct bpf_dynptr *buf_ptr, struct ip4_conn *conn,                   \
                         struct parse_res *pres __arg_nonnull,                                      \
-                        struct h2_frame *frame __arg_nonnull, u16 *null_prefix) {                  \
+                        struct h2_frame *frame __arg_nonnull,                                      \
+                        struct null_prefix *null_prefix) {                                         \
         int ret = -1;                                                                              \
                                                                                                    \
         __sink(buf_ptr);                                                                           \
@@ -240,13 +252,11 @@ struct trans {
     }
 
 // Creates `name`, a stub reporting whether the match at `idx` was found
-// (`replace_matched`).
-#define BEEPER_MATCHED(name)                                                                      \
-    __noinline bool name(const struct sk_msg_md *msg, const struct parse_res *pres __arg_nonnull,  \
-                         u8 idx) {                                                                 \
+// (`matched_fn`).
+#define BEEPER_MATCHED(name)                                                                       \
+    __noinline bool name(const struct parse_res *pres __arg_nonnull, u8 idx) {                     \
         bool ret = false;                                                                          \
                                                                                                    \
-        __sink(msg);                                                                               \
         __sink(pres);                                                                              \
         __sink(idx);                                                                               \
         __sink(ret);                                                                               \
@@ -255,8 +265,8 @@ struct trans {
     }
 
 // Creates `name`, a stub reading the match at `idx` out of `msg`
-// (`replace_extract`).
-#define BEEPER_EXTRACT_MATCH(name)                                                                \
+// (`extract_fn`, `MessageBuffer::Msg`).
+#define BEEPER_EXTRACT_MATCH_MSG(name)                                                             \
     __noinline int name(const struct sk_msg_md *msg, const struct parse_res *pres __arg_nonnull,   \
                         u8 idx, struct hdr_str *str __arg_nonnull) {                               \
         int ret = -1;                                                                              \
@@ -270,12 +280,28 @@ struct trans {
         return ret;                                                                                \
     }
 
+// Creates `name`, a stub reading the match at `idx` out of `skb`
+// (`extract_fn`, `MessageBuffer::Skb`).
+#define BEEPER_EXTRACT_MATCH_SKB(name)                                                             \
+    __noinline int name(const struct __sk_buff *skb, const struct parse_res *pres __arg_nonnull,   \
+                        u8 idx, struct hdr_str *str __arg_nonnull) {                               \
+        int ret = -1;                                                                              \
+                                                                                                   \
+        __sink(skb);                                                                               \
+        __sink(pres);                                                                              \
+        __sink(idx);                                                                               \
+        __sink(str);                                                                               \
+        __sink(ret);                                                                               \
+                                                                                                   \
+        return ret;                                                                                \
+    }
+
 // Creates `name`, a stub reading the `idx`th entry of the dynamic table of the
 // connection a message parsed with an HTTP/2 parser belongs to
-// (`h2::Parser::replace_get_dt_entry`). `idx` is counted the HPACK way, i.e. 1
+// (`h2::Parser::get_dynamic_table_entry`). `idx` is counted the HPACK way, i.e. 1
 // is the most recently added entry and `dt_count` (see `h2_frame`) the oldest
 // still live one. Returns 0 on success, -1 if there is no such entry.
-#define BEEPER_H2_GET_DT_ENTRY(name)                                                              \
+#define BEEPER_H2_GET_DT_ENTRY(name)                                                               \
     __noinline int name(const struct ip4_conn *conn __arg_nonnull, u32 idx,                        \
                         struct header_field *out __arg_nonnull) {                                  \
         int ret = -1;                                                                              \

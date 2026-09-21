@@ -657,7 +657,7 @@ static __always_inline int _add_dynamic_table_entry(const struct msg_ctx *ctx __
 // the ones that resize the dynamic table. Returns the offset it stopped at.
 //
 // See `_parse_hdr_from` for `start`, `end` and `null_prefix`.
-static __always_inline int _parse_stg_from(const struct msg_ctx *ctx, u16 start, u16 end, u16 *s, struct parse_res *pres, u16 *null_prefix) {
+static __always_inline int _parse_stg_from(const struct msg_ctx *ctx, u16 start, u16 end, u16 *s, struct parse_res *pres, struct null_prefix *null_prefix) {
     const u8 *data = ctx->data;
     const u8 *data_end = ctx->data_end;
     u32 len = (u32)(data_end - data);
@@ -682,8 +682,8 @@ static __always_inline int _parse_stg_from(const struct msg_ctx *ctx, u16 start,
         u8 c = data[i];
 
         // skb clears the TLS header, but does not remove it
-        if (null_prefix && c == '\0' && i == *null_prefix) {
-            *null_prefix = i + 1;
+        if (null_prefix && c == '\0' && i == null_prefix->len) {
+            null_prefix->len = i + 1;
             continue;
         }
 
@@ -913,7 +913,7 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
 // are consumed. It may be NULL if the data cannot carry such a prefix.
 //
 // Returns the offset it stopped at, which is `end` if the whole block was read.
-static __always_inline int _parse_hdr_from(const struct msg_ctx *ctx, u16 start, u16 end, struct dynamic_table_info *dt_info, struct h2_parse_state *ps, struct parse_res *pres, u16 *null_prefix) {
+static __always_inline int _parse_hdr_from(const struct msg_ctx *ctx, u16 start, u16 end, struct dynamic_table_info *dt_info, struct h2_parse_state *ps, struct parse_res *pres, struct null_prefix *null_prefix) {
     const u8 *data = ctx->data;
     const u8 *data_end = ctx->data_end;
 
@@ -928,8 +928,8 @@ static __always_inline int _parse_hdr_from(const struct msg_ctx *ctx, u16 start,
         u8 c = data[i];
 
         // skb clears the TLS header, but does not remove it
-        if (null_prefix && c == '\0' && i == *null_prefix) {
-            *null_prefix = i + 1;
+        if (null_prefix && c == '\0' && i == null_prefix->len) {
+            null_prefix->len = i + 1;
             continue;
         }
 
@@ -994,7 +994,7 @@ static __always_inline int _parse_hdr_from(const struct msg_ctx *ctx, u16 start,
 // mirrored, so the dynamic table is marked as drifted.
 //
 // Returns the offset it stopped at, see `_parse_hdr_from`.
-static __always_inline int _parse_hdr_frame(const struct msg_ctx *ctx, u16 start, u16 end, u8 type, u8 flags, struct parse_res *pres, u16 *null_prefix) {
+static __always_inline int _parse_hdr_frame(const struct msg_ctx *ctx, u16 start, u16 end, u8 type, u8 flags, struct parse_res *pres, struct null_prefix *null_prefix) {
     struct dynamic_table_info *dt_info = _get_dynamic_table(&ctx->conn);
     if (!dt_info) return start;
 
@@ -1031,6 +1031,62 @@ static __always_inline int _parse_hdr_frame(const struct msg_ctx *ctx, u16 start
     return res;
 }
 
+// Whether a frame carries anything the parser reads: a header block, or the
+// settings of a SETTINGS frame that is not an acknowledgement.
+static __always_inline bool _is_parsed_frame(u8 type, u8 flags) {
+    bool is_hdr = (type == H2_HEADERS_FRAME || type == H2_CONTINUATION_FRAME);
+    bool is_stg = (type == H2_SETTINGS_FRAME && flags == 0);
+
+    return is_hdr || is_stg;
+}
+
+// Describes the dynamic table of `conn` in `frame` for a frame that leaves it
+// untouched.
+static __always_inline void _skip_frame(const struct ip4_conn *conn, struct h2_frame *frame) {
+    struct dynamic_table_info *dt_info = bpf_map_lookup_elem(&dynamic_table_info, conn);
+    u32 count = dt_info ? dt_info->count : 0;
+
+    frame->dt_count_before = count;
+    frame->dt_count = count;
+}
+
+// Parses the frame that starts `off` bytes into `ctx`, whose payload is `len`
+// bytes long and which has already been made readable in full. HEADERS and
+// CONTINUATION frames are decoded into `pres`, SETTINGS frames are applied to
+// the mirrored dynamic table. The captured ranges are offsets into `ctx`.
+//
+// Returns 0, or -1 if the frame could not be read to its end.
+static __always_inline int _parse_frame(const struct msg_ctx *ctx, u32 off, u32 len, u8 type, u8 flags, struct parse_res *pres, struct h2_frame *frame, struct null_prefix *null_prefix) {
+    if (off > MAX_BYTES) return -1;
+    bpf_clamp_uminmax(off, 0, MAX_BYTES);
+
+    u16 start = 0, end = 0;
+    if (_h2_block(ctx->data + off, ctx->data_end, len, type, flags, &start, &end) < 0) return -1;
+
+    // the parser walks at most `MAX_BYTES` into the data, so a frame reaching
+    // past them could not be read to its end anyway
+    if (off + end > MAX_BYTES) return -1;
+    start += off;
+    end += off;
+
+    // the entry is only ever updated below, never deleted, so the pointer
+    // stays good across the parse
+    struct dynamic_table_info *dt_info = _get_dynamic_table(&ctx->conn);
+    frame->dt_count_before = dt_info ? dt_info->count : 0;
+
+    int res;
+    if (type == H2_SETTINGS_FRAME) {
+        u16 s = S_FIELD;
+        res = _parse_stg_from(ctx, start, end, &s, pres, null_prefix);
+    } else {
+        res = _parse_hdr_frame(ctx, start, end, type, flags, pres, null_prefix);
+    }
+
+    frame->dt_count = dt_info ? dt_info->count : 0;
+
+    return (res < end) ? -1 : 0;
+}
+
 // Parses the frame the message starts with and describes it in `frame`, so that
 // the caller can tell which stream it belongs to and where it ends. HEADERS
 // frames are decoded into `pres`, SETTINGS frames are applied to the mirrored
@@ -1058,9 +1114,10 @@ int parse_msg(struct sk_msg_md *msg, struct parse_res *pres __arg_nonnull, struc
 
     bpf_debug("Parsing HTTP/2 message with length %d, type %d, flags %d", len, type, flags);
 
-    bool is_hdr = (type == H2_HEADERS_FRAME || type == H2_CONTINUATION_FRAME);
-    bool is_stg = (type == H2_SETTINGS_FRAME);
-    if (!is_hdr && !(is_stg && flags == 0)) {
+    if (!_is_parsed_frame(type, flags)) {
+        struct msg_ctx ctx = _new_msg_ctx(msg);
+        _skip_frame(&ctx.conn, frame);
+
         return frame_len;
     }
 
@@ -1069,64 +1126,57 @@ int parse_msg(struct sk_msg_md *msg, struct parse_res *pres __arg_nonnull, struc
     }
 
     struct msg_ctx ctx = _new_msg_ctx(msg);
-
-    u16 start = 0, end = 0;
-    if (_h2_block(ctx.data, ctx.data_end, len, type, flags, &start, &end) < 0) return -1;
-
-    // the entry is only ever updated below, never deleted, so the pointer
-    // stays good across the parse
-    struct dynamic_table_info *dt_info = _get_dynamic_table(&ctx.conn);
-    frame->dt_count_before = dt_info ? dt_info->count : 0;
-
-    int res;
-    if (is_hdr) {
-        res = _parse_hdr_frame(&ctx, start, end, type, flags, pres, NULL);
-    } else {
-        u16 s = S_FIELD;
-        res = _parse_stg_from(&ctx, start, end, &s, pres, NULL);
-    }
-
-    frame->dt_count = dt_info ? dt_info->count : 0;
-
-    if (res < end) return -1;
+    if (_parse_frame(&ctx, 0, len, type, flags, pres, frame, NULL) < 0) return -1;
 
     return frame_len;
 }
 
-// Parses the frame the packet starts with, pulling it into the linear part of
-// the sk_buff first. Unlike `parse_msg`, this only decodes HEADERS frames. See
-// `parse_msg` for the return value.
+// Parses the frame that starts `off` bytes into the packet, pulling it into the
+// linear part of the sk_buff first. The captured ranges are offsets into the
+// sk_buff. See `parse_msg` for what is parsed and for the return value, which
+// is counted from the start of the frame.
 SEC("freplace")
-int parse_skb(struct __sk_buff *skb, struct parse_res *pres __arg_nonnull, struct h2_frame *frame __arg_nonnull, u16 *null_prefix) {
+int parse_skb(struct __sk_buff *skb, u32 off, struct parse_res *pres __arg_nonnull, struct h2_frame *frame __arg_nonnull, struct null_prefix *null_prefix) {
+    if (off > MAX_BYTES) return -1;
+    if (skb->len < off + H2_FRAME_HDR_LEN) return 0;
+    bpf_clamp_uminmax(off, 0, MAX_BYTES);
+
     u8 *data = (u8 *)(long)skb->data;
     u8 *data_end = (u8 *)(long)skb->data_end;
 
-    if (data + H2_FRAME_HDR_LEN > data_end) return 0;
+    // the linear part may well be empty, with everything in the fragments
+    if (data + off + H2_FRAME_HDR_LEN > data_end) {
+        if (bpf_skb_pull_data(skb, off + H2_FRAME_HDR_LEN) < 0) return 0;
 
-    u32 len = data[0] << 16 | data[1] << 8 | data[2];
-    u8 type = data[3];
-    u8 flags = data[4];
+        data = (u8 *)(long)skb->data;
+        data_end = (u8 *)(long)skb->data_end;
+    }
+
+    u8 *hdr = data + off;
+    if (hdr + H2_FRAME_HDR_LEN > data_end) return 0;
+
+    u32 len = hdr[0] << 16 | hdr[1] << 8 | hdr[2];
+    u8 type = hdr[3];
+    u8 flags = hdr[4];
     u32 frame_len = H2_FRAME_HDR_LEN + len;
 
-    *frame = _new_h2_frame(data, type, flags);
+    *frame = _new_h2_frame(hdr, type, flags);
 
     bpf_debug("Parsing HTTP/2 sk_buff with length %d, type %d, flags %d", len, type, flags);
 
-    if (type != H2_HEADERS_FRAME && type != H2_CONTINUATION_FRAME) {
+    if (!_is_parsed_frame(type, flags)) {
+        struct msg_ctx ctx = _new_skb_ctx(skb);
+        _skip_frame(&ctx.conn, frame);
+
         return frame_len;
     }
 
-    if (bpf_skb_pull_data(skb, frame_len) < 0) {
-        return -(data_end - data);
+    if (bpf_skb_pull_data(skb, off + frame_len) < 0) {
+        return -(int)(skb->len - off);
     }
 
     struct msg_ctx ctx = _new_skb_ctx(skb);
-
-    u16 start = 0, end = 0;
-    if (_h2_block(ctx.data, ctx.data_end, len, type, flags, &start, &end) < 0) return -1;
-
-    int res = _parse_hdr_frame(&ctx, start, end, type, flags, pres, null_prefix);
-    if (res < end) return -1;
+    if (_parse_frame(&ctx, off, len, type, flags, pres, frame, null_prefix) < 0) return -1;
 
     return frame_len;
 }
@@ -1135,7 +1185,7 @@ int parse_skb(struct __sk_buff *skb, struct parse_res *pres __arg_nonnull, struc
 // own, so `conn` has to name the one it belongs to for the dynamic table to be
 // found. Only HEADERS frames are decoded. See `parse_msg` for the return value.
 SEC("freplace")
-int parse_buf(const struct bpf_dynptr *buf_ptr, struct ip4_conn *conn, struct parse_res *pres __arg_nonnull, struct h2_frame *frame __arg_nonnull, u16 *null_prefix) {
+int parse_buf(const struct bpf_dynptr *buf_ptr, struct ip4_conn *conn, struct parse_res *pres __arg_nonnull, struct h2_frame *frame __arg_nonnull, struct null_prefix *null_prefix) {
     u8 *data = bpf_dynptr_data(buf_ptr, 0, 9);
     if (data == NULL) return -1;
 
@@ -1184,9 +1234,24 @@ int get_dt_entry(const struct ip4_conn *conn __arg_nonnull, u32 idx, struct head
     return 0;
 }
 
+// Points `str` at the value captured for the match `m`, resolving it against
+// `ctx`. Returns 0 on success, -1 if the value cannot be resolved.
+static __always_inline int _extract_str(const struct msg_ctx *ctx, const struct hdr_match *m, struct hdr_str *str) {
+    u8 *ptr = NULL;
+    u32 len = 0;
+    _extract_match(ctx, m, false, &ptr, &len, NULL);
+    if (ptr == NULL) return -1;
+
+    *str = (struct hdr_str) {
+        .len = len,
+        .ptr = ptr
+    };
+    return 0;
+}
+
 // Returns whether the parser captured a value for the match `idx`.
 SEC("freplace")
-bool matched(const struct sk_msg_md *msg, const struct parse_res *pres __arg_nonnull, u8 idx) {
+bool matched(const struct parse_res *pres __arg_nonnull, u8 idx) {
     if (idx >= MAX_MATCHES) return false;
 
     struct hdr_match m = pres->ms[idx & MAX_MATCH_MASK];
@@ -1201,21 +1266,26 @@ bool matched(const struct sk_msg_md *msg, const struct parse_res *pres __arg_non
 // Returns 0 on success, -1 if nothing was captured for `idx` or if the value
 // can no longer be resolved.
 SEC("freplace")
-int extract_match(const struct sk_msg_md *msg, const struct parse_res *pres __arg_nonnull, u8 idx, struct hdr_str *str __arg_nonnull) {
+int extract_match_msg(const struct sk_msg_md *msg, const struct parse_res *pres __arg_nonnull, u8 idx, struct hdr_str *str __arg_nonnull) {
     if (idx >= MAX_MATCHES) return -1;
 
     struct hdr_match m = pres->ms[idx & MAX_MATCH_MASK];
     if (m.len == 0) return -1;
 
     struct msg_ctx ctx = _new_msg_ctx(msg);
-    u8 *ptr = NULL;
-    u32 len = 0;
-    _extract_match(&ctx, &m, false, &ptr, &len, NULL);
-    if (ptr == NULL) return -1;
+    return _extract_str(&ctx, &m, str);
+}
 
-    *str = (struct hdr_str) {
-        .len = len,
-        .ptr = ptr
-    };
-    return 0;
+// Same as `extract_match`, for a match taken out of an sk_buff. A value that
+// points into `skb` is only valid until the program invalidates its data
+// pointers.
+SEC("freplace")
+int extract_match_skb(const struct __sk_buff *skb, const struct parse_res *pres __arg_nonnull, u8 idx, struct hdr_str *str __arg_nonnull) {
+    if (idx >= MAX_MATCHES) return -1;
+
+    struct hdr_match m = pres->ms[idx & MAX_MATCH_MASK];
+    if (m.len == 0) return -1;
+
+    struct msg_ctx ctx = _new_skb_ctx(skb);
+    return _extract_str(&ctx, &m, str);
 }

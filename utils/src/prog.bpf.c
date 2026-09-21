@@ -3,6 +3,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_endian.h>
+#include <bpf/bpf_core_read.h>
 
 // The program the integration tests attach a parser to. It parses every message
 // travelling in the direction under test and stores what the parser captured in
@@ -34,6 +35,9 @@ volatile const u32 port;
 // parse the responses the server sends instead of the requests it receives
 volatile const bool parse_resp;
 
+// the parsers run at the `sk_skb` hook rather than at `sk_msg`
+volatile const bool hook_skb;
+
 // What the parser captured in the message parsed last, keyed by match id. An id
 // with nothing captured for it is absent from the map.
 struct {
@@ -45,11 +49,68 @@ struct {
 
 // The functions beeper replaces with a parser when a test attaches one.
 BEEPER_MATCHED(matched_h1)
-BEEPER_EXTRACT_MATCH(extract_h1_match)
-BEEPER_H1_PARSE_MSG(parse_h1)
+BEEPER_EXTRACT_MATCH_MSG(extract_h1_match_msg)
+BEEPER_H1_PARSE_MSG(parse_h1_msg)
 
-BEEPER_EXTRACT_MATCH(extract_h2_match)
-BEEPER_H2_PARSE_MSG(parse_h2)
+BEEPER_MATCHED(matched_h2)
+BEEPER_EXTRACT_MATCH_MSG(extract_h2_match_msg)
+BEEPER_H2_PARSE_MSG(parse_h2_msg)
+
+BEEPER_EXTRACT_MATCH_SKB(extract_h1_match_skb)
+BEEPER_H1_PARSE_SKB(parse_h1_skb)
+
+BEEPER_EXTRACT_MATCH_SKB(extract_h2_match_skb)
+BEEPER_H2_PARSE_SKB(parse_h2_skb)
+
+extern void *bpf_cast_to_kern_ctx(void *obj) __ksym;
+
+// Returns where the message a stream parser cut out of `skb` starts. The kernel
+// hands `sk_skb/stream_parser` and `sk_skb/stream_verdict` programs the whole
+// sk_buff the message was found in, which may carry the tail of the message
+// before it, and only records the offset in the control block. It is what the
+// `off` argument of the sk_buff parsers takes.
+static __always_inline u32 strp_offset(struct __sk_buff *skb) {
+    struct sk_buff *kskb = bpf_cast_to_kern_ctx(skb);
+    struct sk_skb_cb *cb = (struct sk_skb_cb *)kskb->cb;
+
+    return BPF_CORE_READ(cb, strp.strp.offset);
+}
+
+// The dynamic table counts of the last HTTP/2 frame that was parsed.
+u32 last_dt_count_before = 0;
+u32 last_dt_count = 0;
+
+// The match ids the parser reported a capture for in the last message that was
+// parsed, one bit per id.
+u32 last_matches = 0;
+
+// Records which of the 32 match ids the parser captured a value for.
+static __always_inline void store_matched(const struct parse_res *pres, bool is_h2) {
+    u32 mask = 0;
+    u32 i = 0;
+    bpf_for(i, 0, 32) {
+        bool matched = is_h2 ? matched_h2(pres, i) : matched_h1(pres, i);
+        if (matched) mask |= (u32)1 << i;
+    }
+
+    last_matches = mask;
+}
+
+// Stores the value `extract` found for the match `i` in `matches`, or clears
+// the match if there is none.
+static __always_inline void store_match(u32 i, int res, const struct hdr_str *str) {
+    if (res != 0) {
+        bpf_map_delete_elem(&matches, &i);
+        return;
+    }
+
+    u16 len = str->len;
+    if (len > 128) len = 128;
+
+    char tmp[128] = {0};
+    bpf_probe_read_kernel(tmp, len, str->ptr);
+    bpf_map_update_elem(&matches, &i, tmp, BPF_ANY);
+}
 
 // Parses the messages of the connection under test and records the captured
 // ranges in `matches`. A message that carries the HTTP/2 preface upgrades its
@@ -84,16 +145,18 @@ int msg_verdict(struct sk_msg_md *msg) {
 
     if (is_h2) {
         struct h2_frame frame = { 0 };
-        msg_len = parse_h2(msg, &pres, &frame);
+        msg_len = parse_h2_msg(msg, &pres, &frame);
         if (msg_len < 0) {
             bpf_error("Failed to parse h2 message: %s", msg->data);
             return SK_PASS;
         }
 
         store_matches = (msg_len > 9);
+        last_dt_count_before = frame.dt_count_before;
+        last_dt_count = frame.dt_count;
     }
     else {
-        msg_len = parse_h1(msg, &pres);
+        msg_len = parse_h1_msg(msg, &pres);
         if (msg_len < 0) {
             // It's possible that this fails because we're actually parsing the body.
             // To avoid this, we'd have to parse the content-length to skip the body.
@@ -101,7 +164,7 @@ int msg_verdict(struct sk_msg_md *msg) {
             return SK_PASS;
         }
 
-        if (matched_h1(msg, &pres, 0)) {
+        if (matched_h1(&pres, 0)) {
             int flag = 1;
             bpf_map_update_elem(&upgraded_conns, &ikey, &flag, BPF_ANY);
             num_upgraded_conns += 1;
@@ -112,33 +175,131 @@ int msg_verdict(struct sk_msg_md *msg) {
 
     // only store matches if we parsed a HEADER frame
     if (store_matches) {
+        store_matched(&pres, is_h2);
+
         u32 i = 0;
         bpf_for(i, 0, 32) {
             struct hdr_str str = { 0 };
-            int res = -1;
-            if (is_h2) {
-                res = extract_h2_match(msg, &pres, i, &str);
-            }
-            else {
-                res = extract_h1_match(msg, &pres, i, &str);
-            }
-
-            if (res == 0) {
-                u16 len = str.len;
-                if (len > 128) len = 128;
-
-                char tmp[128] = {0};
-                bpf_probe_read_kernel(tmp, len, str.ptr);
-                bpf_map_update_elem(&matches, &i, tmp, BPF_ANY);
-            }
-            else {
-                bpf_map_delete_elem(&matches, &i);
-            }
+            int res = is_h2 ? extract_h2_match_msg(msg, &pres, i, &str) : extract_h1_match_msg(msg, &pres, i, &str);
+            store_match(i, res, &str);
         }
     }
 
     bpf_debug("Apply verdict to %d/%dB", msg_len, msg->size);
     bpf_msg_apply_bytes(msg, msg_len);
+
+    return SK_PASS;
+}
+
+// The connection an sk_buff arrived on, as seen from the socket it arrived at.
+static __always_inline struct ip4_conn skb_conn(const struct __sk_buff *skb) {
+    return (struct ip4_conn) {
+        .local = {
+            .ip4 = skb->local_ip4,
+            .port = skb->local_port
+        },
+        .remote = {
+            .ip4 = skb->remote_ip4,
+            .port = bpf_ntohl(skb->remote_port)
+        }
+    };
+}
+
+#define H2_PREFACE "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+#define H2_PREFACE_LEN 24
+
+// Cuts what arrives on a socket into the messages `skb_verdict` parses: an
+// HTTP/2 frame at a time on an upgraded connection, the preface on its own, and
+// whatever arrived otherwise.
+//
+// The message starts `off` bytes into the sk_buff, the kernel hands over the
+// whole of it, and the length returned is counted from `off`.
+SEC("sk_skb/stream_parser")
+int skb_parser(struct __sk_buff *skb) {
+    struct ip4_conn ikey = skb_conn(skb);
+    u32 off = strp_offset(skb);
+    if (off >= skb->len) return 0;
+
+    u32 avail = skb->len - off;
+
+    if (bpf_map_lookup_elem(&upgraded_conns, &ikey) != NULL) {
+        u8 hdr[3];
+        if (bpf_skb_load_bytes(skb, off, hdr, sizeof(hdr)) < 0) return 0;
+
+        u32 len = (u32)hdr[0] << 16 | (u32)hdr[1] << 8 | hdr[2];
+        return 9 + len;
+    }
+
+    const char preface[] = H2_PREFACE;
+    char head[H2_PREFACE_LEN];
+    if (bpf_skb_load_bytes(skb, off, head, H2_PREFACE_LEN) == 0) {
+        bool is_preface = true;
+        for (int i = 0; i < H2_PREFACE_LEN; i++) {
+            if (head[i] != preface[i]) {
+                is_preface = false;
+                break;
+            }
+        }
+
+        if (is_preface) return H2_PREFACE_LEN;
+    }
+
+    return avail;
+}
+
+// Same as `msg_verdict`, for the messages `skb_parser` cut out of what arrived
+// on a socket.
+SEC("sk_skb/stream_verdict")
+int skb_verdict(struct __sk_buff *skb) {
+    struct ip4_conn ikey = skb_conn(skb);
+
+    // what arrives at the server is travelling downstream
+    bool is_downstream = (ikey.local.ip4 == ip4 && ikey.local.port == port);
+    bpf_trace("Processing %dB skb on [%pI4:%u->%pI4:%u] (downstream: %d)", skb->len, &ikey.local.ip4, ikey.local.port, &ikey.remote.ip4, ikey.remote.port, is_downstream);
+
+    if (is_downstream == parse_resp) {
+        return SK_PASS;
+    }
+
+    u32 off = strp_offset(skb);
+    bool is_h2 = (bpf_map_lookup_elem(&upgraded_conns, &ikey) != NULL);
+    bool store_matches = false;
+    struct parse_res pres = { 0 };
+
+    if (is_h2) {
+        struct h2_frame frame = { 0 };
+        int len = parse_h2_skb(skb, off, &pres, &frame, NULL);
+        if (len < 0) {
+            bpf_error("Failed to parse h2 skb");
+            return SK_PASS;
+        }
+
+        store_matches = (len > 9);
+        last_dt_count_before = frame.dt_count_before;
+        last_dt_count = frame.dt_count;
+    }
+    else {
+        if (parse_h1_skb(skb, off, &pres, NULL) < 0) return SK_PASS;
+
+        if (matched_h1(&pres, 0)) {
+            int flag = 1;
+            bpf_map_update_elem(&upgraded_conns, &ikey, &flag, BPF_ANY);
+            num_upgraded_conns += 1;
+        }
+
+        store_matches = true;
+    }
+
+    if (store_matches) {
+        store_matched(&pres, is_h2);
+
+        u32 i = 0;
+        bpf_for(i, 0, 32) {
+            struct hdr_str str = { 0 };
+            int res = is_h2 ? extract_h2_match_skb(skb, &pres, i, &str) : extract_h1_match_skb(skb, &pres, i, &str);
+            store_match(i, res, &str);
+        }
+    }
 
     return SK_PASS;
 }
@@ -168,7 +329,15 @@ int monitor_sockets(struct bpf_sock_ops *ops) {
         bool is_client = (skey.remote.ip4 == ip4 && skey.remote.port == port);
         bool is_server = (skey.local.ip4 == ip4 && skey.local.port == port);
 
-        if (is_client || is_server) {
+        // `msg_verdict` sees a message as it is sent, `skb_verdict` as it
+        // arrives, so the two hooks read the direction under test off opposite
+        // ends of the connection. Only the end that is parsed goes into the
+        // map: a stream parser cuts up everything the map holds, and cutting a
+        // direction this program does not parse stalls it.
+        bool parsed_here = hook_skb ? (parse_resp ? is_client : is_server)
+                                    : (parse_resp ? is_server : is_client);
+
+        if (parsed_here) {
             if (bpf_sock_hash_update(ops, &sock_map, &skey, BPF_ANY) < 0) {
                 bpf_error("Failed to add socket [%pI4:%u->%pI4:%u]", &skey.local.ip4, skey.local.port, &skey.remote.ip4, skey.remote.port);
                 return SK_PASS;

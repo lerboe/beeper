@@ -13,12 +13,12 @@
 //! ```no_run
 //! # fn main() -> anyhow::Result<()> {
 //! # let prog_fd = 0;
-//! use beeper::{h1, pseudo_header::PATH};
+//! use beeper::{MessageBuffer, h1, pseudo_header::PATH};
 //!
 //! let parser = h1::Parser::new()
 //!     .capture_hdr(&PATH)
-//!     .replace_parse_msg("parse_h1")
-//!     .replace_extract("extract_h1_match")
+//!     .parse_fn("parse_h1", MessageBuffer::Msg)
+//!     .extract_fn("extract_h1_match", MessageBuffer::Msg)
 //!     .attach(prog_fd)?;
 //! # Ok(())
 //! # }
@@ -27,9 +27,8 @@
 //! The value returned by `attach` owns the links to the attached programs, so
 //! the parser stays in place until it is dropped.
 
-use anyhow::Result;
 pub(crate) use dfa::Dfa;
-use xbpf::libbpf::{Mut, OpenProgramImpl};
+use std::fmt::Display;
 
 mod dfa;
 
@@ -41,6 +40,23 @@ pub mod h1;
 
 #[cfg(feature = "h2")]
 pub mod h2;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum MessageBuffer {
+    Skb,
+    Msg,
+    DynPtr,
+}
+
+impl Display for MessageBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MessageBuffer::Skb => write!(f, "skb"),
+            MessageBuffer::Msg => write!(f, "msg"),
+            MessageBuffer::DynPtr => write!(f, "dyn_ptr"),
+        }
+    }
+}
 
 /// The names Beeper uses to address the fields of a request or status line.
 ///
@@ -61,21 +77,6 @@ pub mod pseudo_header {
     pub const SCHEME: http::HeaderName = http::HeaderName::from_static("scheme");
 }
 
-/// Points `prog` at the function it replaces in the target program.
-///
-/// `name` is the name of that function in the program `target` refers to, or
-/// `None` if the caller did not configure `prog`, in which case it is left
-/// unloaded.
-fn autoload_and_attach<'obj>(
-    prog: &mut OpenProgramImpl<'obj, Mut>,
-    target: i32,
-    name: Option<String>,
-) -> Result<()> {
-    prog.set_autoload(name.is_some());
-    prog.set_attach_target(target, name)?;
-    Ok(())
-}
-
 /// Identifies a state of the DFA.
 ///
 /// State 0 is the state a message is parsed from, state 1 the one input that
@@ -86,7 +87,7 @@ pub(crate) struct StateId(u16);
 /// Identifies a captured range in the parse result.
 ///
 /// It is the index the target program passes to the functions replaced with
-/// [`Parser::replace_matched`] and [`Parser::replace_extract`]. Captures are
+/// `Parser::matched_fn` and `Parser::extract_fn`. Captures are
 /// numbered in the order in which they are configured.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct MatchId(u16);

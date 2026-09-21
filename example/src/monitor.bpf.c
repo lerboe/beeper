@@ -45,7 +45,7 @@ volatile const u32 port;
 
 // The functions beeper replaces with an HTTP/1.1 parser.
 BEEPER_MATCHED(matched_h1)
-BEEPER_EXTRACT_MATCH(extract_h1_match)
+BEEPER_EXTRACT_MATCH_MSG(extract_h1_match)
 BEEPER_H1_PARSE_MSG(parse_h1)
 
 // The function beeper replaces with an HTTP/2 parser. Its header fields are
@@ -174,7 +174,7 @@ int msg_verdict(struct sk_msg_md *msg) {
             return SK_PASS;
         }
 
-        if (matched_h1(msg, &pres, H1_PREFACE_MID)) {
+        if (matched_h1(&pres, H1_PREFACE_MID)) {
             bpf_trace("Upgrading connection to HTTP/2");
 
             // the preface only ever arrives on the client's own socket, but

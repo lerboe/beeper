@@ -34,13 +34,13 @@ gRPC          | WIP     |
 
 First, in the Rust program, create a new parser instance, add the desired headers that it should parse, and attach it to an existing eBPF program:
 ```rust
-use beeper::h2;
+use beeper::{MessageBuffer, h2};
 
 let h2 = h2::Parser::new()
     .capture_hdr(&beeper::header::PATH)?
     .capture_hdr(&http::header::CONTENT_LENGTH)?
-    .replace_parse_msg("parse_h2")
-    .replace_extract("extract_h2_match")
+    .parse_fn("parse_h2", MessageBuffer::Msg)
+    .extract_fn("extract_h2_match", MessageBuffer::Msg)
     .attach(prog_fd)?;
 ```
 
@@ -49,7 +49,7 @@ Next, in your eBPF program, import the `beeper.h` header, define the stub functi
 #include "beeper.h"
 
 // stub funcs
-BEEPER_EXTRACT_MATCH(extract_h2_match)
+BEEPER_EXTRACT_MATCH_MSG(extract_h2_match)
 BEEPER_H2_PARSE_MSG(parse_h2)
 
 // the header matches occur in the same order as configured in user space
