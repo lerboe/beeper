@@ -42,6 +42,10 @@ pub struct Parser {
 
     /// The extract function name for each message buffer.
     extract_fns: HashMap<MessageBuffer, String>,
+
+    /// The match id of every header captured so far, so that a header asked
+    /// for twice is captured once.
+    captures: HashMap<HeaderName, MatchId>,
 }
 
 xbpf::include_bpf!("h1/parser");
@@ -58,6 +62,7 @@ impl Parser {
             parse_fns: HashMap::new(),
             matched_fn: None,
             extract_fns: HashMap::new(),
+            captures: HashMap::new(),
         }
     }
 
@@ -131,8 +136,23 @@ impl Parser {
     ///
     /// # Returns
     ///
-    /// The match ID that can be used in eBPF to extract the captured value.
+    /// The match ID that can be used in eBPF to extract the captured value. A
+    /// header that is already captured keeps the ID it was given the first
+    /// time, rather than being captured a second time under a new one.
     pub fn capture_hdr(&mut self, name: &HeaderName) -> Result<MatchId, Error> {
+        if let Some(&mid) = self.captures.get(name) {
+            return Ok(mid);
+        }
+
+        let mid = self.capture_new_hdr(name)?;
+        self.captures.insert(name.clone(), mid);
+
+        Ok(mid)
+    }
+
+    /// Configures the parser to capture the value of a header field it does
+    /// not capture yet, see [`Parser::capture_hdr`].
+    fn capture_new_hdr(&mut self, name: &HeaderName) -> Result<MatchId, Error> {
         if name == &METHOD || name == &PATH {
             return self.capture_status_line_hdr(name);
         } else if name == &STATUS {
@@ -479,6 +499,18 @@ mod tests {
         assert_eq!(
             parser.capture_hdr(&hdr(MAX_MATCHES)),
             Err(Error::MatchLimitExceeded(MAX_MATCHES as usize))
+        );
+    }
+
+    #[test]
+    fn the_same_header_is_captured_under_one_match_id() {
+        let mut parser = Parser::new();
+        let first = parser.capture_hdr(&hdr(0)).expect("capture header");
+        let second = parser.capture_hdr(&hdr(0)).expect("capture header again");
+
+        assert_eq!(
+            first, second,
+            "capturing a header twice handed out two ids for one range"
         );
     }
 }

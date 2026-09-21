@@ -61,6 +61,10 @@ pub struct Parser {
 
     /// The function name to retrieve dynamic table entries.
     get_dynamic_table_entry_fn: Option<String>,
+
+    /// The match id of every header captured so far, so that a header asked
+    /// for twice is captured once.
+    captures: HashMap<HeaderName, MatchId>,
 }
 
 xbpf::include_bpf!("h2/parser");
@@ -80,6 +84,7 @@ impl Parser {
             matched_fn: None,
             extract_fns: HashMap::new(),
             get_dynamic_table_entry_fn: None,
+            captures: HashMap::new(),
         }
     }
 
@@ -149,8 +154,14 @@ impl Parser {
     ///
     /// # Returns
     ///
-    /// The match ID that can be used in eBPF to extract the captured value.
+    /// The match ID that can be used in eBPF to extract the captured value. A
+    /// header that is already captured keeps the ID it was given the first
+    /// time, rather than being captured a second time under a new one.
     pub fn capture_hdr(&mut self, name: &HeaderName) -> Result<MatchId, Error> {
+        if let Some(&mid) = self.captures.get(name) {
+            return Ok(mid);
+        }
+
         let mut name_encoded = Vec::new();
         huffman::encode(wire_name(name).as_bytes(), &mut name_encoded)?;
 
@@ -159,6 +170,8 @@ impl Parser {
             .start_pattern(S_NAME)
             .push_bytes(&name_encoded)
             .with(Action::capture(mid));
+
+        self.captures.insert(name.clone(), mid);
 
         Ok(mid)
     }
@@ -555,6 +568,18 @@ mod tests {
         assert_eq!(
             parser.capture_hdr(&hdr(MAX_MATCHES)),
             Err(Error::MatchLimitExceeded(MAX_MATCHES as usize))
+        );
+    }
+
+    #[test]
+    fn the_same_header_is_captured_under_one_match_id() {
+        let mut parser = Parser::new();
+        let first = parser.capture_hdr(&hdr(0)).expect("capture header");
+        let second = parser.capture_hdr(&hdr(0)).expect("capture header again");
+
+        assert_eq!(
+            first, second,
+            "capturing a header twice handed out two ids for one range"
         );
     }
 }
