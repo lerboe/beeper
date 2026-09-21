@@ -207,26 +207,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
-name = "bpf-tracing"
-version = "0.0.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03afc6160907ec9ab6c9b81d830c65351789472986f17d8c9279fca8929c851d"
-dependencies = [
- "bpf-tracing-include",
- "libbpf-rs 0.26.2",
- "tracing",
-]
-
-[[package]]
-name = "bpf-tracing-include"
-version = "0.0.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d87c0f987c14b007d890dfe989b2428a6749973f17e584e012aeeedfeeb627d"
-dependencies = [
- "tracing",
-]
-
-[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -962,25 +942,13 @@ dependencies = [
  "anyhow",
  "cargo_metadata",
  "clap",
- "libbpf-rs 0.27.0",
+ "libbpf-rs",
  "memmap2",
  "serde",
  "serde_json",
  "tempfile",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "libbpf-rs"
-version = "0.26.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd8e8db46a2d5967b5b3dba7aba32a875dc38f222395040607045635ec1f9b63"
-dependencies = [
- "bitflags",
- "libbpf-sys",
- "libc",
- "vsprintf",
 ]
 
 [[package]]
@@ -2041,7 +2009,6 @@ dependencies = [
  "as-bytes",
  "axum",
  "beeper",
- "bpf-tracing",
  "bytes",
  "libc",
  "tokio",
@@ -2350,7 +2317,7 @@ checksum = "b4279f972c12786565d3e9ce5fc9c2412a773fc260bca14df836b91a347b0781"
 dependencies = [
  "glob",
  "libbpf-cargo",
- "libbpf-rs 0.27.0",
+ "libbpf-rs",
  "tokio",
  "tracing",
  "tracing-subscriber",
