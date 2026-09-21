@@ -58,8 +58,19 @@ impl<'obj> Monitor<'obj> {
             )),
         }?;
 
-        open_skel.maps.rodata_data.as_mut().unwrap().ip4 = ip4;
-        open_skel.maps.rodata_data.as_mut().unwrap().port = addr.port() as u32;
+        let mut h1 = h1::Parser::new();
+        let preface_mid = h1.match_h2_preface()?;
+        let path_mid = h1.capture_hdr(&PATH)?;
+        let lang_mid = h1.capture_hdr(&ACCEPT_LANGUAGE)?;
+        let status_mid = h1.capture_hdr(&STATUS)?;
+
+        let rodata = open_skel.maps.rodata_data.as_mut().unwrap();
+        rodata.ip4 = ip4;
+        rodata.port = addr.port() as u32;
+        rodata.h1_preface_mid = preface_mid.into();
+        rodata.h1_path_mid = path_mid.into();
+        rodata.h1_accept_language_mid = lang_mid.into();
+        rodata.h1_status_mid = status_mid.into();
 
         let skel = open_skel.load()?;
         xbpf::tracing::try_init(skel.object())?;
@@ -76,11 +87,7 @@ impl<'obj> Monitor<'obj> {
 
         let prog_fd = skel.progs.msg_verdict.as_fd().as_raw_fd();
 
-        let h1 = h1::Parser::new()
-            .match_h2_preface()
-            .capture_hdr(&PATH)
-            .capture_hdr(&ACCEPT_LANGUAGE)
-            .capture_hdr(&STATUS)
+        let h1 = h1
             .parse_fn("parse_h1", MessageBuffer::Msg)
             .matched_fn("matched_h1")
             .extract_fn("extract_h1_match", MessageBuffer::Msg)

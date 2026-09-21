@@ -8,7 +8,7 @@
 
 use anyhow::Result;
 use as_bytes::AsBytes;
-use beeper::{MessageBuffer, h2::Parser};
+use beeper::{MatchId, MessageBuffer, h2::Parser};
 use std::{
     io::{Error, ErrorKind},
     mem::MaybeUninit,
@@ -170,13 +170,13 @@ impl<'obj> TestProgram<'obj> {
         Ok(func.test_run(input)?.return_value)
     }
 
-    /// Returns the range captured for the match `idx` in the last parsed
+    /// Returns the range captured for the match `mid` in the last parsed
     /// message, or `None` if the parser did not capture one.
-    pub fn get_match(&self, idx: usize) -> Result<Option<Vec<u8>>> {
+    pub fn get_match(&self, mid: MatchId) -> Result<Option<Vec<u8>>> {
         let id = self.skel.maps.matches.info()?.info.id;
         let map = MapHandle::from_map_id(id)?;
 
-        let key = idx as u32;
+        let key = u8::from(mid) as u32;
         let key = unsafe { key.as_bytes() };
         let val = map.lookup(&key, MapFlags::empty())?;
 

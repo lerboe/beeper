@@ -1,4 +1,4 @@
-use beeper::{h1, pseudo_header};
+use beeper::{MatchId, h1, pseudo_header};
 use http::{HeaderName, HeaderValue, header};
 use reqwest::Client;
 use std::net::SocketAddr;
@@ -12,21 +12,21 @@ use utils::{
 };
 use xbpf::OpenObject;
 
-fn assert_match_eq(prog: &TestProgram, idx: usize, expected: Option<&HeaderValue>) {
-    let actual = prog.get_match(idx).expect("get_match");
+fn assert_match_eq(prog: &TestProgram, mid: MatchId, expected: Option<&HeaderValue>) {
+    let actual = prog.get_match(mid).expect("get_match");
     let actual = actual.map(|s| String::from_utf8(s).unwrap());
 
     if expected.is_none() {
         assert!(
             actual.is_none(),
-            "get_match({idx}): {}, expected: none",
+            "get_match({mid:?}): {}, expected: none",
             actual.unwrap()
         );
     } else {
         let expected = expected.unwrap().to_str().unwrap();
         assert!(
             actual.is_some(),
-            "get_match({idx}): none, expected: {expected}"
+            "get_match({mid:?}): none, expected: {expected}"
         );
         assert_eq!(actual.unwrap().as_str(), expected);
     }
@@ -64,19 +64,19 @@ async fn send_raw_bytes(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
 
 /// Same as [`assert_match_eq`], but compares the raw bytes of the capture, so
 /// that a value that is not valid UTF-8 can be asserted on as well.
-fn assert_match_bytes_eq(prog: &TestProgram, idx: usize, expected: Option<&[u8]>) {
-    let actual = prog.get_match(idx).expect("get_match");
+fn assert_match_bytes_eq(prog: &TestProgram, mid: MatchId, expected: Option<&[u8]>) {
+    let actual = prog.get_match(mid).expect("get_match");
 
     match expected {
         None => assert!(
             actual.is_none(),
-            "get_match({idx}): {:?}, expected: none",
+            "get_match({mid:?}): {:?}, expected: none",
             String::from_utf8_lossy(&actual.unwrap())
         ),
         Some(expected) => {
             assert!(
                 actual.is_some(),
-                "get_match({idx}): none, expected: {:?}",
+                "get_match({mid:?}): none, expected: {:?}",
                 String::from_utf8_lossy(expected)
             );
             let actual = actual.unwrap();
@@ -88,18 +88,22 @@ fn assert_match_bytes_eq(prog: &TestProgram, idx: usize, expected: Option<&[u8]>
     }
 }
 
+/// Attaches a parser capturing `hdrs` and returns it along with the match id
+/// of each of them, in the order they were configured in.
 fn attach_h1_parser(
     prog_fd: i32,
     hook: Hook,
     match_preface: bool,
     hdrs: &[HeaderName],
-) -> h1::AttachedParser {
+) -> (h1::AttachedParser, Vec<MatchId>) {
     let mut h1 = h1::Parser::new();
     if match_preface {
-        h1 = h1.match_h2_preface();
+        h1.match_h2_preface().expect("match preface");
     }
+
+    let mut mids = Vec::new();
     for hdr in hdrs {
-        h1 = h1.capture_hdr(hdr);
+        mids.push(h1.capture_hdr(hdr).expect("capture header"));
     }
 
     let suffix = hook.to_string();
@@ -108,7 +112,7 @@ fn attach_h1_parser(
         .parse_fn(format!("parse_h1_{suffix}"), hook.into())
         .extract_fn(format!("extract_h1_match_{suffix}"), hook.into());
 
-    h1.attach(prog_fd).expect("attach parser")
+    (h1.attach(prog_fd).expect("attach parser"), mids)
 }
 
 #[tokio::test]
@@ -118,7 +122,7 @@ async fn match_h2_preface() {
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
 
-    let _h1 = attach_h1_parser(prog.prog_fd(), Hook::Msg, true, &[]);
+    let (_h1, _mids) = attach_h1_parser(prog.prog_fd(), Hook::Msg, true, &[]);
     let client = Client::builder()
         .http2_prior_knowledge()
         .build()
@@ -139,7 +143,7 @@ async fn parse_simple_header() {
 
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
-    let _h1 = attach_h1_parser(prog.prog_fd(), Hook::Msg, true, &[header::USER_AGENT]);
+    let (_h1, mids) = attach_h1_parser(prog.prog_fd(), Hook::Msg, true, &[header::USER_AGENT]);
 
     let user_agent = HeaderValue::from_static("some user agent");
     let client = build_client();
@@ -151,7 +155,7 @@ async fn parse_simple_header() {
         .expect("request");
 
     assert_eq!(resp.status(), 200);
-    assert_match_eq(&prog, 1, Some(&user_agent));
+    assert_match_eq(&prog, mids[0], Some(&user_agent));
 }
 
 #[tokio::test]
@@ -160,7 +164,7 @@ async fn ignore_header_case() {
 
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
-    let _h1 = attach_h1_parser(prog.prog_fd(), Hook::Msg, true, &[header::USER_AGENT]);
+    let (_h1, mids) = attach_h1_parser(prog.prog_fd(), Hook::Msg, true, &[header::USER_AGENT]);
 
     // reqwest normalizes header names, so the request is written to the socket as is
     let user_agent = HeaderValue::from_static("beeper");
@@ -175,7 +179,7 @@ async fn ignore_header_case() {
         resp.starts_with("HTTP/1.1 200 OK"),
         "unexpected response: {resp}"
     );
-    assert_match_eq(&prog, 1, Some(&user_agent));
+    assert_match_eq(&prog, mids[0], Some(&user_agent));
 }
 
 #[tokio::test]
@@ -184,7 +188,7 @@ async fn ignores_header_whitespace() {
 
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
-    let _h1 = attach_h1_parser(prog.prog_fd(), Hook::Msg, true, &[header::USER_AGENT]);
+    let (_h1, mids) = attach_h1_parser(prog.prog_fd(), Hook::Msg, true, &[header::USER_AGENT]);
 
     // the whitespace between the colon and the value is not part of the value
     let user_agent = HeaderValue::from_static("beeper");
@@ -199,7 +203,7 @@ async fn ignores_header_whitespace() {
         resp.starts_with("HTTP/1.1 200 OK"),
         "unexpected response: {resp}"
     );
-    assert_match_eq(&prog, 1, Some(&user_agent));
+    assert_match_eq(&prog, mids[0], Some(&user_agent));
 
     // beeper also matches whitespace between the name and the colon. the server
     // rejects such a request as a smuggling risk, but it is parsed off the wire
@@ -212,7 +216,7 @@ async fn ignores_header_whitespace() {
 
     _ = send_raw(addr, &req).await;
 
-    assert_match_eq(&prog, 1, Some(&user_agent));
+    assert_match_eq(&prog, mids[0], Some(&user_agent));
 }
 
 #[tokio::test]
@@ -222,7 +226,7 @@ async fn parse_subsequent_headers() {
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
 
-    let _h1 = attach_h1_parser(
+    let (_h1, mids) = attach_h1_parser(
         prog.prog_fd(),
         Hook::Msg,
         true,
@@ -241,8 +245,8 @@ async fn parse_subsequent_headers() {
         .expect("request");
 
     assert_eq!(resp.status(), 200);
-    assert_match_eq(&prog, 1, Some(&user_agent));
-    assert_match_eq(&prog, 2, Some(&lang));
+    assert_match_eq(&prog, mids[0], Some(&user_agent));
+    assert_match_eq(&prog, mids[1], Some(&lang));
 }
 
 #[tokio::test]
@@ -252,7 +256,7 @@ async fn parse_status_line_only() {
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
 
-    let _h1 = attach_h1_parser(
+    let (_h1, mids) = attach_h1_parser(
         prog.prog_fd(),
         Hook::Msg,
         true,
@@ -269,8 +273,8 @@ async fn parse_status_line_only() {
     assert_eq!(resp.status(), 200);
     let method = HeaderValue::from_static("GET");
     let path = HeaderValue::from_static("/");
-    assert_match_eq(&prog, 1, Some(&path));
-    assert_match_eq(&prog, 2, Some(&method));
+    assert_match_eq(&prog, mids[0], Some(&path));
+    assert_match_eq(&prog, mids[1], Some(&method));
 }
 
 #[tokio::test]
@@ -280,7 +284,7 @@ async fn parse_status_line_and_subsequent_header() {
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
 
-    let _h1 = attach_h1_parser(
+    let (_h1, mids) = attach_h1_parser(
         prog.prog_fd(),
         Hook::Msg,
         true,
@@ -299,8 +303,8 @@ async fn parse_status_line_and_subsequent_header() {
     assert_eq!(resp.status(), 200);
     let path = HeaderValue::from_static("/");
     let content_length = HeaderValue::from_str(&format!("{}", body.len())).unwrap();
-    assert_match_eq(&prog, 1, Some(&path));
-    assert_match_eq(&prog, 2, Some(&content_length));
+    assert_match_eq(&prog, mids[0], Some(&path));
+    assert_match_eq(&prog, mids[1], Some(&content_length));
 }
 
 #[tokio::test]
@@ -310,7 +314,7 @@ async fn parse_status_code() {
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Upstream).expect("attach");
 
-    let _h1 = attach_h1_parser(
+    let (_h1, mids) = attach_h1_parser(
         prog.prog_fd(),
         Hook::Msg,
         true,
@@ -329,8 +333,8 @@ async fn parse_status_code() {
     assert_eq!(resp.status(), 200);
     let status = HeaderValue::from_static("200");
     let content_length = HeaderValue::from_str(&format!("{}", body.len())).unwrap();
-    assert_match_eq(&prog, 1, Some(&status));
-    assert_match_eq(&prog, 2, Some(&content_length));
+    assert_match_eq(&prog, mids[0], Some(&status));
+    assert_match_eq(&prog, mids[1], Some(&content_length));
 }
 
 #[tokio::test]
@@ -339,7 +343,7 @@ async fn ignore_a_preface_that_is_not_one() {
 
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
-    let _h1 = attach_h1_parser(prog.prog_fd(), Hook::Msg, true, &[]);
+    let (_h1, _mids) = attach_h1_parser(prog.prog_fd(), Hook::Msg, true, &[]);
 
     // the preface asks for the target `*`, which is also the character the DFA
     // spells "any byte" with. Anything else in its place is a different message
@@ -363,13 +367,13 @@ async fn match_a_star_in_a_header_name_literally() {
     // `*` is a legal character of a field name, and one the DFA spells "any
     // byte" with
     let starred = HeaderName::from_bytes(b"x*y").expect("header name");
-    let _h1 = attach_h1_parser(prog.prog_fd(), Hook::Msg, true, &[starred]);
+    let (_h1, mids) = attach_h1_parser(prog.prog_fd(), Hook::Msg, true, &[starred]);
 
     let req = format!("GET / HTTP/1.1\r\nHost: {addr}\r\nxzy: beeper\r\n\r\n");
     _ = send_raw(addr, &req).await;
 
     // no field of the request is named `x*y`, so there is nothing to capture
-    assert_match_eq(&prog, 1, None);
+    assert_match_eq(&prog, mids[0], None);
 }
 
 #[tokio::test]
@@ -378,7 +382,7 @@ async fn keep_a_value_that_carries_high_bytes_together() {
 
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
-    let _h1 = attach_h1_parser(prog.prog_fd(), Hook::Msg, true, &[header::USER_AGENT]);
+    let (_h1, mids) = attach_h1_parser(prog.prog_fd(), Hook::Msg, true, &[header::USER_AGENT]);
 
     // a field value may carry obs-text, i.e. any byte from 0x80 to 0xFF. 0x8D
     // and 0x8A are the two that a parser masking its input down to seven bits
@@ -392,7 +396,7 @@ async fn keep_a_value_that_carries_high_bytes_together() {
 
     _ = send_raw_bytes(addr, &req).await;
 
-    assert_match_bytes_eq(&prog, 1, Some(value));
+    assert_match_bytes_eq(&prog, mids[0], Some(value));
 }
 
 #[tokio::test]
@@ -401,7 +405,7 @@ async fn capture_nothing_for_an_empty_value() {
 
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
-    let _h1 = attach_h1_parser(prog.prog_fd(), Hook::Msg, true, &[header::USER_AGENT]);
+    let (_h1, mids) = attach_h1_parser(prog.prog_fd(), Hook::Msg, true, &[header::USER_AGENT]);
 
     // an empty value is legal, and there is nothing to capture in it. The
     // fields behind it are not part of it either
@@ -414,7 +418,7 @@ async fn capture_nothing_for_an_empty_value() {
         "unexpected response: {resp}"
     );
 
-    assert_match_eq(&prog, 1, None);
+    assert_match_eq(&prog, mids[0], None);
 }
 
 #[tokio::test]
@@ -423,7 +427,7 @@ async fn parse_a_header_in_the_first_half_of_a_long_message() {
 
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
-    let _h1 = attach_h1_parser(prog.prog_fd(), Hook::Msg, true, &[header::USER_AGENT]);
+    let (_h1, mids) = attach_h1_parser(prog.prog_fd(), Hook::Msg, true, &[header::USER_AGENT]);
 
     // the parser walks the first 0x7FFF bytes of a message. The field below
     // sits well inside of them, the padding behind it pushes the message well
@@ -444,7 +448,7 @@ async fn parse_a_header_in_the_first_half_of_a_long_message() {
     assert!(req.len() > 0x7FFF, "the message is not long enough");
     _ = send_raw(addr, &req).await;
 
-    assert_match_eq(&prog, 1, Some(&user_agent));
+    assert_match_eq(&prog, mids[0], Some(&user_agent));
 }
 
 #[tokio::test]
@@ -453,7 +457,7 @@ async fn parse_lf_endings() {
 
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
-    let _h1 = attach_h1_parser(prog.prog_fd(), Hook::Msg, true, &[header::USER_AGENT]);
+    let (_h1, mids) = attach_h1_parser(prog.prog_fd(), Hook::Msg, true, &[header::USER_AGENT]);
 
     // section 2.2 of RFC 9112 lets a recipient read a bare LF as a line terminator
     let user_agent = HeaderValue::from_static("beeper");
@@ -465,7 +469,7 @@ async fn parse_lf_endings() {
         "unexpected response: {resp}"
     );
 
-    assert_match_eq(&prog, 1, Some(&user_agent));
+    assert_match_eq(&prog, mids[0], Some(&user_agent));
 }
 
 // TODO: How to inject an invalid response?
@@ -475,7 +479,7 @@ async fn parse_lf_endings() {
 
 //     let mut open_obj = OpenObject::new();
 //     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
-//     let _h1 = attach_h1_parser(prog.prog_fd(), Hook::Msg,  true, &[header::USER_AGENT]);
+//     let (_h1, mids) = attach_h1_parser(prog.prog_fd(), Hook::Msg,  true, &[header::USER_AGENT]);
 
 //     // section 2.2 of RFC 9112 lets a recipient read a bare LF as a line terminator
 //     let user_agent = HeaderValue::from_static("beeper");
@@ -487,7 +491,7 @@ async fn parse_lf_endings() {
 //         "unexpected response: {resp}"
 //     );
 
-//     assert_match_eq(&prog, 1, Some(&user_agent));
+//     assert_match_eq(&prog, mids[0], Some(&user_agent));
 // }
 
 #[tokio::test]
@@ -498,7 +502,7 @@ async fn match_h2_preface_in_skb() {
     let prog = TestProgram::attach_to(addr, &mut open_obj, Direction::Downstream, Hook::Skb)
         .expect("attach");
 
-    let _h1 = attach_h1_parser(prog.prog_fd(), Hook::Skb, true, &[]);
+    let (_h1, _mids) = attach_h1_parser(prog.prog_fd(), Hook::Skb, true, &[]);
     let client = Client::builder()
         .http2_prior_knowledge()
         .build()
@@ -520,7 +524,7 @@ async fn parse_simple_header_in_skb() {
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach_to(addr, &mut open_obj, Direction::Downstream, Hook::Skb)
         .expect("attach");
-    let _h1 = attach_h1_parser(prog.prog_fd(), Hook::Skb, true, &[header::USER_AGENT]);
+    let (_h1, mids) = attach_h1_parser(prog.prog_fd(), Hook::Skb, true, &[header::USER_AGENT]);
 
     let user_agent = HeaderValue::from_static("some user agent");
     let client = build_client();
@@ -532,7 +536,7 @@ async fn parse_simple_header_in_skb() {
         .expect("request");
 
     assert_eq!(resp.status(), 200);
-    assert_match_eq(&prog, 1, Some(&user_agent));
+    assert_match_eq(&prog, mids[0], Some(&user_agent));
 }
 
 #[tokio::test]
@@ -541,15 +545,15 @@ async fn report_the_fields_that_were_matched() {
 
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
-    let _h1 = attach_h1_parser(
+    let (_h1, mids) = attach_h1_parser(
         prog.prog_fd(),
         Hook::Msg,
         true,
         &[header::USER_AGENT, header::ACCEPT_LANGUAGE],
     );
 
-    // the preface is match 0, the two fields follow it. The request is no
-    // preface and carries no language, so only the user agent is matched
+    // the request is no preface and carries no language, so of the three
+    // configured matches only the user agent is reported
     let user_agent = HeaderValue::from_static("beeper");
     let client = build_client();
     let resp = client
@@ -560,5 +564,9 @@ async fn report_the_fields_that_were_matched() {
         .expect("request");
 
     assert_eq!(resp.status(), 200);
-    assert_eq!(prog.last_matches(), 0b010, "only the user agent is matched");
+    assert_eq!(
+        prog.last_matches(),
+        1 << u8::from(mids[0]),
+        "only the user agent is matched"
+    );
 }

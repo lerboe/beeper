@@ -33,12 +33,12 @@ struct {
 volatile const u32 ip4;
 volatile const u32 port;
 
-// The matches the h1 parser is configured with, in the order in which user
-// space captures them.
-#define H1_PREFACE_MID 0
-#define H1_PATH_MID 1
-#define H1_ACCEPT_LANGUAGE_MID 2
-#define H1_STATUS_MID 3
+// The matches the h1 parser is configured with, set by user space before the
+// program is loaded, from the ids the parser handed back for them.
+volatile const u8 h1_preface_mid;
+volatile const u8 h1_path_mid;
+volatile const u8 h1_accept_language_mid;
+volatile const u8 h1_status_mid;
 
 // The frame type carrying a message's body, see section 6.1 of RFC 9113.
 #define H2_DATA_FRAME 0x00
@@ -89,11 +89,11 @@ static __always_inline void log_h1_request(struct sk_msg_md *msg, struct parse_r
     if (!scratch) return;
 
     struct hdr_str path = { 0 };
-    if (extract_h1_match(msg, pres, H1_PATH_MID, &path) < 0) return;
+    if (extract_h1_match(msg, pres, h1_path_mid, &path) < 0) return;
     copy_bounded(path.ptr, path.len, scratch->a);
 
     struct hdr_str lang = { 0 };
-    if (extract_h1_match(msg, pres, H1_ACCEPT_LANGUAGE_MID, &lang) == 0) {
+    if (extract_h1_match(msg, pres, h1_accept_language_mid, &lang) == 0) {
         copy_bounded(lang.ptr, lang.len, scratch->b);
         bpf_debug("--> %s accept-language: %s", scratch->a, scratch->b);
     } else {
@@ -109,7 +109,7 @@ static __always_inline void log_h1_response(struct sk_msg_md *msg, struct parse_
     if (!scratch) return;
 
     struct hdr_str status = { 0 };
-    if (extract_h1_match(msg, pres, H1_STATUS_MID, &status) < 0) return;
+    if (extract_h1_match(msg, pres, h1_status_mid, &status) < 0) return;
     copy_bounded(status.ptr, status.len, scratch->a);
 
     copy_bounded((u8 *)(long)msg->data + hdr_len, msg->size - hdr_len, scratch->b);
@@ -174,7 +174,7 @@ int msg_verdict(struct sk_msg_md *msg) {
             return SK_PASS;
         }
 
-        if (matched_h1(&pres, H1_PREFACE_MID)) {
+        if (matched_h1(&pres, h1_preface_mid)) {
             bpf_trace("Upgrading connection to HTTP/2");
 
             // the preface only ever arrives on the client's own socket, but

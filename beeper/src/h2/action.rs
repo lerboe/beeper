@@ -125,7 +125,7 @@ impl Action {
     /// Returns the action capturing the value of the field whose name the
     /// automaton just matched, under the id `cid`.
     pub const fn capture(mid: MatchId) -> Action {
-        Action::new(Kind::Capture, mid.0, 0)
+        Action::new(Kind::Capture, mid.0 as u16, 0)
     }
 }
 

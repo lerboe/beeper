@@ -1,6 +1,6 @@
 #![allow(unused_imports)]
 use crate::{
-    Dfa, MatchId, MessageBuffer,
+    Dfa, Error, MatchId, MessageBuffer,
     dfa::{ANY_STATE, INIT_STATE, fmt_input},
     h1::action::Action,
     pseudo_header::{METHOD, PATH, STATUS},
@@ -20,7 +20,7 @@ const LF: &str = "\n";
 
 /// The number of ranges a parser can be configured to capture. Must stay in
 /// sync with `MAX_MATCHES` of beeper.h.
-const MAX_MATCHES: u16 = 32;
+const MAX_MATCHES: u8 = 32;
 
 /// A parser for HTTP/1.x messages.
 ///
@@ -32,7 +32,7 @@ pub struct Parser {
     dfa: Dfa<Action>,
 
     /// The number of matches occuring in the patterns.
-    num_matches: u16,
+    num_matches: u8,
 
     /// The parse function name for each message buffer.
     parse_fns: HashMap<MessageBuffer, String>,
@@ -98,19 +98,19 @@ impl Parser {
 
     /// Returns an unused match id.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the parser is already configured with [`MAX_MATCHES`] matches,
-    /// as the parser program has no room to tell one more apart from them.
-    fn new_match(&mut self) -> MatchId {
-        assert!(
-            self.num_matches < MAX_MATCHES,
-            "a parser captures at most {MAX_MATCHES} ranges"
-        );
+    /// Returns an error if the parser is already configured with
+    /// [`MAX_MATCHES`] matches, as the parser program has no room to tell one
+    /// more apart from them.
+    fn new_match(&mut self) -> Result<MatchId, Error> {
+        if self.num_matches >= MAX_MATCHES {
+            return Err(Error::MatchLimitExceeded(MAX_MATCHES as usize));
+        }
 
         let id = MatchId(self.num_matches);
         self.num_matches += 1;
-        id
+        Ok(id)
     }
 
     /// Configures the parser to capture the value of a header field.
@@ -123,14 +123,23 @@ impl Parser {
     /// # Arguments
     ///
     /// * `name` - The header name whose value to capture
-    pub fn capture_hdr(mut self, name: &HeaderName) -> Parser {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the parser already captures as many fields as the
+    /// parser program has room for.
+    ///
+    /// # Returns
+    ///
+    /// The match ID that can be used in eBPF to extract the captured value.
+    pub fn capture_hdr(&mut self, name: &HeaderName) -> Result<MatchId, Error> {
         if name == &METHOD || name == &PATH {
             return self.capture_status_line_hdr(name);
         } else if name == &STATUS {
             return self.capture_status_code();
         }
 
-        let mid = self.new_match();
+        let mid = self.new_match()?;
         let mut pattern = self.dfa.start_pattern(ANY_STATE);
         pattern
             .push(LF)
@@ -157,7 +166,7 @@ impl Parser {
             .push_optional(CR, false)
             .restart_with(LF);
 
-        self
+        Ok(mid)
     }
 
     /// Configures the parser to match an HTTP/2 preface in an HTTP/1.1 connection.
@@ -167,8 +176,17 @@ impl Parser {
     ///
     /// The preface is captured as a match, so the target program can detect the
     /// upgrade and switch to an HTTP/2 parser for the rest of the connection.
-    pub fn match_h2_preface(mut self) -> Parser {
-        let mid = self.new_match();
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the parser already captures as many fields as the
+    /// parser program has room for.
+    ///
+    /// # Returns
+    ///
+    /// The match ID that can be used in eBPF to extract the captured value.
+    pub fn match_h2_preface(&mut self) -> Result<MatchId, Error> {
+        let mid = self.new_match()?;
         self.dfa
             .start_pattern(INIT_STATE)
             .with(Action::StartCapture(mid))
@@ -178,7 +196,7 @@ impl Parser {
             ))
             .with(Action::EndCaptureAndDone(mid));
 
-        self
+        Ok(mid)
     }
 
     /// Configures the parser to stop at the empty line that ends the header
@@ -201,13 +219,22 @@ impl Parser {
     /// # Panics
     ///
     /// Panics if `name` is neither [`METHOD`] nor [`PATH`].
-    fn capture_status_line_hdr(mut self, name: &HeaderName) -> Parser {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the parser already captures as many fields as the
+    /// parser program has room for.
+    ///
+    /// # Returns
+    ///
+    /// The match ID that can be used in eBPF to extract the captured value.
+    fn capture_status_line_hdr(&mut self, name: &HeaderName) -> Result<MatchId, Error> {
         let methods = [
             "POST", "GET", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE",
         ];
 
+        let mid = self.new_match()?;
         if name == &METHOD {
-            let mid = self.new_match();
             self.dfa
                 .start_pattern(INIT_STATE)
                 .with(Action::StartCapture(mid))
@@ -219,7 +246,6 @@ impl Parser {
                 .push_optional(CR, false)
                 .restart_with(LF);
         } else if name == &PATH {
-            let mid = self.new_match();
             self.dfa
                 .start_pattern(INIT_STATE)
                 .push_options_ci(&methods)
@@ -237,14 +263,22 @@ impl Parser {
             );
         }
 
-        self
+        Ok(mid)
     }
 
     /// Configures the parser to match the status line of a response and capture
     /// its status code.
-    fn capture_status_code(mut self) -> Parser {
-        let mid = self.new_match();
-
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the parser already captures as many fields as the
+    /// parser program has room for.
+    ///
+    /// # Returns
+    ///
+    /// The match ID that can be used in eBPF to extract the captured value.
+    fn capture_status_code(&mut self) -> Result<MatchId, Error> {
+        let mid = self.new_match()?;
         self.dfa
             .start_pattern(INIT_STATE)
             .push_ci("HTTP/1.1 ")
@@ -255,7 +289,7 @@ impl Parser {
             .push_optional(CR, false)
             .restart_with(LF);
 
-        self
+        Ok(mid)
     }
 
     /// Loads the configured parser and attaches it to the target program.
@@ -312,7 +346,11 @@ impl Parser {
             let prog = match msg_buf {
                 MessageBuffer::Msg => &mut open_skel.progs.extract_match_msg,
                 MessageBuffer::Skb => &mut open_skel.progs.extract_match_skb,
-                MessageBuffer::DynPtr => bail!("the parser extracts a match from a msg or an skb, not from a {msg_buf}"),
+                MessageBuffer::DynPtr => {
+                    bail!(
+                        "the parser extracts a match from a msg or an skb, not from a {msg_buf:?}"
+                    )
+                }
             };
             prog.set_autoload(true);
             prog.set_attach_target(target, Some(func.clone()))?;
@@ -341,7 +379,11 @@ impl Parser {
             links.push(match msg_buf {
                 MessageBuffer::Msg => skel.progs.extract_match_msg.attach()?,
                 MessageBuffer::Skb => skel.progs.extract_match_skb.attach()?,
-                MessageBuffer::DynPtr => bail!("the parser extracts a match from a msg or an skb, not from a {msg_buf}"),
+                MessageBuffer::DynPtr => {
+                    bail!(
+                        "the parser extracts a match from a msg or an skb, not from a {msg_buf:?}"
+                    )
+                }
             });
         }
 
@@ -416,4 +458,27 @@ impl Parser {
 pub struct AttachedParser {
     #[allow(dead_code)]
     links: Vec<Link>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hdr(i: u8) -> HeaderName {
+        HeaderName::from_bytes(format!("x-{i}").as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn a_parser_captures_at_most_max_matches_ranges() {
+        let mut parser = Parser::new();
+        for i in 0..MAX_MATCHES {
+            let mid = parser.capture_hdr(&hdr(i)).expect("capture header");
+            assert_eq!(u8::from(mid), i);
+        }
+
+        assert_eq!(
+            parser.capture_hdr(&hdr(MAX_MATCHES)),
+            Err(Error::MatchLimitExceeded(MAX_MATCHES as usize))
+        );
+    }
 }

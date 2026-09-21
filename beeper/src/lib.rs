@@ -15,8 +15,10 @@
 //! # let prog_fd = 0;
 //! use beeper::{MessageBuffer, h1, pseudo_header::PATH};
 //!
-//! let parser = h1::Parser::new()
-//!     .capture_hdr(&PATH)
+//! let mut parser = h1::Parser::new();
+//! let path = parser.capture_hdr(&PATH)?;
+//!
+//! let parser = parser
 //!     .parse_fn("parse_h1", MessageBuffer::Msg)
 //!     .extract_fn("extract_h1_match", MessageBuffer::Msg)
 //!     .attach(prog_fd)?;
@@ -28,6 +30,7 @@
 //! the parser stays in place until it is dropped.
 
 pub(crate) use dfa::Dfa;
+use httlib_huffman::EncoderError;
 use std::fmt::Display;
 
 mod dfa;
@@ -48,12 +51,35 @@ pub enum MessageBuffer {
     DynPtr,
 }
 
-impl Display for MessageBuffer {
+/// The ways configuring a parser can fail.
+#[derive(Debug, PartialEq)]
+pub enum Error {
+    /// The parser is already configured with as many captures as the parser
+    /// program has room for. The limit is carried along.
+    MatchLimitExceeded(usize),
+
+    /// A header name could not be Huffman encoded, so there is no way to match
+    /// it on the wire.
+    InvalidEncoding(EncoderError),
+}
+
+impl std::error::Error for Error {}
+
+impl From<EncoderError> for Error {
+    fn from(err: EncoderError) -> Error {
+        Error::InvalidEncoding(err)
+    }
+}
+
+impl Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            MessageBuffer::Skb => write!(f, "skb"),
-            MessageBuffer::Msg => write!(f, "msg"),
-            MessageBuffer::DynPtr => write!(f, "dyn_ptr"),
+            Error::MatchLimitExceeded(limit) => {
+                write!(f, "a parser captures at most {limit} ranges")
+            }
+            Error::InvalidEncoding(err) => {
+                write!(f, "the header name cannot be Huffman encoded: {err}")
+            }
         }
     }
 }
@@ -90,4 +116,10 @@ pub(crate) struct StateId(u16);
 /// `Parser::matched_fn` and `Parser::extract_fn`. Captures are
 /// numbered in the order in which they are configured.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct MatchId(u16);
+pub struct MatchId(u8);
+
+impl From<MatchId> for u8 {
+    fn from(id: MatchId) -> u8 {
+        id.0
+    }
+}

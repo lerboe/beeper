@@ -42,9 +42,9 @@ impl From<Action> for h1_action {
     fn from(value: Action) -> Self {
         let (kind, flags, mid) = match value {
             Action::Done => (H1A_NONE, H1F_DONE, 0),
-            Action::StartCapture(mid) => (H1A_START_CAPTURE, 0, mid.0 as u8),
-            Action::EndCapture(mid) => (H1A_END_CAPTURE, 0, mid.0 as u8),
-            Action::EndCaptureAndDone(mid) => (H1A_END_CAPTURE, H1F_DONE, mid.0 as u8),
+            Action::StartCapture(mid) => (H1A_START_CAPTURE, 0, mid.0),
+            Action::EndCapture(mid) => (H1A_END_CAPTURE, 0, mid.0),
+            Action::EndCaptureAndDone(mid) => (H1A_END_CAPTURE, H1F_DONE, mid.0),
         };
 
         h1_action { kind, flags, mid }

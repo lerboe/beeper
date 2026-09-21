@@ -1,6 +1,6 @@
 #![allow(unused_imports)]
 use crate::{
-    Dfa, MatchId, MessageBuffer,
+    Dfa, Error, MatchId, MessageBuffer,
     h2::{action::*, hpack},
 };
 use anyhow::{Result, bail};
@@ -23,7 +23,7 @@ extern crate plain;
 
 /// The number of ranges a parser can be configured to capture. Must stay in
 /// sync with `MAX_MATCHES` of beeper.h.
-const MAX_MATCHES: u16 = 32;
+const MAX_MATCHES: u8 = 32;
 
 /// Returns `name` as HTTP/2 spells it, i.e. with the leading colon of a
 /// pseudo-header, see [`crate::header`].
@@ -48,7 +48,7 @@ pub struct Parser {
     dfa: Dfa<Action>,
 
     /// The number of matches occuring in the patterns.
-    num_matches: u16,
+    num_matches: u8,
 
     /// The parse function name for each message buffer.
     parse_fns: HashMap<MessageBuffer, String>,
@@ -146,28 +146,38 @@ impl Parser {
     ///
     /// Returns an error if `name` cannot be Huffman encoded, or if the parser
     /// already captures as many fields as the parser program has room for.
-    pub fn capture_hdr(mut self, name: &HeaderName) -> Result<Parser> {
-        if self.num_matches >= MAX_MATCHES {
-            bail!("a parser captures at most {MAX_MATCHES} fields");
-        }
-
+    ///
+    /// # Returns
+    ///
+    /// The match ID that can be used in eBPF to extract the captured value.
+    pub fn capture_hdr(&mut self, name: &HeaderName) -> Result<MatchId, Error> {
         let mut name_encoded = Vec::new();
         huffman::encode(wire_name(name).as_bytes(), &mut name_encoded)?;
 
-        let mid = self.new_match();
+        let mid = self.new_match()?;
         self.dfa
             .start_pattern(S_NAME)
             .push_bytes(&name_encoded)
             .with(Action::capture(mid));
 
-        Ok(self)
+        Ok(mid)
     }
 
     /// Returns an unused match id.
-    fn new_match(&mut self) -> MatchId {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the parser is already configured with
+    /// [`MAX_MATCHES`] matches, as the parser program has no room to tell one
+    /// more apart from them.
+    fn new_match(&mut self) -> Result<MatchId, Error> {
+        if self.num_matches >= MAX_MATCHES {
+            return Err(Error::MatchLimitExceeded(MAX_MATCHES as usize));
+        }
+
         let id = MatchId(self.num_matches);
         self.num_matches += 1;
-        id
+        Ok(id)
     }
 
     /// Fills `static_table` with the Huffman encoded entries of the HPACK
@@ -278,7 +288,9 @@ impl Parser {
                 MessageBuffer::Msg => &mut open_skel.progs.extract_match_msg,
                 MessageBuffer::Skb => &mut open_skel.progs.extract_match_skb,
                 MessageBuffer::DynPtr => {
-                    bail!("the parser extracts a match from a msg or an skb, not from a {msg_buf}")
+                    bail!(
+                        "the parser extracts a match from a msg or an skb, not from a {msg_buf:?}"
+                    )
                 }
             };
             prog.set_autoload(true);
@@ -315,7 +327,9 @@ impl Parser {
                 MessageBuffer::Msg => skel.progs.extract_match_msg.attach()?,
                 MessageBuffer::Skb => skel.progs.extract_match_skb.attach()?,
                 MessageBuffer::DynPtr => {
-                    bail!("the parser extracts a match from a msg or an skb, not from a {msg_buf}")
+                    bail!(
+                        "the parser extracts a match from a msg or an skb, not from a {msg_buf:?}"
+                    )
                 }
             });
         }
@@ -519,5 +533,28 @@ fn delete_if_present(map: &MapHandle, key: &[u8]) -> Result<()> {
     match map.delete(key) {
         Err(e) if e.kind() != ErrorKind::NotFound => Err(e.into()),
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hdr(i: u8) -> HeaderName {
+        HeaderName::from_bytes(format!("x-{i}").as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn a_parser_captures_at_most_max_matches_ranges() {
+        let mut parser = Parser::new();
+        for i in 0..MAX_MATCHES {
+            let mid = parser.capture_hdr(&hdr(i)).expect("capture header");
+            assert_eq!(u8::from(mid), i);
+        }
+
+        assert_eq!(
+            parser.capture_hdr(&hdr(MAX_MATCHES)),
+            Err(Error::MatchLimitExceeded(MAX_MATCHES as usize))
+        );
     }
 }
