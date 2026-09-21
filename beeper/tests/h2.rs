@@ -14,7 +14,8 @@ use utils::{
 };
 use xbpf::OpenObject;
 
-const TEST_HEADER: HeaderName = HeaderName::from_static("testheader");
+const TEST_HEADER_NAME: &str = "testheader";
+const TEST_HEADER: HeaderName = HeaderName::from_static(TEST_HEADER_NAME);
 
 fn huffman_encode(s: &str) -> Vec<u8> {
     let mut coded = Vec::new();
@@ -36,15 +37,10 @@ fn huffman_decode(val: &[u8]) -> String {
     String::from_utf8(res).unwrap()
 }
 
-fn dynamic_table_size_for_headers(headers: &[(HeaderName, HeaderValue)]) -> u32 {
-    headers.iter().fold(0, |acc, (k, v)| {
-        // pseudo-headers are addressed without the colon they carry on the wire
-        let colon = matches!(
-            k.as_str(),
-            "authority" | "method" | "path" | "scheme" | "status"
-        );
-        acc + (k.as_str().len() + colon as usize + v.len() + 32) as u32
-    })
+fn dynamic_table_size_for_headers(headers: &[(&str, HeaderValue)]) -> u32 {
+    headers
+        .iter()
+        .fold(0, |acc, (k, v)| acc + (k.len() + v.len() + 32) as u32)
 }
 
 fn assert_match_eq(prog: &TestProgram, mid: MatchId, expected: Option<&HeaderValue>) {
@@ -327,11 +323,7 @@ fn attach_h1_parser(prog_fd: i32, hook: Hook) -> h1::AttachedParser {
 
 /// Attaches a parser capturing `hdrs` and returns it along with the match id
 /// of each of them, in the order they were configured in.
-fn attach_h2_parser(
-    prog_fd: i32,
-    hook: Hook,
-    hdrs: &[HeaderName],
-) -> (h2::AttachedParser, Vec<MatchId>) {
+fn attach_h2_parser(prog_fd: i32, hook: Hook, hdrs: &[&str]) -> (h2::AttachedParser, Vec<MatchId>) {
     let mut h2 = h2::Parser::new();
 
     let mut mids = Vec::new();
@@ -357,7 +349,7 @@ fn attach_at<'obj>(
     addr: SocketAddr,
     open_obj: &'obj mut OpenObject,
     hook: Hook,
-    hdrs: &[HeaderName],
+    hdrs: &[&str],
 ) -> (
     TestProgram<'obj>,
     h1::AttachedParser,
@@ -394,7 +386,8 @@ async fn parse_header_field_indexed_in_static_table() {
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
 
     let _h1 = attach_h1_parser(prog.prog_fd(), Hook::Msg);
-    let (_h2, mids) = attach_h2_parser(prog.prog_fd(), Hook::Msg, &[pseudo_header::METHOD]);
+    let (_h2, mids) =
+        attach_h2_parser(prog.prog_fd(), Hook::Msg, &[pseudo_header::METHOD.as_str()]);
 
     let client = Client::connect(addr, None).await;
     client.get(format!("http://{}", addr), &[]).await;
@@ -408,8 +401,12 @@ async fn parse_header_field_no_indexing_name_indexed_in_static_table() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let (prog, _h1, _h2, mids) =
-        attach_at(addr, &mut open_obj, Hook::Msg, &[header::AUTHORIZATION]);
+    let (prog, _h1, _h2, mids) = attach_at(
+        addr,
+        &mut open_obj,
+        Hook::Msg,
+        &[header::AUTHORIZATION.as_str()],
+    );
 
     let auth_val = HeaderValue::from_static("Basic YmVlbGluZTpiZWVsaW5l"); // beeper:beeper in base64
 
@@ -429,7 +426,7 @@ async fn parse_header_field_never_indexing_name_indexed_in_static_table() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let (prog, _h1, _h2, mids) = attach_at(addr, &mut open_obj, Hook::Msg, &[TEST_HEADER]);
+    let (prog, _h1, _h2, mids) = attach_at(addr, &mut open_obj, Hook::Msg, &[TEST_HEADER_NAME]);
 
     let mut test_header_val = HeaderValue::from_static("my secret");
     test_header_val.set_sensitive(true);
@@ -450,7 +447,7 @@ async fn parse_header_field_never_indexing_new_name() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let (prog, _h1, _h2, mids) = attach_at(addr, &mut open_obj, Hook::Msg, &[TEST_HEADER]);
+    let (prog, _h1, _h2, mids) = attach_at(addr, &mut open_obj, Hook::Msg, &[TEST_HEADER_NAME]);
 
     let mut test_header_val = HeaderValue::from_static("my secret");
     test_header_val.set_sensitive(true);
@@ -475,7 +472,7 @@ async fn parse_header_field_incremental_indexing_name_indexed_in_static_table() 
         addr,
         &mut open_obj,
         Hook::Msg,
-        &[header::USER_AGENT, pseudo_header::PATH],
+        &[header::USER_AGENT.as_str(), pseudo_header::PATH.as_str()],
     );
 
     let user_agent_val = HeaderValue::from_static("beeper");
@@ -507,7 +504,7 @@ async fn parse_header_field_incremental_indexing_new_name() {
         addr,
         &mut open_obj,
         Hook::Msg,
-        &[TEST_HEADER, pseudo_header::PATH],
+        &[TEST_HEADER_NAME, pseudo_header::PATH.as_str()],
     );
 
     let test_header_val = HeaderValue::from_static("beeper");
@@ -534,7 +531,10 @@ async fn parse_header_field_incremental_indexing_indexed_in_dynamic_table() {
         addr,
         &mut open_obj,
         Hook::Msg,
-        &[header::USER_AGENT, header::ACCEPT_LANGUAGE],
+        &[
+            header::USER_AGENT.as_str(),
+            header::ACCEPT_LANGUAGE.as_str(),
+        ],
     );
 
     let user_agent_val = HeaderValue::from_static("beeper");
@@ -611,7 +611,8 @@ async fn parse_header_field_incremental_indexing_not_huffman_encoded() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let (prog, _h1, h2, mids) = attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT]);
+    let (prog, _h1, h2, mids) =
+        attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT.as_str()]);
 
     let accept_val = HeaderValue::from_static("*/*");
     let test_header_val = HeaderValue::from_static("in-the-hive");
@@ -623,7 +624,7 @@ async fn parse_header_field_incremental_indexing_not_huffman_encoded() {
         .request(raw_request_block(
             &addr.to_string(),
             &[
-                (None, TEST_HEADER.as_str(), "in-the-hive"),
+                (None, TEST_HEADER_NAME, "in-the-hive"),
                 (Some(19), "accept", "*/*"),
             ],
         ))
@@ -638,8 +639,8 @@ async fn parse_header_field_incremental_indexing_not_huffman_encoded() {
     // an entry is sized by its name and value as text, whichever form they were
     // sent in
     let expected_dt = &[
-        (TEST_HEADER, test_header_val.clone()),
-        (header::ACCEPT, accept_val.clone()),
+        (TEST_HEADER_NAME, test_header_val.clone()),
+        (header::ACCEPT.as_str(), accept_val.clone()),
     ];
     let info = h2
         .dynamic_table_info(client.local_addr, client.remote_addr)
@@ -655,7 +656,8 @@ async fn resolve_index_of_entry_that_was_not_huffman_encoded() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let (prog, _h1, _h2, mids) = attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT]);
+    let (prog, _h1, _h2, mids) =
+        attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT.as_str()]);
 
     let accept_val = HeaderValue::from_static("*/*");
 
@@ -692,7 +694,8 @@ async fn ignore_frame_that_ends_before_it_claims_to() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let (prog, _h1, h2, mids) = attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT]);
+    let (prog, _h1, h2, mids) =
+        attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT.as_str()]);
 
     let mut client = RawClient::connect(addr).await;
 
@@ -741,7 +744,8 @@ async fn ignore_header_field_indexed_past_the_end_of_the_table() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let (prog, _h1, h2, mids) = attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT]);
+    let (prog, _h1, h2, mids) =
+        attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT.as_str()]);
 
     let mut client = RawClient::connect(addr).await;
 
@@ -770,7 +774,8 @@ async fn ignore_header_field_whose_value_runs_past_the_frame() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let (prog, _h1, h2, mids) = attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT]);
+    let (prog, _h1, h2, mids) =
+        attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT.as_str()]);
 
     let mut client = RawClient::connect(addr).await;
 
@@ -804,7 +809,8 @@ async fn parse_frame_after_an_unknown_one() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let (prog, _h1, _h2, mids) = attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT]);
+    let (prog, _h1, _h2, mids) =
+        attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT.as_str()]);
 
     let mut client = RawClient::connect(addr).await;
 
@@ -854,7 +860,7 @@ async fn evict_header_field_from_dynamic_table() {
         addr,
         &mut open_obj,
         Hook::Msg,
-        &[TEST_HEADER, header::USER_AGENT],
+        &[TEST_HEADER_NAME, header::USER_AGENT.as_str()],
     );
 
     let test_header_val = HeaderValue::from_static("asdfqwerasdfqwerasdfqwerasdfqwer");
@@ -875,9 +881,9 @@ async fn evict_header_field_from_dynamic_table() {
 
     let authority = addr.to_string();
     let expected_dt = &[
-        (TEST_HEADER, test_header_val.clone()),
+        (TEST_HEADER_NAME, test_header_val.clone()),
         (
-            pseudo_header::AUTHORITY,
+            pseudo_header::AUTHORITY.as_str(),
             HeaderValue::from_str(&authority.as_str()).unwrap(),
         ),
     ];
@@ -898,12 +904,12 @@ async fn evict_header_field_from_dynamic_table() {
         .dynamic_table_info(client.local_addr, client.remote_addr)
         .expect("dynamic_table_info");
     let expected_dt = &[
-        (TEST_HEADER, test_header_val.clone()),
+        (TEST_HEADER_NAME, test_header_val.clone()),
         (
-            pseudo_header::AUTHORITY,
+            pseudo_header::AUTHORITY.as_str(),
             HeaderValue::from_str(&authority.as_str()).unwrap(),
         ),
-        (header::USER_AGENT, user_agent_val.clone()),
+        (header::USER_AGENT.as_str(), user_agent_val.clone()),
     ];
     assert_eq!(info.max_size, 254);
     assert_eq!(info.count, expected_dt.len() as u32);
@@ -922,9 +928,9 @@ async fn evict_header_field_from_dynamic_table() {
         .dynamic_table_info(client.local_addr, client.remote_addr)
         .expect("dynamic_table_info");
     let expected_dt = &[
-        (TEST_HEADER, test_header_val.clone()),
-        (header::USER_AGENT, user_agent_val.clone()),
-        (header::USER_AGENT, test_header_val.clone()),
+        (TEST_HEADER_NAME, test_header_val.clone()),
+        (header::USER_AGENT.as_str(), user_agent_val.clone()),
+        (header::USER_AGENT.as_str(), test_header_val.clone()),
     ];
     assert_eq!(info.max_size, 254);
     assert_eq!(info.count, expected_dt.len() as u32);
@@ -965,7 +971,8 @@ async fn parse_padded_header_frame() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let (prog, _h1, h2, mids) = attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT]);
+    let (prog, _h1, h2, mids) =
+        attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT.as_str()]);
 
     let authority = addr.to_string();
     let padded_val = HeaderValue::from_static("padded");
@@ -1005,8 +1012,8 @@ async fn parse_padded_header_frame() {
         .expect("dynamic_table_info");
 
     let expected_dt = &[
-        (header::ACCEPT, padded_val.clone()),
-        (header::ACCEPT, next_val.clone()),
+        (header::ACCEPT.as_str(), padded_val.clone()),
+        (header::ACCEPT.as_str(), next_val.clone()),
     ];
     assert_eq!(
         info.count,
@@ -1021,7 +1028,8 @@ async fn parse_header_frame_that_carries_a_priority() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let (prog, _h1, h2, mids) = attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT]);
+    let (prog, _h1, h2, mids) =
+        attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT.as_str()]);
 
     let authority = addr.to_string();
     let accept_val = HeaderValue::from_static("after-the-priority");
@@ -1047,7 +1055,7 @@ async fn parse_header_frame_that_carries_a_priority() {
         .dynamic_table_info(client.local_addr, client.remote_addr)
         .expect("dynamic_table_info");
 
-    let expected_dt = &[(header::ACCEPT, accept_val.clone())];
+    let expected_dt = &[(header::ACCEPT.as_str(), accept_val.clone())];
     assert_eq!(
         info.count,
         expected_dt.len() as u32,
@@ -1065,7 +1073,7 @@ async fn resolve_index_of_entry_added_after_an_eviction() {
         addr,
         &mut open_obj,
         Hook::Msg,
-        &[TEST_HEADER, header::USER_AGENT],
+        &[TEST_HEADER_NAME, header::USER_AGENT.as_str()],
     );
 
     let long_val = HeaderValue::from_static("asdfqwerasdfqwerasdfqwerasdfqwer");
@@ -1118,7 +1126,8 @@ async fn parse_header_block_split_over_a_continuation_frame() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let (prog, _h1, h2, mids) = attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT]);
+    let (prog, _h1, h2, mids) =
+        attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT.as_str()]);
 
     let authority = addr.to_string();
     let accept_val = HeaderValue::from_static("in-the-continuation");
@@ -1139,7 +1148,7 @@ async fn parse_header_block_split_over_a_continuation_frame() {
         .dynamic_table_info(client.local_addr, client.remote_addr)
         .expect("dynamic_table_info");
 
-    let expected_dt = &[(header::ACCEPT, accept_val.clone())];
+    let expected_dt = &[(header::ACCEPT.as_str(), accept_val.clone())];
     assert_eq!(info.count, expected_dt.len() as u32);
     assert_eq!(info.size, dynamic_table_size_for_headers(expected_dt));
     assert_eq!(
@@ -1153,7 +1162,8 @@ async fn mark_the_table_as_drifted_when_a_continuation_frame_splits_a_field() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let (prog, _h1, h2, mids) = attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT]);
+    let (prog, _h1, h2, mids) =
+        attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT.as_str()]);
 
     let authority = addr.to_string();
     let accept_val = HeaderValue::from_static("across-the-break");
@@ -1186,7 +1196,8 @@ async fn update_dynamic_table_size_past_the_width_of_a_u16() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let (_prog, _h1, h2, _mids) = attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT]);
+    let (_prog, _h1, h2, _mids) =
+        attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT.as_str()]);
 
     // SETTINGS_HEADER_TABLE_SIZE is a 32 bit parameter, and a size above 64KiB
     // is one browsers do announce
@@ -1204,7 +1215,8 @@ async fn resolve_a_captured_index_against_the_table_it_was_read_from() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let (prog, _h1, _h2, mids) = attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT]);
+    let (prog, _h1, _h2, mids) =
+        attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT.as_str()]);
 
     let authority = addr.to_string();
     let first = HeaderValue::from_static("first");
@@ -1248,7 +1260,8 @@ async fn ignore_a_value_that_runs_into_the_frame_behind_it() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let (_prog, _h1, h2, _mids) = attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT]);
+    let (_prog, _h1, h2, _mids) =
+        attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT.as_str()]);
 
     let authority = addr.to_string();
     let mut client = RawClient::connect(addr).await;
@@ -1285,7 +1298,8 @@ async fn size_a_dynamic_table_entry_that_is_longer_than_an_entry_holds() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let (_prog, _h1, h2, _mids) = attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT]);
+    let (_prog, _h1, h2, _mids) =
+        attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT.as_str()]);
 
     let authority = addr.to_string();
     let long = "a".repeat(130);
@@ -1307,7 +1321,7 @@ async fn size_a_dynamic_table_entry_that_is_longer_than_an_entry_holds() {
         .dynamic_table_info(client.local_addr, client.remote_addr)
         .expect("dynamic_table_info");
 
-    let expected_dt = &[(header::ACCEPT, long_val.clone())];
+    let expected_dt = &[(header::ACCEPT.as_str(), long_val.clone())];
     assert_eq!(info.count, expected_dt.len() as u32);
     assert_eq!(
         info.size,
@@ -1325,7 +1339,7 @@ async fn ignore_an_index_that_only_wraps_into_the_table() {
         TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
 
     let _h1 = attach_h1_parser(prog.prog_fd(), Hook::Msg);
-    let (_h2, mids) = attach_h2_parser(prog.prog_fd(), Hook::Msg, &[header::ACCEPT]);
+    let (_h2, mids) = attach_h2_parser(prog.prog_fd(), Hook::Msg, &[header::ACCEPT.as_str()]);
 
     let authority = addr.to_string();
     let secret = HeaderValue::from_static("secret");
@@ -1384,7 +1398,7 @@ async fn match_a_field_name_by_the_whole_name() {
     assert!(coded_long.starts_with(&coded_short));
 
     let _h1 = attach_h1_parser(prog.prog_fd(), Hook::Msg);
-    let (_h2, mids) = attach_h2_parser(prog.prog_fd(), Hook::Msg, &[short]);
+    let (_h2, mids) = attach_h2_parser(prog.prog_fd(), Hook::Msg, &[short.as_str()]);
 
     let authority = addr.to_string();
     let mut block = vec![0x82, 0x86, 0x84];
@@ -1409,8 +1423,12 @@ async fn parse_header_field_indexed_in_static_table_in_skb() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let (prog, _h1, _h2, mids) =
-        attach_at(addr, &mut open_obj, Hook::Skb, &[pseudo_header::METHOD]);
+    let (prog, _h1, _h2, mids) = attach_at(
+        addr,
+        &mut open_obj,
+        Hook::Skb,
+        &[pseudo_header::METHOD.as_str()],
+    );
 
     // the preface and the client's SETTINGS usually arrive together, so the
     // frames behind the preface start in the middle of an sk_buff
@@ -1430,7 +1448,10 @@ async fn parse_header_field_incremental_indexing_indexed_in_dynamic_table_in_skb
         addr,
         &mut open_obj,
         Hook::Skb,
-        &[header::USER_AGENT, header::ACCEPT_LANGUAGE],
+        &[
+            header::USER_AGENT.as_str(),
+            header::ACCEPT_LANGUAGE.as_str(),
+        ],
     );
 
     let user_agent_val = HeaderValue::from_static("beeper");
@@ -1474,7 +1495,8 @@ async fn parse_every_frame_of_a_single_write_in_skb() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let (prog, _h1, h2, mids) = attach_at(addr, &mut open_obj, Hook::Skb, &[header::ACCEPT]);
+    let (prog, _h1, h2, mids) =
+        attach_at(addr, &mut open_obj, Hook::Skb, &[header::ACCEPT.as_str()]);
 
     let authority = addr.to_string();
     let mut client = RawClient::connect(addr).await;
@@ -1511,7 +1533,7 @@ async fn report_the_dynamic_table_on_a_skipped_frame(hook: Hook) {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let (prog, _h1, _h2, _mids) = attach_at(addr, &mut open_obj, hook, &[header::ACCEPT]);
+    let (prog, _h1, _h2, _mids) = attach_at(addr, &mut open_obj, hook, &[header::ACCEPT.as_str()]);
 
     let mut client = RawClient::connect(addr).await;
     client
@@ -1546,7 +1568,7 @@ async fn forget_a_connection(hook: Hook) {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let (prog, _h1, h2, mids) = attach_at(addr, &mut open_obj, hook, &[header::ACCEPT]);
+    let (prog, _h1, h2, mids) = attach_at(addr, &mut open_obj, hook, &[header::ACCEPT.as_str()]);
 
     let authority = addr.to_string();
     let mut client = RawClient::connect(addr).await;

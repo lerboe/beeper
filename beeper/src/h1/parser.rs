@@ -43,9 +43,9 @@ pub struct Parser {
     /// The extract function name for each message buffer.
     extract_fns: HashMap<MessageBuffer, String>,
 
-    /// The match id of every header captured so far, so that a header asked
-    /// for twice is captured once.
-    captures: HashMap<HeaderName, MatchId>,
+    /// The match id of every header captured so far, lowercased as the parser
+    /// matches it, so that a header asked for twice is captured once.
+    captures: HashMap<String, MatchId>,
 }
 
 xbpf::include_bpf!("h1/parser");
@@ -127,7 +127,9 @@ impl Parser {
     ///
     /// # Arguments
     ///
-    /// * `name` - The header name whose value to capture
+    /// * `name` - The header name whose value to capture, matched case
+    ///   insensitively. A [`PseudoHeader`] names a field of the request or
+    ///   status line.
     ///
     /// # Errors
     ///
@@ -139,23 +141,24 @@ impl Parser {
     /// The match ID that can be used in eBPF to extract the captured value. A
     /// header that is already captured keeps the ID it was given the first
     /// time, rather than being captured a second time under a new one.
-    pub fn capture_hdr(&mut self, name: &HeaderName) -> Result<MatchId, Error> {
-        if let Some(&mid) = self.captures.get(name) {
+    pub fn capture_hdr<H: AsRef<str>>(&mut self, name: H) -> Result<MatchId, Error> {
+        let name = name.as_ref().to_lowercase();
+        if let Some(&mid) = self.captures.get(&name) {
             return Ok(mid);
         }
 
-        let mid = self.capture_new_hdr(name)?;
-        self.captures.insert(name.clone(), mid);
+        let mid = self.capture_new_hdr(&name)?;
+        self.captures.insert(name, mid);
 
         Ok(mid)
     }
 
     /// Configures the parser to capture the value of a header field it does
     /// not capture yet, see [`Parser::capture_hdr`].
-    fn capture_new_hdr(&mut self, name: &HeaderName) -> Result<MatchId, Error> {
-        if name == &METHOD || name == &PATH {
+    fn capture_new_hdr(&mut self, name: &str) -> Result<MatchId, Error> {
+        if name == METHOD.as_str() || name == PATH.as_str() {
             return self.capture_status_line_hdr(name);
-        } else if name == &STATUS {
+        } else if name == STATUS.as_str() {
             return self.capture_status_code();
         }
 
@@ -163,7 +166,7 @@ impl Parser {
         let mut pattern = self.dfa.start_pattern(ANY_STATE);
         pattern
             .push(LF)
-            .push_ci(name.as_str())
+            .push_ci(name)
             .push_optional("\t", true)
             .push_optional(" ", true)
             .push_ci(":")
@@ -248,13 +251,13 @@ impl Parser {
     /// # Returns
     ///
     /// The match ID that can be used in eBPF to extract the captured value.
-    fn capture_status_line_hdr(&mut self, name: &HeaderName) -> Result<MatchId, Error> {
+    fn capture_status_line_hdr(&mut self, name: &str) -> Result<MatchId, Error> {
         let methods = [
             "POST", "GET", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE",
         ];
 
         let mid = self.new_match()?;
-        if name == &METHOD {
+        if name == METHOD.as_str() {
             self.dfa
                 .start_pattern(INIT_STATE)
                 .with(Action::StartCapture(mid))
@@ -265,7 +268,7 @@ impl Parser {
                 .push_ci(" HTTP/1.1")
                 .push_optional(CR, false)
                 .restart_with(LF);
-        } else if name == &PATH {
+        } else if name == PATH.as_str() {
             self.dfa
                 .start_pattern(INIT_STATE)
                 .push_options_ci(&methods)
@@ -505,10 +508,12 @@ mod tests {
     #[test]
     fn the_same_header_is_captured_under_one_match_id() {
         // the status line fields are each captured by a path of their own
-        for name in [hdr(0), METHOD, PATH, STATUS] {
+        let names: [&dyn AsRef<str>; 4] = [&hdr(0), &METHOD, &PATH, &STATUS];
+        for name in names {
+            let name = name.as_ref();
             let mut parser = Parser::new();
-            let first = parser.capture_hdr(&name).expect("capture header");
-            let second = parser.capture_hdr(&name).expect("capture header again");
+            let first = parser.capture_hdr(name).expect("capture header");
+            let second = parser.capture_hdr(name).expect("capture header again");
 
             assert_eq!(
                 first, second,

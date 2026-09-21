@@ -84,23 +84,50 @@ impl Display for Error {
     }
 }
 
-/// The names Beeper uses to address the fields of a request or status line.
+/// One of the fields of a request or status line.
 ///
 /// HTTP/2 carries them as pseudo-headers, HTTP/1.x as part of the first line
-/// of a message. They are spelled without the leading colon of their HTTP/2
-/// counterparts so that a single [`http::HeaderName`] addresses the same field
-/// in both protocols.
+/// of a message. A `PseudoHeaderName` is spelled the way HTTP/2 puts it on the
+/// wire, with the leading colon that tells it apart from a header field of the
+/// same name, and addresses the same field in either protocol. The constants
+/// of [`pseudo_header`] name the ones a parser understands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PseudoHeaderName(&'static str);
+
+impl PseudoHeaderName {
+    /// Returns the field as HTTP/2 spells it, e.g. `:path`.
+    pub const fn as_str(&self) -> &'static str {
+        self.0
+    }
+}
+
+impl AsRef<str> for PseudoHeaderName {
+    fn as_ref(&self) -> &str {
+        self.0
+    }
+}
+
+impl AsRef<[u8]> for PseudoHeaderName {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+/// The names Beeper uses to address the fields of a request or status line,
+/// see [`PseudoHeaderName`].
 pub mod pseudo_header {
+    use super::PseudoHeaderName;
+
     /// The method of a request, e.g. `GET`.
-    pub const METHOD: http::HeaderName = http::HeaderName::from_static("method");
+    pub const METHOD: PseudoHeaderName = PseudoHeaderName(":method");
     /// The path a request is addressed to, e.g. `/index.html`.
-    pub const PATH: http::HeaderName = http::HeaderName::from_static("path");
+    pub const PATH: PseudoHeaderName = PseudoHeaderName(":path");
     /// The status code of a response, e.g. `200`.
-    pub const STATUS: http::HeaderName = http::HeaderName::from_static("status");
+    pub const STATUS: PseudoHeaderName = PseudoHeaderName(":status");
     /// The authority of a request, e.g. `example.com`.
-    pub const AUTHORITY: http::HeaderName = http::HeaderName::from_static("authority");
+    pub const AUTHORITY: PseudoHeaderName = PseudoHeaderName(":authority");
     /// The scheme of a request, e.g. `example.com`.
-    pub const SCHEME: http::HeaderName = http::HeaderName::from_static("scheme");
+    pub const SCHEME: PseudoHeaderName = PseudoHeaderName(":scheme");
 }
 
 /// Identifies a state of the DFA.

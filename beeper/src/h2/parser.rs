@@ -25,15 +25,6 @@ extern crate plain;
 /// sync with `MAX_MATCHES` of beeper.h.
 const MAX_MATCHES: u8 = 32;
 
-/// Returns `name` as HTTP/2 spells it, i.e. with the leading colon of a
-/// pseudo-header, see [`crate::header`].
-fn wire_name(name: &HeaderName) -> String {
-    match name.as_str() {
-        "authority" | "method" | "path" | "scheme" | "status" => format!(":{name}"),
-        name => name.to_string(),
-    }
-}
-
 /// The index the first entry of a dynamic table is stored under. Must stay in
 /// sync with `DYNAMIC_TABLE_BASE` of h2/parser.bpf.c.
 const DYNAMIC_TABLE_BASE: u32 = 62;
@@ -62,9 +53,9 @@ pub struct Parser {
     /// The function name to retrieve dynamic table entries.
     get_dynamic_table_entry_fn: Option<String>,
 
-    /// The match id of every header captured so far, so that a header asked
-    /// for twice is captured once.
-    captures: HashMap<HeaderName, MatchId>,
+    /// The match id of every header captured so far, keyed by the name as it
+    /// travels the wire, so that a header asked for twice is captured once.
+    captures: HashMap<Vec<u8>, MatchId>,
 }
 
 xbpf::include_bpf!("h2/parser");
@@ -140,12 +131,13 @@ impl Parser {
     /// The field name is matched in its Huffman encoded form, which is how
     /// HPACK puts it on the wire. Fields the peer replaced with an index into
     /// the static or the dynamic table are matched against the entry the index
-    /// resolves to. Pseudo-headers are addressed without their leading colon,
-    /// see [`crate::header`].
+    /// resolves to. A [`PseudoHeader`] carries the leading colon HTTP/2 spells
+    /// it with, see [`crate::PseudoHeader`].
     ///
     /// # Arguments
     ///
-    /// * `name` - The header name whose value to capture
+    /// * `name` - The header name whose value to capture, as it travels the
+    ///   wire
     ///
     /// # Errors
     ///
@@ -157,13 +149,14 @@ impl Parser {
     /// The match ID that can be used in eBPF to extract the captured value. A
     /// header that is already captured keeps the ID it was given the first
     /// time, rather than being captured a second time under a new one.
-    pub fn capture_hdr(&mut self, name: &HeaderName) -> Result<MatchId, Error> {
+    pub fn capture_hdr<H: AsRef<[u8]>>(&mut self, name: H) -> Result<MatchId, Error> {
+        let name = name.as_ref();
         if let Some(&mid) = self.captures.get(name) {
             return Ok(mid);
         }
 
         let mut name_encoded = Vec::new();
-        huffman::encode(wire_name(name).as_bytes(), &mut name_encoded)?;
+        huffman::encode(name, &mut name_encoded)?;
 
         let mid = self.new_match()?;
         self.dfa
@@ -171,7 +164,7 @@ impl Parser {
             .push_bytes(&name_encoded)
             .with(Action::capture(mid));
 
-        self.captures.insert(name.clone(), mid);
+        self.captures.insert(name.to_vec(), mid);
 
         Ok(mid)
     }
@@ -574,15 +567,19 @@ mod tests {
 
     #[test]
     fn the_same_header_is_captured_under_one_match_id() {
-        // a pseudo-header is matched under the name `wire_name` gives it
-        for name in [hdr(0), METHOD, PATH, STATUS] {
+        // a pseudo-header is matched under the colon spelled name
+        let names: [&dyn AsRef<[u8]>; 4] = [&hdr(0), &METHOD, &PATH, &STATUS];
+        for name in names {
+            let name = name.as_ref();
             let mut parser = Parser::new();
-            let first = parser.capture_hdr(&name).expect("capture header");
-            let second = parser.capture_hdr(&name).expect("capture header again");
+            let first = parser.capture_hdr(name).expect("capture header");
+            let second = parser.capture_hdr(name).expect("capture header again");
 
             assert_eq!(
-                first, second,
-                "capturing {name} twice handed out two ids for one range"
+                first,
+                second,
+                "capturing {} twice handed out two ids for one range",
+                String::from_utf8_lossy(name)
             );
         }
     }

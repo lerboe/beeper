@@ -94,7 +94,7 @@ fn attach_h1_parser(
     prog_fd: i32,
     hook: Hook,
     match_preface: bool,
-    hdrs: &[HeaderName],
+    hdrs: &[&str],
 ) -> (h1::AttachedParser, Vec<MatchId>) {
     let mut h1 = h1::Parser::new();
     if match_preface {
@@ -143,7 +143,12 @@ async fn parse_simple_header() {
 
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
-    let (_h1, mids) = attach_h1_parser(prog.prog_fd(), Hook::Msg, true, &[header::USER_AGENT]);
+    let (_h1, mids) = attach_h1_parser(
+        prog.prog_fd(),
+        Hook::Msg,
+        true,
+        &[header::USER_AGENT.as_str()],
+    );
 
     let user_agent = HeaderValue::from_static("some user agent");
     let client = build_client();
@@ -164,7 +169,12 @@ async fn ignore_header_case() {
 
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
-    let (_h1, mids) = attach_h1_parser(prog.prog_fd(), Hook::Msg, true, &[header::USER_AGENT]);
+    let (_h1, mids) = attach_h1_parser(
+        prog.prog_fd(),
+        Hook::Msg,
+        true,
+        &[header::USER_AGENT.as_str()],
+    );
 
     // reqwest normalizes header names, so the request is written to the socket as is
     let user_agent = HeaderValue::from_static("beeper");
@@ -188,7 +198,12 @@ async fn ignores_header_whitespace() {
 
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
-    let (_h1, mids) = attach_h1_parser(prog.prog_fd(), Hook::Msg, true, &[header::USER_AGENT]);
+    let (_h1, mids) = attach_h1_parser(
+        prog.prog_fd(),
+        Hook::Msg,
+        true,
+        &[header::USER_AGENT.as_str()],
+    );
 
     // the whitespace between the colon and the value is not part of the value
     let user_agent = HeaderValue::from_static("beeper");
@@ -230,7 +245,10 @@ async fn parse_subsequent_headers() {
         prog.prog_fd(),
         Hook::Msg,
         true,
-        &[header::USER_AGENT, header::ACCEPT_LANGUAGE],
+        &[
+            header::USER_AGENT.as_str(),
+            header::ACCEPT_LANGUAGE.as_str(),
+        ],
     );
 
     let client = build_client();
@@ -260,7 +278,7 @@ async fn parse_status_line_only() {
         prog.prog_fd(),
         Hook::Msg,
         true,
-        &[pseudo_header::PATH, pseudo_header::METHOD],
+        &[pseudo_header::PATH.as_str(), pseudo_header::METHOD.as_str()],
     );
 
     let client = build_client();
@@ -288,7 +306,10 @@ async fn parse_status_line_and_subsequent_header() {
         prog.prog_fd(),
         Hook::Msg,
         true,
-        &[pseudo_header::PATH, header::CONTENT_LENGTH],
+        &[
+            pseudo_header::PATH.as_str(),
+            header::CONTENT_LENGTH.as_str(),
+        ],
     );
 
     let body = "Hello, world!";
@@ -318,7 +339,10 @@ async fn parse_status_code() {
         prog.prog_fd(),
         Hook::Msg,
         true,
-        &[pseudo_header::STATUS, header::CONTENT_LENGTH],
+        &[
+            pseudo_header::STATUS.as_str(),
+            header::CONTENT_LENGTH.as_str(),
+        ],
     );
 
     let body = "Hello, world!";
@@ -367,7 +391,7 @@ async fn match_a_star_in_a_header_name_literally() {
     // `*` is a legal character of a field name, and one the DFA spells "any
     // byte" with
     let starred = HeaderName::from_bytes(b"x*y").expect("header name");
-    let (_h1, mids) = attach_h1_parser(prog.prog_fd(), Hook::Msg, true, &[starred]);
+    let (_h1, mids) = attach_h1_parser(prog.prog_fd(), Hook::Msg, true, &[starred.as_str()]);
 
     let req = format!("GET / HTTP/1.1\r\nHost: {addr}\r\nxzy: beeper\r\n\r\n");
     _ = send_raw(addr, &req).await;
@@ -382,7 +406,12 @@ async fn keep_a_value_that_carries_high_bytes_together() {
 
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
-    let (_h1, mids) = attach_h1_parser(prog.prog_fd(), Hook::Msg, true, &[header::USER_AGENT]);
+    let (_h1, mids) = attach_h1_parser(
+        prog.prog_fd(),
+        Hook::Msg,
+        true,
+        &[header::USER_AGENT.as_str()],
+    );
 
     // a field value may carry obs-text, i.e. any byte from 0x80 to 0xFF. 0x8D
     // and 0x8A are the two that a parser masking its input down to seven bits
@@ -405,7 +434,12 @@ async fn capture_nothing_for_an_empty_value() {
 
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
-    let (_h1, mids) = attach_h1_parser(prog.prog_fd(), Hook::Msg, true, &[header::USER_AGENT]);
+    let (_h1, mids) = attach_h1_parser(
+        prog.prog_fd(),
+        Hook::Msg,
+        true,
+        &[header::USER_AGENT.as_str()],
+    );
 
     // an empty value is legal, and there is nothing to capture in it. The
     // fields behind it are not part of it either
@@ -427,7 +461,12 @@ async fn parse_a_header_in_the_first_half_of_a_long_message() {
 
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
-    let (_h1, mids) = attach_h1_parser(prog.prog_fd(), Hook::Msg, true, &[header::USER_AGENT]);
+    let (_h1, mids) = attach_h1_parser(
+        prog.prog_fd(),
+        Hook::Msg,
+        true,
+        &[header::USER_AGENT.as_str()],
+    );
 
     // the parser walks the first 0x7FFF bytes of a message. The field below
     // sits well inside of them, the padding behind it pushes the message well
@@ -457,7 +496,12 @@ async fn parse_lf_endings() {
 
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
-    let (_h1, mids) = attach_h1_parser(prog.prog_fd(), Hook::Msg, true, &[header::USER_AGENT]);
+    let (_h1, mids) = attach_h1_parser(
+        prog.prog_fd(),
+        Hook::Msg,
+        true,
+        &[header::USER_AGENT.as_str()],
+    );
 
     // section 2.2 of RFC 9112 lets a recipient read a bare LF as a line terminator
     let user_agent = HeaderValue::from_static("beeper");
@@ -479,7 +523,7 @@ async fn parse_lf_endings() {
 
 //     let mut open_obj = OpenObject::new();
 //     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
-//     let (_h1, mids) = attach_h1_parser(prog.prog_fd(), Hook::Msg,  true, &[header::USER_AGENT]);
+//     let (_h1, mids) = attach_h1_parser(prog.prog_fd(), Hook::Msg,  true, &[header::USER_AGENT.as_str()]);
 
 //     // section 2.2 of RFC 9112 lets a recipient read a bare LF as a line terminator
 //     let user_agent = HeaderValue::from_static("beeper");
@@ -524,7 +568,12 @@ async fn parse_simple_header_in_skb() {
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach_to(addr, &mut open_obj, Direction::Downstream, Hook::Skb)
         .expect("attach");
-    let (_h1, mids) = attach_h1_parser(prog.prog_fd(), Hook::Skb, true, &[header::USER_AGENT]);
+    let (_h1, mids) = attach_h1_parser(
+        prog.prog_fd(),
+        Hook::Skb,
+        true,
+        &[header::USER_AGENT.as_str()],
+    );
 
     let user_agent = HeaderValue::from_static("some user agent");
     let client = build_client();
@@ -549,7 +598,10 @@ async fn report_the_fields_that_were_matched() {
         prog.prog_fd(),
         Hook::Msg,
         true,
-        &[header::USER_AGENT, header::ACCEPT_LANGUAGE],
+        &[
+            header::USER_AGENT.as_str(),
+            header::ACCEPT_LANGUAGE.as_str(),
+        ],
     );
 
     // the request is no preface and carries no language, so of the three
