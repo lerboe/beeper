@@ -207,7 +207,7 @@ impl Parser {
             hf_key.resize(128, 0);
             hf_val.resize(128, 0);
 
-            let hf = header_field {
+            let hf = hdr_field {
                 key: hf_key.try_into().unwrap(),
                 key_len,
                 val: hf_val.try_into().unwrap(),

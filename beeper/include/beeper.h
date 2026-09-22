@@ -102,7 +102,7 @@ struct h2_frame {
 // appeared on the wire. `key_huff` and `val_huff` say whether that was the
 // Huffman coded form; a peer may send either, so a reader that hands an entry
 // on has to say which one it is holding.
-struct header_field {
+struct hdr_field {
     u8 key[BEEPER_H2_FIELD_MAXLEN];
     u8 key_len;
     u8 val[BEEPER_H2_FIELD_MAXLEN];
@@ -303,7 +303,7 @@ struct trans {
 // still live one. Returns 0 on success, -1 if there is no such entry.
 #define BEEPER_H2_GET_DT_ENTRY(name)                                                               \
     __noinline int name(const struct ip4_conn *conn __arg_nonnull, u32 idx,                        \
-                        struct header_field *out __arg_nonnull) {                                  \
+                        struct hdr_field *out __arg_nonnull) {                                     \
         int ret = -1;                                                                              \
                                                                                                    \
         __sink(conn);                                                                              \
