@@ -1,5 +1,5 @@
 #include "vmlinux.h"
-#include "beeper.h"
+#include "beeper/http1.h"
 #include "xbpf.h"
 #include <bpf/bpf_helpers.h>
 
@@ -215,7 +215,7 @@ bool matched(const struct parse_res *pres __arg_nonnull, u8 idx) {
 // Returns 0 on success, -1 if nothing was captured for `idx` or if the range
 // lies outside of the part of the message the program can read.
 SEC("freplace")
-int extract_match_msg(const struct sk_msg_md *msg, const struct parse_res *pres __arg_nonnull, u8 idx, struct hdr_str* str __arg_nonnull) {
+int extract_match_msg(const struct sk_msg_md *msg, const struct parse_res *pres __arg_nonnull, u8 idx, struct bytes* str __arg_nonnull) {
     if (idx >= MAX_MATCHES) return -1;
 
     struct hdr_match m = pres->ms[idx & MAX_MATCH_MASK];
@@ -236,7 +236,7 @@ int extract_match_msg(const struct sk_msg_md *msg, const struct parse_res *pres 
 // points into `skb`, so it is only valid until the program invalidates its data
 // pointers.
 SEC("freplace")
-int extract_match_skb(const struct __sk_buff *skb, const struct parse_res *pres __arg_nonnull, u8 idx, struct hdr_str* str __arg_nonnull) {
+int extract_match_skb(const struct __sk_buff *skb, const struct parse_res *pres __arg_nonnull, u8 idx, struct bytes* str __arg_nonnull) {
     if (idx >= MAX_MATCHES) return -1;
 
     struct hdr_match m = pres->ms[idx & MAX_MATCH_MASK];

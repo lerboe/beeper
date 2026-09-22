@@ -7,8 +7,8 @@
 //! user space.
 //!
 //! The target program declares the functions it wants Beeper to provide with
-//! the `BEEPER_*` macros of `beeper.h` and then names them in the [`h1`] or
-//! [`h2`] builder:
+//! the `BEEPER_*` macros of `beeper/http1.h` or `beeper/http2.h` and then
+//! names them in the [`h1`] or [`h2`] builder:
 //!
 //! ```no_run
 //! # fn main() -> Result<(), beeper::Error> {

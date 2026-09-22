@@ -1,5 +1,5 @@
 #include "vmlinux.h"
-#include "beeper.h"
+#include "beeper/http2.h"
 #include "xbpf.h"
 #include <bpf/bpf_helpers.h>
 
@@ -11,7 +11,7 @@
 
 // The number of bytes of a name or a value that are kept in a table entry.
 // Longer fields are truncated, which bounds the copies for the verifier.
-// `hdr_field`, which both tables are made of, is declared in beeper.h so
+// `h2_hdr_field`, which both tables are made of, is declared in beeper/http2.h so
 // that a target program reading dynamic table entries with
 // `BEEPER_H2_GET_DT_ENTRY` agrees on its layout.
 #define HEADER_FIELD_MAXLEN BEEPER_H2_FIELD_MAXLEN
@@ -53,7 +53,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, STATIC_TABLE_SIZE+1);
     __type(key, u32);
-    __type(value, struct hdr_field);
+    __type(value, struct h2_hdr_field);
 } static_table SEC(".maps");
 
 // The dynamic table is per connection, and its entries are addressed by the
@@ -66,7 +66,7 @@ struct dynamic_table_key {
 // An entry of the dynamic table, along with the size it accounts for in the
 // table, which is computed from the decoded lengths of its name and value.
 struct dynamic_table_entry {
-    struct hdr_field field;
+    struct h2_hdr_field field;
     u32 size;
 };
 
@@ -464,7 +464,7 @@ static __always_inline void _next(u16 state, u8 input, u16 *next_state, u16 *act
 // Looks up the field the HPACK index `idx` refers to, in the static table if it
 // is one of the first `STATIC_TABLE_SIZE` indices and in the dynamic table of
 // `conn` otherwise. `*hf` is NULL if there is no such entry.
-static __always_inline void _get_table_entry(const struct ip4_conn *conn __arg_nonnull, const struct dynamic_table_info *dt_info __arg_nonnull, u32 idx, struct hdr_field **hf) {
+static __always_inline void _get_table_entry(const struct ip4_conn *conn __arg_nonnull, const struct dynamic_table_info *dt_info __arg_nonnull, u32 idx, struct h2_hdr_field **hf) {
     if (!_is_valid_hpack_index(dt_info, idx)) {
         *hf = NULL;
         return;
@@ -483,7 +483,7 @@ static __always_inline void _get_table_entry(const struct ip4_conn *conn __arg_n
 
         // `field` is the first member of `dynamic_table_entry`, so this cast
         // preserves NULL and avoids an extra branch on the lookup result.
-        *hf = (struct hdr_field *)bpf_map_lookup_elem(&dynamic_table, &key);
+        *hf = (struct h2_hdr_field *)bpf_map_lookup_elem(&dynamic_table, &key);
     }
     else {
         *hf = bpf_map_lookup_elem(&static_table, &idx);
@@ -817,7 +817,7 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
             .huff = false,
         };
 
-        struct hdr_field *hf = NULL;
+        struct h2_hdr_field *hf = NULL;
         _get_table_entry(&ctx->conn, dt_info, idx, &hf);
         if (hf == NULL) return 0;
 
@@ -1185,11 +1185,11 @@ int parse_skb(struct __sk_buff *skb, u32 off, struct parse_res *pres __arg_nonnu
 // as `_get_table_entry` counts it. Returns 0 on success, -1 if there is no
 // such entry.
 SEC("freplace")
-int get_dt_entry(const struct ip4_conn *conn __arg_nonnull, u32 idx, struct hdr_field *out __arg_nonnull) {
+int get_dt_entry(const struct ip4_conn *conn __arg_nonnull, u32 idx, struct h2_hdr_field *out __arg_nonnull) {
     struct dynamic_table_info *dt_info = bpf_map_lookup_elem(&dynamic_table_info, conn);
     if (dt_info == NULL) return -1;
 
-    struct hdr_field *hf = NULL;
+    struct h2_hdr_field *hf = NULL;
     _get_table_entry(conn, dt_info, idx, &hf);
     if (hf == NULL) return -1;
 
@@ -1200,13 +1200,13 @@ int get_dt_entry(const struct ip4_conn *conn __arg_nonnull, u32 idx, struct hdr_
 
 // Points `str` at the value captured for the match `m`, resolving it against
 // `ctx`. Returns 0 on success, -1 if the value cannot be resolved.
-static __always_inline int _extract_str(const struct msg_ctx *ctx, const struct hdr_match *m, struct hdr_str *str) {
+static __always_inline int _extract_str(const struct msg_ctx *ctx, const struct hdr_match *m, struct bytes *str) {
     u8 *ptr = NULL;
     u32 len = 0;
     _extract_match(ctx, m, false, &ptr, &len, NULL);
     if (ptr == NULL) return -1;
 
-    *str = (struct hdr_str) {
+    *str = (struct bytes) {
         .len = len,
         .ptr = ptr
     };
@@ -1230,7 +1230,7 @@ bool matched(const struct parse_res *pres __arg_nonnull, u8 idx) {
 // Returns 0 on success, -1 if nothing was captured for `idx` or if the value
 // can no longer be resolved.
 SEC("freplace")
-int extract_match_msg(const struct sk_msg_md *msg, const struct parse_res *pres __arg_nonnull, u8 idx, struct hdr_str *str __arg_nonnull) {
+int extract_match_msg(const struct sk_msg_md *msg, const struct parse_res *pres __arg_nonnull, u8 idx, struct bytes *str __arg_nonnull) {
     if (idx >= MAX_MATCHES) return -1;
 
     struct hdr_match m = pres->ms[idx & MAX_MATCH_MASK];
@@ -1244,7 +1244,7 @@ int extract_match_msg(const struct sk_msg_md *msg, const struct parse_res *pres 
 // points into `skb` is only valid until the program invalidates its data
 // pointers.
 SEC("freplace")
-int extract_match_skb(const struct __sk_buff *skb, const struct parse_res *pres __arg_nonnull, u8 idx, struct hdr_str *str __arg_nonnull) {
+int extract_match_skb(const struct __sk_buff *skb, const struct parse_res *pres __arg_nonnull, u8 idx, struct bytes *str __arg_nonnull) {
     if (idx >= MAX_MATCHES) return -1;
 
     struct hdr_match m = pres->ms[idx & MAX_MATCH_MASK];

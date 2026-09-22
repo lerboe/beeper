@@ -51,9 +51,9 @@ let h2 = h2
     .attach(prog_fd)?;
 ```
 
-Next, in your eBPF program, import the `beeper.h` header, define the stub functions, and call them with the input buffer:
+Next, in your eBPF program, import the header of the protocol you parse, define the stub functions, and call them with the input buffer:
 ```c
-#include "beeper.h"
+#include "beeper/http2.h"
 
 // stub funcs
 BEEPER_EXTRACT_MATCH_MSG(extract_h2_match)
@@ -69,7 +69,7 @@ int msg_verdict(struct sk_msg_md *msg) {
     struct h2_frame frame = { 0 };
     int msg_len = parse_h2(msg, &pres, &frame);
     if (msg_len >= 0) {
-        struct hdr_str path = { 0 };
+        struct bytes path = { 0 };
         if (extract_h2_match(msg, &pres, h2_path_mid, &path) == 0) {
             // note that path can be Huffman-encoded
         }

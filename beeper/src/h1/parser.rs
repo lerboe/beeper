@@ -18,7 +18,7 @@ const CR: &str = "\r";
 const LF: &str = "\n";
 
 /// The number of ranges a parser can be configured to capture. Must stay in
-/// sync with `MAX_MATCHES` of beeper.h.
+/// sync with `MAX_MATCHES` of beeper/beeper.h.
 const MAX_MATCHES: u8 = 32;
 
 /// A parser for HTTP/1.x messages.

@@ -1,4 +1,5 @@
-#include "beeper.h"
+#include "beeper/http1.h"
+#include "beeper/http2.h"
 #include "xbpf.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
@@ -98,7 +99,7 @@ static __always_inline void store_matched(const struct parse_res *pres, bool is_
 
 // Stores the value `extract` found for the match `i` in `matches`, or clears
 // the match if there is none.
-static __always_inline void store_match(u32 i, int res, const struct hdr_str *str) {
+static __always_inline void store_match(u32 i, int res, const struct bytes *str) {
     if (res != 0) {
         bpf_map_delete_elem(&matches, &i);
         return;
@@ -179,7 +180,7 @@ int msg_verdict(struct sk_msg_md *msg) {
 
         u32 i = 0;
         bpf_for(i, 0, 32) {
-            struct hdr_str str = { 0 };
+            struct bytes str = { 0 };
             int res = is_h2 ? extract_h2_match_msg(msg, &pres, i, &str) : extract_h1_match_msg(msg, &pres, i, &str);
             store_match(i, res, &str);
         }
@@ -295,7 +296,7 @@ int skb_verdict(struct __sk_buff *skb) {
 
         u32 i = 0;
         bpf_for(i, 0, 32) {
-            struct hdr_str str = { 0 };
+            struct bytes str = { 0 };
             int res = is_h2 ? extract_h2_match_skb(skb, &pres, i, &str) : extract_h1_match_skb(skb, &pres, i, &str);
             store_match(i, res, &str);
         }

@@ -21,7 +21,7 @@ use xbpf::libbpf::{
 extern crate plain;
 
 /// The number of ranges a parser can be configured to capture. Must stay in
-/// sync with `MAX_MATCHES` of beeper.h.
+/// sync with `MAX_MATCHES` of beeper/beeper.h.
 const MAX_MATCHES: u8 = 32;
 
 /// The index the first entry of a dynamic table is stored under. Must stay in
@@ -207,7 +207,7 @@ impl Parser {
             hf_key.resize(128, 0);
             hf_val.resize(128, 0);
 
-            let hf = hdr_field {
+            let hf = h2_hdr_field {
                 key: hf_key.try_into().unwrap(),
                 key_len,
                 val: hf_val.try_into().unwrap(),

@@ -1,4 +1,5 @@
-#include "beeper.h"
+#include "beeper/http1.h"
+#include "beeper/http2.h"
 #include "xbpf.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
@@ -88,11 +89,11 @@ static __always_inline void log_h1_request(struct sk_msg_md *msg, struct parse_r
     struct log_scratch *scratch = bpf_map_lookup_elem(&log_scratch_map, &zero);
     if (!scratch) return;
 
-    struct hdr_str path = { 0 };
+    struct bytes path = { 0 };
     if (extract_h1_match(msg, pres, h1_path_mid, &path) < 0) return;
     copy_bounded(path.ptr, path.len, scratch->a);
 
-    struct hdr_str lang = { 0 };
+    struct bytes lang = { 0 };
     if (extract_h1_match(msg, pres, h1_accept_language_mid, &lang) == 0) {
         copy_bounded(lang.ptr, lang.len, scratch->b);
         bpf_debug("--> %s accept-language: %s", scratch->a, scratch->b);
@@ -108,7 +109,7 @@ static __always_inline void log_h1_response(struct sk_msg_md *msg, struct parse_
     struct log_scratch *scratch = bpf_map_lookup_elem(&log_scratch_map, &zero);
     if (!scratch) return;
 
-    struct hdr_str status = { 0 };
+    struct bytes status = { 0 };
     if (extract_h1_match(msg, pres, h1_status_mid, &status) < 0) return;
     copy_bounded(status.ptr, status.len, scratch->a);
 
