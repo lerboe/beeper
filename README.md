@@ -28,7 +28,7 @@ gRPC          | WIP     |
 
 ## Use cases
 
-[hyper-fast-path](https://github.com/lerboe/hyper-fast-path) uses beeper to serve static assets from the kernel. This improves the throughput of HTTP servers by up to 2.8x.
+[hyper-fast-path](https://github.com/lerboe/hyper-fast-path) uses beeper to serve static assets from the kernel. This improves the throughput of HTTP servers by up to **4.5x**.
 
 ## Usage
 
