@@ -1181,42 +1181,6 @@ int parse_skb(struct __sk_buff *skb, u32 off, struct parse_res *pres __arg_nonnu
     return frame_len;
 }
 
-// Parses the frame `buf_ptr` starts with. A buffer carries no connection of its
-// own, so `conn` has to name the one it belongs to for the dynamic table to be
-// found. Only HEADERS frames are decoded. See `parse_msg` for the return value.
-SEC("freplace")
-int parse_buf(const struct bpf_dynptr *buf_ptr, struct ip4_conn *conn, struct parse_res *pres __arg_nonnull, struct h2_frame *frame __arg_nonnull, struct null_prefix *null_prefix) {
-    u8 *data = bpf_dynptr_data(buf_ptr, 0, 9);
-    if (data == NULL) return -1;
-
-    u32 len = data[0] << 16 | data[1] << 8 | data[2];
-    u8 type = data[3];
-    u8 flags = data[4];
-    u32 frame_len = H2_FRAME_HDR_LEN + len;
-
-    *frame = _new_h2_frame(data, type, flags);
-
-    bpf_debug("Parsing HTTP/2 buf with length %d, type %d, flags %d", len, type, flags);
-
-    if (type != H2_HEADERS_FRAME && type != H2_CONTINUATION_FRAME) {
-        return frame_len;
-    }
-
-    data = bpf_dynptr_data(buf_ptr, 0, frame_len);
-    if (data == NULL) return -1;
-
-    struct msg_ctx ctx = {
-        .data = data,
-        .data_end = data + frame_len,
-        .conn = *conn
-    };
-
-    u16 start = 0, end = 0;
-    if (_h2_block(ctx.data, ctx.data_end, len, type, flags, &start, &end) < 0) return -1;
-
-    return _parse_hdr_frame(&ctx, start, end, type, flags, pres, null_prefix);
-}
-
 // Reads the `idx`th entry of `conn`'s dynamic table into `out`, `idx` counted
 // as `_get_table_entry` counts it. Returns 0 on success, -1 if there is no
 // such entry.

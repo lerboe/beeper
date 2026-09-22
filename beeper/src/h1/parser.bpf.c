@@ -200,24 +200,6 @@ int parse_skb(struct __sk_buff *skb, u32 off, struct parse_res *pres __arg_nonnu
     return res > 0 ? res - (int)off : res + (int)off;
 }
 
-// Parses the header block of the first `len` bytes of `buf_ptr`. Unlike a
-// message or a packet, a buffer is contiguous, so there is nothing to pull in
-// and a single pass is enough. See `parse_msg` for the return value.
-SEC("freplace")
-int parse_buf(const struct bpf_dynptr *buf_ptr, u32 len, struct parse_res *pres __arg_nonnull, struct null_prefix *null_prefix) {
-    u32 cidx[MAX_MATCHES] = { 0 };
-    u16 s = s_init;
-
-    u8 *data = bpf_dynptr_data(buf_ptr, 0, len);
-    if (data == NULL) return -1;
-
-    u8 *data_end = data + len;
-
-    int res = _parse_from(data, data_end, 0, pres->ms, cidx, &s, null_prefix);
-
-    return res;
-}
-
 // Returns whether the parser captured a range for the match `idx`.
 SEC("freplace")
 bool matched(const struct parse_res *pres __arg_nonnull, u8 idx) {
