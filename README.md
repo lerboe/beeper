@@ -26,7 +26,7 @@ HTTP/1.1      | ✅      | 6.8
 HTTP/2        | ✅      | 6.8
 gRPC          | WIP     | 
 
-## Use cases
+## Use Cases
 
 [hyper-fast-path](https://github.com/lerboe/hyper-fast-path) uses beeper to serve static assets from the kernel. This improves the throughput of HTTP servers by up to **4.5x**.
 
