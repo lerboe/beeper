@@ -1181,12 +1181,52 @@ int parse_skb(struct __sk_buff *skb, u32 off, struct parse_res *pres __arg_nonnu
     return frame_len;
 }
 
+// The bytes of the buffer a dynptr was walked over last, one copy per CPU.
+// `bpf_dynptr_data` only hands out a slice of a length the verifier knows at
+// load time, which the length of a frame never is, so the parser reads the
+// bytes out of the dynptr and walks the copy instead.
+//
+// ponytail: one copy per CPU, so what `extract_match_buf` points into holds
+// until the next parse on the same CPU. A program that sleeps between parsing
+// and extracting would need the copy keyed by something narrower.
+struct buf_copy {
+    u8 data[MAX_BYTES + 1];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, struct buf_copy);
+} buf_copies SEC(".maps");
+
+// Reads the first `*len` bytes of `buf_ptr` into this CPU's copy and returns
+// where they landed, cutting `*len` down to the bytes the copy holds. Returns
+// NULL if the buffer is shorter than that, i.e. if the bytes are not there.
+//
+// It is kept out of line on purpose: the verifier does not track a dynptr that
+// was spilled to the stack, and inlining this into a caller that holds a few
+// more values live is enough for clang to spill the one it is handed.
+static __noinline u8 *_copy_buf(const struct bpf_dynptr *buf_ptr, u32 *len) {
+    u32 zero = 0;
+    struct buf_copy *buf = bpf_map_lookup_elem(&buf_copies, &zero);
+    if (buf == NULL) return NULL;
+
+    bpf_clamp_uminmax(*len, 0, MAX_BYTES);
+    if (bpf_dynptr_read(buf->data, *len, buf_ptr, 0, 0) < 0) return NULL;
+
+    return buf->data;
+}
+
 // Parses the frame `buf_ptr` starts with. A buffer carries no connection of its
 // own, so `conn` has to name the one it belongs to for the dynamic table to be
 // found. Only HEADERS frames are decoded. See `parse_msg` for the return value.
 SEC("freplace")
 int parse_buf(const struct bpf_dynptr *buf_ptr, struct ip4_conn *conn, struct parse_res *pres __arg_nonnull, struct h2_frame *frame __arg_nonnull, struct null_prefix *null_prefix) {
-    u8 *data = bpf_dynptr_data(buf_ptr, 0, 9);
+    if (conn == NULL) return -1;
+
+    u32 copied = H2_FRAME_HDR_LEN;
+    u8 *data = _copy_buf(buf_ptr, &copied);
     if (data == NULL) return -1;
 
     u32 len = data[0] << 16 | data[1] << 8 | data[2];
@@ -1202,8 +1242,9 @@ int parse_buf(const struct bpf_dynptr *buf_ptr, struct ip4_conn *conn, struct pa
         return frame_len;
     }
 
-    data = bpf_dynptr_data(buf_ptr, 0, frame_len);
-    if (data == NULL) return -1;
+    copied = frame_len;
+    data = _copy_buf(buf_ptr, &copied);
+    if (data == NULL || copied < frame_len) return -1;
 
     struct msg_ctx ctx = {
         .data = data,
@@ -1287,5 +1328,31 @@ int extract_match_skb(const struct __sk_buff *skb, const struct parse_res *pres 
     if (m.len == 0) return -1;
 
     struct msg_ctx ctx = _new_skb_ctx(skb);
+    return _extract_str(&ctx, &m, str);
+}
+
+// Same as `extract_match`, for a match taken out of a buffer. A value that was
+// spelled out in the buffer points into the copy `parse_buf` made of it, so it
+// is only valid until the next parse on the same CPU. `conn` names the
+// connection the buffer belongs to, the buffer itself carries none.
+SEC("freplace")
+int extract_match_buf(const struct bpf_dynptr *buf_ptr, const struct ip4_conn *conn __arg_nonnull, const struct parse_res *pres __arg_nonnull, u8 idx, struct hdr_str *str __arg_nonnull) {
+    if (idx >= MAX_MATCHES) return -1;
+
+    struct hdr_match m = pres->ms[idx & MAX_MATCH_MASK];
+    if (m.len == 0) return -1;
+
+    struct msg_ctx ctx = { .conn = *conn };
+
+    // a value the peer only referenced by index is read out of the tables, so
+    // only one spelled out in the buffer needs the bytes at hand
+    if (m.in_msg) {
+        u32 len = (u32)m.idx + m.len;
+        ctx.data = _copy_buf(buf_ptr, &len);
+        if (ctx.data == NULL) return -1;
+
+        ctx.data_end = ctx.data + len;
+    }
+
     return _extract_str(&ctx, &m, str);
 }

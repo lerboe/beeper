@@ -47,6 +47,10 @@ pub enum Hook {
 
     /// `sk_skb`, as the messages arrive.
     Skb,
+
+    /// A buffer handed over as a dynptr, parsed on demand rather than on a
+    /// socket. See [`TestProgram::parse_h1_buf`].
+    Buf,
 }
 
 impl Hook {
@@ -54,6 +58,7 @@ impl Hook {
         match self {
             Hook::Msg => "msg",
             Hook::Skb => "skb",
+            Hook::Buf => "buf",
         }
     }
 }
@@ -63,6 +68,7 @@ impl From<Hook> for MessageBuffer {
         match hook {
             Hook::Msg => MessageBuffer::Msg,
             Hook::Skb => MessageBuffer::Skb,
+            Hook::Buf => MessageBuffer::DynPtr,
         }
     }
 }
@@ -150,6 +156,8 @@ impl<'obj> TestProgram<'obj> {
                 skel.progs.skb_parser.attach_sockmap(sock_map_fd)?;
                 skel.progs.skb_verdict.attach_sockmap(sock_map_fd)?;
             }
+            // a buffer arrives at no socket, the test hands it over itself
+            Hook::Buf => {}
         }
 
         debug!("Test program attached");
@@ -199,11 +207,82 @@ impl<'obj> TestProgram<'obj> {
         (bss.last_dt_count_before, bss.last_dt_count)
     }
 
+    /// Parses `buf` with the HTTP/1.x parser attached at [`Hook::Buf`] and
+    /// returns what it reported.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the buffer does not fit, or if the program that
+    /// hands it over cannot be run.
+    pub fn parse_h1_buf(&self, buf: &[u8]) -> Result<i32> {
+        self.parse_buf(buf, None)
+    }
+
+    /// Same as [`TestProgram::parse_h1_buf`], for the HTTP/2 parser. The
+    /// buffer is parsed as the connection between `local` and `remote`, which
+    /// is what the parser keys its dynamic table with.
+    pub fn parse_h2_buf(&self, buf: &[u8], local: SocketAddr, remote: SocketAddr) -> Result<i32> {
+        self.parse_buf(buf, Some((local, remote)))
+    }
+
+    /// Hands `buf` to the buffer parsers, as HTTP/2 if `conn` names the
+    /// connection it belongs to and as HTTP/1.x otherwise.
+    fn parse_buf(&self, buf: &[u8], conn: Option<(SocketAddr, SocketAddr)>) -> Result<i32> {
+        let mut args = buf_args {
+            len: buf.len() as u32,
+            is_h2: MaybeUninit::new(conn.is_some()),
+            ..Default::default()
+        };
+
+        if buf.len() > args.data.len() {
+            return Err(Error::new(ErrorKind::InvalidInput, "buffer does not fit").into());
+        }
+        args.data[..buf.len()].copy_from_slice(buf);
+
+        if let Some((local, remote)) = conn {
+            args.conn = ip4_conn {
+                local: ip4_addr(local),
+                remote: ip4_addr(remote),
+            };
+        }
+
+        let key = 0u32;
+        self.skel.maps.buf_input.update(
+            unsafe { key.as_bytes() },
+            unsafe { args.as_bytes() },
+            MapFlags::ANY,
+        )?;
+
+        let input = ProgramInput::default();
+        Ok(self
+            .skel
+            .progs
+            .parse_buf_input
+            .test_run(input)?
+            .return_value as i32)
+    }
+
     /// Returns the file descriptor of the program a parser attaches to.
     pub fn prog_fd(&self) -> i32 {
         match self.hook {
             Hook::Msg => self.skel.progs.msg_verdict.as_fd().as_raw_fd(),
             Hook::Skb => self.skel.progs.skb_verdict.as_fd().as_raw_fd(),
+            Hook::Buf => self.skel.progs.parse_buf_input.as_fd().as_raw_fd(),
         }
+    }
+}
+
+/// Converts `addr` into the address the BPF programs key a connection with.
+///
+/// # Panics
+///
+/// Panics if `addr` is an IPv6 address, which beeper does not support.
+fn ip4_addr(addr: SocketAddr) -> types::ip4_addr {
+    match addr {
+        SocketAddr::V4(addr) => types::ip4_addr {
+            ip4: u32::from_ne_bytes(addr.ip().octets()),
+            port: addr.port() as u32,
+        },
+        SocketAddr::V6(_) => panic!("ip4_addr does not support IPv6 addresses"),
     }
 }

@@ -200,6 +200,43 @@ int parse_skb(struct __sk_buff *skb, u32 off, struct parse_res *pres __arg_nonnu
     return res > 0 ? res - (int)off : res + (int)off;
 }
 
+// The bytes of the buffer a dynptr was walked over last, one copy per CPU.
+// `bpf_dynptr_data` only hands out a slice of a length the verifier knows at
+// load time, which the length of a message never is, so the parser reads the
+// bytes out of the dynptr and walks the copy instead.
+//
+// ponytail: one copy per CPU, so what `extract_match_buf` points into holds
+// until the next parse on the same CPU. A program that sleeps between parsing
+// and extracting would need the copy keyed by something narrower.
+struct buf_copy {
+    u8 data[MAX_BYTES + 1];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, struct buf_copy);
+} buf_copies SEC(".maps");
+
+// Reads the first `*len` bytes of `buf_ptr` into this CPU's copy and returns
+// where they landed, cutting `*len` down to the bytes the copy holds. Returns
+// NULL if the buffer is shorter than that, i.e. if the bytes are not there.
+//
+// It is kept out of line on purpose: the verifier does not track a dynptr that
+// was spilled to the stack, and inlining this into a caller that holds a few
+// more values live is enough for clang to spill the one it is handed.
+static __noinline u8 *_copy_buf(const struct bpf_dynptr *buf_ptr, u32 *len) {
+    u32 zero = 0;
+    struct buf_copy *buf = bpf_map_lookup_elem(&buf_copies, &zero);
+    if (buf == NULL) return NULL;
+
+    bpf_clamp_uminmax(*len, 0, MAX_BYTES);
+    if (bpf_dynptr_read(buf->data, *len, buf_ptr, 0, 0) < 0) return NULL;
+
+    return buf->data;
+}
+
 // Parses the header block of the first `len` bytes of `buf_ptr`. Unlike a
 // message or a packet, a buffer is contiguous, so there is nothing to pull in
 // and a single pass is enough. See `parse_msg` for the return value.
@@ -208,7 +245,7 @@ int parse_buf(const struct bpf_dynptr *buf_ptr, u32 len, struct parse_res *pres 
     u32 cidx[MAX_MATCHES] = { 0 };
     u16 s = s_init;
 
-    u8 *data = bpf_dynptr_data(buf_ptr, 0, len);
+    u8 *data = _copy_buf(buf_ptr, &len);
     if (data == NULL) return -1;
 
     u8 *data_end = data + len;
@@ -264,6 +301,27 @@ int extract_match_skb(const struct __sk_buff *skb, const struct parse_res *pres 
     u8 *data_end = (u8 *)(long)skb->data_end;
 
     if (data + m.idx + m.len > data_end) return -1;
+
+    str->ptr = data + m.idx;
+    str->len = m.len;
+
+    return 0;
+}
+
+// Same as `extract_match`, for a match taken out of a buffer. The range points
+// into the copy `parse_buf` made of it, so it is only valid until the next
+// parse on the same CPU.
+SEC("freplace")
+int extract_match_buf(const struct bpf_dynptr *buf_ptr, const struct parse_res *pres __arg_nonnull, u8 idx, struct hdr_str* str __arg_nonnull) {
+    if (idx >= MAX_MATCHES) return -1;
+
+    struct hdr_match m = pres->ms[idx & MAX_MATCH_MASK];
+    if (m.len == 0) return -1;
+
+    u32 end = (u32)m.idx + m.len;
+    u32 len = end;
+    u8 *data = _copy_buf(buf_ptr, &len);
+    if (data == NULL || len < end) return -1;
 
     str->ptr = data + m.idx;
     str->len = m.len;

@@ -62,6 +62,12 @@ BEEPER_H1_PARSE_SKB(parse_h1_skb)
 BEEPER_EXTRACT_MATCH_SKB(extract_h2_match_skb)
 BEEPER_H2_PARSE_SKB(parse_h2_skb)
 
+BEEPER_H1_EXTRACT_MATCH_BUF(extract_h1_match_buf)
+BEEPER_H1_PARSE_BUF(parse_h1_buf)
+
+BEEPER_H2_EXTRACT_MATCH_BUF(extract_h2_match_buf)
+BEEPER_H2_PARSE_BUF(parse_h2_buf)
+
 extern void *bpf_cast_to_kern_ctx(void *obj) __ksym;
 
 // Returns where the message a stream parser cut out of `skb` starts. The kernel
@@ -302,6 +308,79 @@ int skb_verdict(struct __sk_buff *skb) {
     }
 
     return SK_PASS;
+}
+
+// The most bytes of a buffer a test can hand to `parse_buf_input`.
+#define MAX_BUF_INPUT 1024
+
+// The buffer to parse, written by the test before it runs `parse_buf_input`.
+// `conn` names the connection it belongs to, which only an HTTP/2 parse needs:
+// a buffer carries no connection of its own.
+struct buf_args {
+    struct ip4_conn conn;
+    u32 len;
+    bool is_h2;
+    u8 data[MAX_BUF_INPUT];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, struct buf_args);
+} buf_input SEC(".maps");
+
+// Parses the buffer of `buf_input` and records what the parser captured in
+// `matches`, the way the socket hooks do it for a message. The hooks that hand
+// out a dynptr are none a test can drive, so the buffer parsers are run over a
+// dynptr built on a map value instead.
+//
+// Returns what the parser returned for the buffer.
+SEC("syscall")
+int parse_buf_input(void *ctx) {
+    u32 zero = 0;
+    struct buf_args *args = bpf_map_lookup_elem(&buf_input, &zero);
+    if (args == NULL) return -1;
+
+    u32 len = args->len;
+    if (len > MAX_BUF_INPUT) return -1;
+    bpf_clamp_uminmax(len, 0, MAX_BUF_INPUT);
+
+    struct bpf_dynptr buf;
+    if (bpf_dynptr_from_mem(args->data, len, 0, &buf) < 0) return -1;
+
+    bool is_h2 = args->is_h2;
+    struct parse_res pres = { 0 };
+    int res;
+
+    if (is_h2) {
+        struct h2_frame frame = { 0 };
+        res = parse_h2_buf(&buf, &args->conn, &pres, &frame, NULL);
+
+        last_dt_count_before = frame.dt_count_before;
+        last_dt_count = frame.dt_count;
+    }
+    else {
+        res = parse_h1_buf(&buf, len, &pres, NULL);
+    }
+
+    if (res < 0) return res;
+
+    u32 mask = 0;
+    u32 i = 0;
+    bpf_for(i, 0, 32) {
+        bool matched = is_h2 ? matched_h2(&pres, i) : matched_h1(&pres, i);
+        if (matched) mask |= (u32)1 << i;
+
+        struct hdr_str str = { 0 };
+        int mres = is_h2 ? extract_h2_match_buf(&buf, &args->conn, &pres, i, &str)
+                         : extract_h1_match_buf(&buf, &pres, i, &str);
+        store_match(i, mres, &str);
+    }
+
+    last_matches = mask;
+
+    return res;
 }
 
 // Adds both ends of every connection to the server under test to `sock_map`, so

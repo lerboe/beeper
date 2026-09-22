@@ -296,6 +296,44 @@ struct trans {
         return ret;                                                                                \
     }
 
+// Creates `name`, a stub reading the match at `idx` out of the buffer
+// `buf_ptr` points at (`h1::Parser::extract_fn`, `MessageBuffer::DynPtr`).
+#define BEEPER_H1_EXTRACT_MATCH_BUF(name)                                                          \
+    __noinline int name(const struct bpf_dynptr *buf_ptr,                                          \
+                        const struct parse_res *pres __arg_nonnull, u8 idx,                        \
+                        struct hdr_str *str __arg_nonnull) {                                       \
+        int ret = -1;                                                                              \
+                                                                                                   \
+        __sink(buf_ptr);                                                                           \
+        __sink(pres);                                                                              \
+        __sink(idx);                                                                               \
+        __sink(str);                                                                               \
+        __sink(ret);                                                                               \
+                                                                                                   \
+        return ret;                                                                                \
+    }
+
+// Creates `name`, a stub reading the match at `idx` out of the buffer
+// `buf_ptr` points at (`h2::Parser::extract_fn`, `MessageBuffer::DynPtr`). A
+// match the peer only referenced by index is read out of the HPACK tables of
+// `conn` instead, which is why the buffer parser takes the connection along.
+#define BEEPER_H2_EXTRACT_MATCH_BUF(name)                                                          \
+    __noinline int name(const struct bpf_dynptr *buf_ptr,                                          \
+                        const struct ip4_conn *conn __arg_nonnull,                                 \
+                        const struct parse_res *pres __arg_nonnull, u8 idx,                        \
+                        struct hdr_str *str __arg_nonnull) {                                       \
+        int ret = -1;                                                                              \
+                                                                                                   \
+        __sink(buf_ptr);                                                                           \
+        __sink(conn);                                                                              \
+        __sink(pres);                                                                              \
+        __sink(idx);                                                                               \
+        __sink(str);                                                                               \
+        __sink(ret);                                                                               \
+                                                                                                   \
+        return ret;                                                                                \
+    }
+
 // Creates `name`, a stub reading the `idx`th entry of the dynamic table of the
 // connection a message parsed with an HTTP/2 parser belongs to
 // (`h2::Parser::get_dynamic_table_entry`). `idx` is counted the HPACK way, i.e. 1

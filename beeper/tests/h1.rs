@@ -622,3 +622,64 @@ async fn report_the_fields_that_were_matched() {
         "only the user agent is matched"
     );
 }
+
+/// Attaches the test program at [`Hook::Buf`]. A buffer arrives at no socket,
+/// so there is no server to talk to and the address is only a placeholder.
+fn attach_buf_program(open_obj: &mut OpenObject) -> TestProgram<'_> {
+    TestProgram::attach_to("127.0.0.1:1", open_obj, Direction::Downstream, Hook::Buf)
+        .expect("attach")
+}
+
+#[test]
+fn parse_headers_in_buf() {
+    let mut open_obj = OpenObject::new();
+    let prog = attach_buf_program(&mut open_obj);
+    let (_h1, mids) = attach_h1_parser(
+        prog.prog_fd(),
+        Hook::Buf,
+        true,
+        &[
+            header::USER_AGENT.as_str(),
+            header::ACCEPT_LANGUAGE.as_str(),
+        ],
+    );
+
+    let req = "GET / HTTP/1.1\r\nhost: beeper\r\nuser-agent: some user agent\r\n\r\n";
+    let res = prog.parse_h1_buf(req.as_bytes()).expect("parse buffer");
+
+    assert_eq!(res, req.len() as i32, "the whole header block was parsed");
+    assert_match_eq(
+        &prog,
+        mids[0],
+        Some(&HeaderValue::from_static("some user agent")),
+    );
+
+    // the buffer carries no language, so nothing is captured for it
+    assert_match_eq(&prog, mids[1], None);
+    assert_eq!(
+        prog.last_matches(),
+        1 << u8::from(mids[0]),
+        "only the user agent is matched"
+    );
+}
+
+#[test]
+fn report_a_buf_that_ends_mid_message() {
+    let mut open_obj = OpenObject::new();
+    let prog = attach_buf_program(&mut open_obj);
+    let (_h1, _mids) = attach_h1_parser(
+        prog.prog_fd(),
+        Hook::Buf,
+        true,
+        &[header::USER_AGENT.as_str()],
+    );
+
+    let req = "GET / HTTP/1.1\r\nuser-agent: some user";
+    let res = prog.parse_h1_buf(req.as_bytes()).expect("parse buffer");
+
+    assert_eq!(
+        res,
+        -(req.len() as i32),
+        "the parser ran out of bytes and reports what it looked at"
+    );
+}

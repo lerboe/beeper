@@ -375,6 +375,8 @@ fn conn_at(
     match hook {
         Hook::Msg => (local_addr, remote_addr),
         Hook::Skb => (remote_addr, local_addr),
+        // a buffer names the connection it is parsed as itself
+        Hook::Buf => (local_addr, remote_addr),
     }
 }
 
@@ -1634,4 +1636,74 @@ async fn forget_a_connection_in_msg() {
 #[tokio::test]
 async fn forget_a_connection_in_skb() {
     forget_a_connection(Hook::Skb).await;
+}
+
+/// Attaches the test program at [`Hook::Buf`] along with an HTTP/2 parser
+/// capturing `hdrs`. A buffer arrives at no socket, so there is no server to
+/// talk to and the address of the program is only a placeholder.
+fn attach_buf_program<'obj>(
+    open_obj: &'obj mut OpenObject,
+    hdrs: &[&str],
+) -> (TestProgram<'obj>, h2::AttachedParser, Vec<MatchId>) {
+    let prog = TestProgram::attach_to("127.0.0.1:1", open_obj, Direction::Downstream, Hook::Buf)
+        .expect("attach program");
+    let (h2, mids) = attach_h2_parser(prog.prog_fd(), Hook::Buf, hdrs);
+
+    (prog, h2, mids)
+}
+
+/// The connection a buffer is parsed as. It names no socket of its own, the
+/// parser only keys its per connection state with it.
+fn buf_conn() -> (SocketAddr, SocketAddr) {
+    (
+        "127.0.0.1:4242".parse().expect("local"),
+        "127.0.0.1:8080".parse().expect("remote"),
+    )
+}
+
+#[test]
+fn parse_header_field_in_buf() {
+    let mut open_obj = OpenObject::new();
+    let (prog, h2, mids) = attach_buf_program(&mut open_obj, &[header::ACCEPT.as_str()]);
+
+    let (local, remote) = buf_conn();
+    let block = raw_request_block("beeper", &[(Some(19), "accept", "text/plain")]);
+    let buf = frame(0x01, 0x05, 1, &block);
+
+    let res = prog
+        .parse_h2_buf(&buf, local, remote)
+        .expect("parse buffer");
+
+    assert_eq!(res, buf.len() as i32, "the whole frame was parsed");
+
+    // the block spells its values out rather than Huffman coding them, so the
+    // capture comes back as it was sent
+    assert_eq!(
+        prog.get_match(mids[0]).expect("get_match").as_deref(),
+        Some(b"text/plain".as_slice()),
+    );
+
+    // the field was sent with incremental indexing, so it is in the table now
+    let info = h2
+        .dynamic_table_info(local, remote)
+        .expect("connection is known")
+        .expect("dynamic_table_info");
+    assert_eq!(info.count, 1);
+}
+
+#[test]
+fn resolve_header_field_indexed_in_static_table_in_buf() {
+    let mut open_obj = OpenObject::new();
+    let (prog, _h2, mids) = attach_buf_program(&mut open_obj, &[pseudo_header::METHOD.as_str()]);
+
+    let (local, remote) = buf_conn();
+    let block = raw_request_block("beeper", &[]);
+    let buf = frame(0x01, 0x05, 1, &block);
+
+    prog.parse_h2_buf(&buf, local, remote)
+        .expect("parse buffer");
+
+    // `:method: GET` travels as a single index, so its value is not in the
+    // buffer at all and has to come out of the static table
+    assert_match_eq(&prog, mids[0], Some(&HeaderValue::from_static("GET")));
 }
