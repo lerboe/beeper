@@ -32,13 +32,20 @@ gRPC          | WIP     |
 
 ## Usage
 
-First, in the Rust program, create a new parser instance, add the desired headers that it should parse, and attach it to an existing eBPF program:
+First, in the Rust program, create a new parser instance, add the desired headers that it should capture, and attach it to an existing eBPF program:
 ```rust
-use beeper::{MessageBuffer, h2};
+use beeper::{MessageBuffer, h2, pseudo_header::PATH};
+use http::header::CONTENT_LENGTH;
 
-let h2 = h2::Parser::new()
-    .capture_hdr(&beeper::header::PATH)?
-    .capture_hdr(&http::header::CONTENT_LENGTH)?
+let mut h2 = h2::Parser::new();
+let path_mid = h2.capture_hdr(&PATH)?;
+let content_length_mid = h2.capture_hdr(&CONTENT_LENGTH)?;
+
+// hand the match ids to the eBPF program before it is loaded
+rodata.h2_path_mid = path_mid.into();
+rodata.h2_content_length_mid = content_length_mid.into();
+
+let h2 = h2
     .parse_fn("parse_h2", MessageBuffer::Msg)
     .extract_fn("extract_h2_match", MessageBuffer::Msg)
     .attach(prog_fd)?;
@@ -52,9 +59,9 @@ Next, in your eBPF program, import the `beeper.h` header, define the stub functi
 BEEPER_EXTRACT_MATCH_MSG(extract_h2_match)
 BEEPER_H2_PARSE_MSG(parse_h2)
 
-// the header matches occur in the same order as configured in user space
-#define H2_PATH_MID 0
-#define H2_CONTENT_LENGTH_MID 1
+// the match ids the parser handed back, set by user space
+volatile const u8 h2_path_mid;
+volatile const u8 h2_content_length_mid;
 
 SEC("sk_msg")
 int msg_verdict(struct sk_msg_md *msg) {
@@ -63,14 +70,17 @@ int msg_verdict(struct sk_msg_md *msg) {
     int msg_len = parse_h2(msg, &pres, &frame);
     if (msg_len >= 0) {
         struct hdr_str path = { 0 };
-        if (extract_h2_match(msg, &pres, H2_PATH_MID, &path) == 0) {
+        if (extract_h2_match(msg, &pres, h2_path_mid, &path) == 0) {
             // note that path can be Huffman-encoded
         }
     }
+
+    return SK_PASS;
 }
 ```
 
-Finally, to make this all compile, beeper relies on [xbpf](https://github.com/lerboe/xbpf). Add the following to `build.rs`:
+Finally, to make this all compile, beeper relies on [xbpf](https://crates.io/crates/xbpf). Add the following to `build.rs`:
+
 ```rust
 use beeper::build::clang_args;
 use xbpf::build::Builder;
