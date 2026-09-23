@@ -196,7 +196,7 @@ dependencies = [
  "tokio",
  "tracing",
  "utils",
- "xbpf",
+ "xbpf 0.0.4",
 ]
 
 [[package]]
@@ -434,7 +434,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -449,7 +449,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "xbpf",
+ "xbpf 0.0.3",
 ]
 
 [[package]]
@@ -1227,7 +1227,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1374,7 +1374,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1431,7 +1431,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1741,7 +1741,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2014,7 +2014,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "xbpf",
+ "xbpf 0.0.3",
 ]
 
 [[package]]
@@ -2148,7 +2148,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2314,6 +2314,20 @@ name = "xbpf"
 version = "0.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4279f972c12786565d3e9ce5fc9c2412a773fc260bca14df836b91a347b0781"
+dependencies = [
+ "glob",
+ "libbpf-cargo",
+ "libbpf-rs",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "xbpf"
+version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e545e20d5daea40d878fe63df16061c306b136bf691d5c8a5167f8f4cc9ce86"
 dependencies = [
  "glob",
  "libbpf-cargo",

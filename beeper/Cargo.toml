@@ -24,10 +24,10 @@ httlib-huffman = "0.3.4"
 libc = "0.2.189"
 plain = "0.2.3"
 tracing = "0.1.44"
-xbpf = "0.0.3"
+xbpf = "0.0.4"
 
 [build-dependencies]
-xbpf = { version = "0.0.3", features = ["build"] }
+xbpf = { version = "0.0.4", features = ["build"] }
 
 [dev-dependencies]
 reqwest = "0.13.4"
