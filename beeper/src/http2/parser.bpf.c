@@ -679,6 +679,8 @@ static __always_inline int _parse_stg_from(const struct msg_ctx *ctx, u16 start,
     u32 val = 0;
 
     bpf_for(i, start, len+1) {
+        // the byte past the frame belongs to the next one
+        if (i >= len) break;
         if (data + i + 1 > data_end) break;
         u8 c = data[i];
 
@@ -892,6 +894,12 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
     if (ps->kind == HTTP2A_TABLE_SIZE) {
         bpf_debug("hdr: table size update: %u", ps->v);
         dt_info->max_size = ps->v;
+
+        // a table that shrinks evicts its oldest entries right away, see
+        // section 4.3 of RFC 7541. Evicting them only once the next entry is
+        // added would miss an update to 0 that clears the table, followed by
+        // one that grows it back
+        _try_evict_dynamic_table_entries(ctx, dt_info, 0);
         return 0;
     }
 
