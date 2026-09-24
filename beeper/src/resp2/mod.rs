@@ -17,7 +17,9 @@
 //! table is injected into the BPF parser program. The kernel side walks the
 //! array and the length of every bulk string, skips the string itself and
 //! captures the ones it was configured to. Their contents are never walked, so
-//! they may hold any byte, CRLF included.
+//! they may hold any byte, CRLF included. An array holds up to [`MAX_ARGS`]
+//! elements of any of the types above; an array nested in another one is not
+//! parsed.
 
 mod parser;
 

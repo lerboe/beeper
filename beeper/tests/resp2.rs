@@ -310,3 +310,65 @@ async fn parse_every_reply_of_a_pipeline() {
 
     assert_match_eq(&prog, mid, Some(b"value"));
 }
+
+#[tokio::test]
+async fn capture_bulk_string_elements_of_an_array_reply() {
+    let redis = server::launch_redis().await.expect("launch redis");
+
+    let mut open_obj = OpenObject::new();
+    let prog = TestProgram::attach_resp2(redis.addr, &mut open_obj, Direction::Upstream, Hook::Msg)
+        .expect("attach");
+    let (_resp2, mids) = attach_resp2_parser(prog.prog_fd(), Hook::Msg, &[0, 1]);
+
+    let mut stream = TcpStream::connect(redis.addr).await.expect("connect");
+    request(&mut stream, &cmd(&[b"SET", b"a", b"x"]), b"+OK\r\n").await;
+
+    // the missing key is a null element
+    let reply = b"*2\r\n$1\r\nx\r\n$-1\r\n";
+    request(&mut stream, &cmd(&[b"MGET", b"a", b"missing"]), reply).await;
+
+    assert_match_eq(&prog, mids[0], Some(b"x"));
+    assert_match_eq(&prog, mids[1], None);
+}
+
+#[tokio::test]
+async fn capture_integer_elements_of_an_array_reply() {
+    let redis = server::launch_redis().await.expect("launch redis");
+
+    let mut open_obj = OpenObject::new();
+    let prog = TestProgram::attach_resp2(redis.addr, &mut open_obj, Direction::Upstream, Hook::Msg)
+        .expect("attach");
+    let (_resp2, mids) = attach_resp2_parser(prog.prog_fd(), Hook::Msg, &[0, 1]);
+
+    let mut stream = TcpStream::connect(redis.addr).await.expect("connect");
+    request(&mut stream, &cmd(&[b"SADD", b"s", b"m"]), b":1\r\n").await;
+
+    let reply = b"*2\r\n:1\r\n:0\r\n";
+    request(&mut stream, &cmd(&[b"SMISMEMBER", b"s", b"m", b"n"]), reply).await;
+
+    assert_match_eq(&prog, mids[0], Some(b"1"));
+    assert_match_eq(&prog, mids[1], Some(b"0"));
+}
+
+#[tokio::test]
+async fn capture_simple_string_and_error_elements_of_an_array_reply() {
+    let redis = server::launch_redis().await.expect("launch redis");
+
+    let mut open_obj = OpenObject::new();
+    let prog = TestProgram::attach_resp2(redis.addr, &mut open_obj, Direction::Upstream, Hook::Msg)
+        .expect("attach");
+    let (_resp2, mids) = attach_resp2_parser(prog.prog_fd(), Hook::Msg, &[0, 1]);
+
+    // a transaction replies with the reply of every command it ran
+    let mut stream = TcpStream::connect(redis.addr).await.expect("connect");
+    request(&mut stream, &cmd(&[b"MULTI"]), b"+OK\r\n").await;
+    request(&mut stream, &cmd(&[b"SET", b"k", b"v"]), b"+QUEUED\r\n").await;
+    request(&mut stream, &cmd(&[b"INCR", b"k"]), b"+QUEUED\r\n").await;
+
+    let err = b"ERR value is not an integer or out of range";
+    let reply = [b"*2\r\n+OK\r\n-", &err[..], b"\r\n"].concat();
+    request(&mut stream, &cmd(&[b"EXEC"]), &reply).await;
+
+    assert_match_eq(&prog, mids[0], Some(b"OK"));
+    assert_match_eq(&prog, mids[1], Some(err));
+}
