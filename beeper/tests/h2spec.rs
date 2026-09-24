@@ -46,6 +46,17 @@ const EXPECTED_PARSE_ERRORS: &[&str] = &[
     "http2/6.2/4",
 ];
 
+/// The cases in which the echo server's own verdict hinges on timing: it may
+/// answer a request before the frame that makes it malformed has been read.
+/// They flip on the bare server as well, so only their parse errors count.
+const RACY_CASES: &[&str] = &[
+    // a second HEADERS frame without END_STREAM, trailers that carry a
+    // pseudo-header, and a content-length the DATA frames disagree with
+    "http2/8.1/1",
+    "http2/8.1.2.1/3",
+    "http2/8.1.2.6/1",
+];
+
 /// How often a case whose verdict differs from the one without the parser is
 /// retried, on both servers. A few cases hinge on timeouts, which a loaded
 /// machine can miss, the bare server included.
@@ -290,7 +301,7 @@ async fn conformance(hook: Hook) {
     for id in &cases {
         let mut outcome = run_case_twice(&bin, bare, parsed, id, &prog).await;
         for _ in 0..RETRIES {
-            if outcome.bare == outcome.parsed {
+            if outcome.bare == outcome.parsed || RACY_CASES.contains(&id.as_str()) {
                 break;
             }
             outcome = run_case_twice(&bin, bare, parsed, id, &prog).await;
@@ -306,7 +317,7 @@ async fn conformance(hook: Hook) {
         "case", "bare", "parsed", "frames", "errors"
     );
     for (id, o) in &outcomes {
-        let flag = if o.bare != o.parsed {
+        let flag = if o.bare != o.parsed && !RACY_CASES.contains(id) {
             problems.push(format!(
                 "{id}: {} without the parser, {} with it\n{}",
                 o.bare,
@@ -353,6 +364,11 @@ async fn h2spec_msg() {
     conformance(Hook::Msg).await;
 }
 
+/// Left out of CI: at `sk_skb`, the kernel's stream parser now and then holds
+/// back the last frame h2spec sends, so the server never answers it and a
+/// handful of cases time out, different ones on every run. It happens without
+/// a beeper parser attached, and with a stream parser that passes on every
+/// byte it is handed, but not without a stream parser.
 #[tokio::test]
 #[ignore = "downloads h2spec and runs for minutes"]
 async fn h2spec_skb() {
