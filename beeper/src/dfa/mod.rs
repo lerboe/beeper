@@ -186,7 +186,7 @@ impl<A: Copy + Debug + PartialEq + Eq> DfaBuilder<'_, A> {
         to: Option<StateId>,
         case_sensitive: bool,
     ) -> StateId {
-        let to = to.unwrap_or(self.dfa.next_state(&from, &input));
+        let to = to.unwrap_or_else(|| self.dfa.next_state(&from, &input));
 
         self.dfa.insert_edge(from, input, to, None);
         if !case_sensitive && let Some(other) = other_case(input) {
@@ -323,6 +323,19 @@ impl<A: Copy + Debug + PartialEq + Eq> DfaBuilder<'_, A> {
             case_sensitive: true,
             repeat,
         });
+        self
+    }
+
+    /// Appends `input` to the pattern, case sensitively, and lets its last
+    /// byte lead into `to`, so that the pattern joins another one there.
+    pub fn push_to(&mut self, input: &str, to: StateId) -> &mut Self {
+        let (last, init) = input
+            .as_bytes()
+            .split_last()
+            .expect("Cannot push an empty input");
+
+        self.push_inner(init, true);
+        self.push_edge(Input::from(*last), Some(to), true);
         self
     }
 
