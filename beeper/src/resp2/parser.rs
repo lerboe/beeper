@@ -22,12 +22,15 @@ pub struct Resp2 {
     /// The match id of every argument captured so far, by its position in the
     /// command.
     args: [Option<MatchId>; MAX_ARGS],
+
+    /// The match id of the payload of a reply, if it is captured.
+    reply: Option<MatchId>,
 }
 
-/// A parser for RESP2 commands.
+/// A parser for RESP2 commands and replies.
 ///
-/// The builder methods configure which arguments the parser captures and
-/// which functions of the target program it replaces. Nothing is loaded into
+/// The builder methods configure which arguments and replies the parser
+/// captures and which functions of the target program it replaces. Nothing is loaded into
 /// the kernel until [`Parser::attach`] is called.
 pub type Parser = dfa_parser::Parser<Resp2>;
 
@@ -71,6 +74,81 @@ impl Parser {
         Ok(mid)
     }
 
+    /// Configures the parser to capture the payload of a reply.
+    ///
+    /// The payload is what a simple string (`+OK`), an error (`-ERR ...`), an
+    /// integer (`:1`) or a bulk string (`$5\r\nvalue`) carries, without its
+    /// type, its length or its CRLF. The type is the first byte of the
+    /// message. A null bulk string (`$-1`) captures nothing.
+    ///
+    /// A reply that is an array of bulk strings is walked like a command, so
+    /// its elements are captured with [`Parser::capture_arg`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the parser already captures as many ranges as the
+    /// parser program has room for.
+    ///
+    /// # Returns
+    ///
+    /// The match ID that can be used in eBPF to extract the captured value. It
+    /// is the same every time the method is called.
+    pub fn capture_reply(&mut self) -> Result<MatchId, Error> {
+        if let Some(mid) = self.proto.reply {
+            return Ok(mid);
+        }
+
+        let mid = self.new_match()?;
+        self.proto.reply = Some(mid);
+
+        Ok(mid)
+    }
+
+    /// Configures the parser to walk a reply that is no array of bulk strings,
+    /// and to stop behind it. See [`Parser::match_commands`] for the ones that
+    /// are.
+    fn match_replies(&mut self) {
+        let reply = self.proto.reply;
+
+        // the payload of a simple string, an error or an integer runs up to
+        // the CRLF, as it is not prefixed with its length
+        for kind in ["+", "-", ":"] {
+            let mut pattern = self.dfa.start_pattern(INIT_STATE);
+            pattern.push(kind);
+            if let Some(mid) = reply {
+                pattern.with(Action::StartCapture(mid));
+            }
+
+            pattern.push_any(1..);
+            if let Some(mid) = reply {
+                pattern.with(Action::EndCapture(mid));
+            }
+
+            pattern.push(CRLF).with(Action::Done);
+        }
+
+        self.dfa
+            .start_pattern(INIT_STATE)
+            .push("$")
+            .push_any(1..)
+            .with(Action::LenDigit)
+            .push(CRLF)
+            .with(Action::Skip(reply))
+            .push(CRLF)
+            .with(Action::Done);
+
+        // a null bulk string, a null array and an empty array carry nothing.
+        // Their `-` and `0` are no length, but spelled out, which the length
+        // above only reads if nothing else matches
+        for empty in ["$-1", "*-1", "*0"] {
+            self.dfa
+                .start_pattern(INIT_STATE)
+                .push(empty)
+                .push(CRLF)
+                .with(Action::Done);
+        }
+    }
+
     /// Configures the parser to walk a command of up to [`MAX_ARGS`] arguments
     /// and to stop behind its last one, so that the next command of a
     /// pipeline is left to a parse of its own.
@@ -104,8 +182,8 @@ impl Parser {
     /// Every function configured with [`Parser::parse_fn`],
     /// [`Parser::matched_fn`] or [`Parser::extract_fn`] is replaced in the
     /// target program, the remaining parser programs are left unloaded. The
-    /// parser always stops behind the first command of a message, and reports
-    /// the number of bytes it takes up.
+    /// parser always stops behind the first command or reply of a message,
+    /// and reports the number of bytes it takes up.
     ///
     /// # Arguments
     ///
@@ -118,6 +196,7 @@ impl Parser {
     /// matching signature.
     pub fn attach(mut self, target: i32) -> Result<AttachedParser, Error> {
         self.match_commands();
+        self.match_replies();
         load(&self, target)
     }
 }
@@ -145,7 +224,7 @@ mod tests {
         };
 
         let (mut s, mut len, mut skip) = (INIT_STATE, 0usize, 0usize);
-        let mut ms = HashMap::new();
+        let (mut ms, mut starts) = (HashMap::new(), HashMap::new());
         for (i, &c) in msg.iter().enumerate() {
             if skip > 0 {
                 skip -= 1;
@@ -167,6 +246,10 @@ mod tests {
                     if let Some(mid) = mid {
                         ms.insert(mid, msg[i + 1..i + 1 + skip].to_vec());
                     }
+                }
+                Some(Action::StartCapture(mid)) => _ = starts.insert(mid, i + 1),
+                Some(Action::EndCapture(mid)) => {
+                    _ = ms.insert(mid, msg[starts[&mid]..=i].to_vec());
                 }
                 Some(Action::Done) => return Some((i + 1, ms)),
                 None => {}
@@ -193,7 +276,61 @@ mod tests {
         let mut parser = Parser::new();
         let mids = [0, 1, 2].map(|i| parser.capture_arg(i).expect("capture argument"));
         parser.match_commands();
+        parser.match_replies();
         (parser, mids)
+    }
+
+    /// Returns a parser capturing the payload of a reply, ready to attach.
+    fn reply_parser() -> (Parser, MatchId) {
+        let mut parser = Parser::new();
+        let mid = parser.capture_reply().expect("capture reply");
+        parser.match_commands();
+        parser.match_replies();
+        (parser, mid)
+    }
+
+    #[test]
+    fn capture_the_payload_of_every_reply_that_carries_one() {
+        let (parser, mid) = reply_parser();
+        let replies: [(&[u8], &[u8]); 5] = [
+            (b"+OK\r\n", b"OK"),
+            (b"-ERR unknown command\r\n", b"ERR unknown command"),
+            (b":-42\r\n", b"-42"),
+            (b"$5\r\nva\r\nl\r\n", b"va\r\nl"),
+            (b"$0\r\n\r\n", b""),
+        ];
+
+        for (reply, payload) in replies {
+            let (len, ms) = walk(&parser, reply).expect("done");
+            assert_eq!(len, reply.len());
+            assert_eq!(ms[&mid], payload, "{}", String::from_utf8_lossy(reply));
+        }
+    }
+
+    #[test]
+    fn walk_replies_that_carry_nothing() {
+        let (parser, mid) = reply_parser();
+        for reply in [b"$-1\r\n".as_slice(), b"*-1\r\n", b"*0\r\n"] {
+            let (len, ms) = walk(&parser, reply).expect("done");
+            assert_eq!(len, reply.len());
+            assert!(!ms.contains_key(&mid));
+        }
+    }
+
+    #[test]
+    fn stop_behind_the_first_reply_of_a_pipeline() {
+        let (parser, mid) = reply_parser();
+        let (len, ms) = walk(&parser, b"+OK\r\n$5\r\nvalue\r\n").expect("done");
+        assert_eq!(len, 5);
+        assert_eq!(ms[&mid], b"OK");
+    }
+
+    #[test]
+    fn capture_the_elements_of_an_array_reply_as_arguments() {
+        let (parser, mids) = parser();
+        let (_, ms) = walk(&parser, &cmd(&[b"a", b"b"])).expect("done");
+        assert_eq!(ms[&mids[0]], b"a");
+        assert_eq!(ms[&mids[1]], b"b");
     }
 
     #[test]
@@ -289,7 +426,9 @@ mod tests {
         for i in 0..MAX_ARGS.min(MAX_MATCHES as usize) {
             parser.capture_arg(i).expect("capture argument");
         }
+        parser.capture_reply().expect("capture reply");
         parser.match_commands();
+        parser.match_replies();
 
         assert!(parser.dfa.num_states() <= MAX_STATES);
     }

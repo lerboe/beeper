@@ -7,7 +7,13 @@
 //! *3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n
 //! ```
 //!
-//! [`Parser`] compiles the shape of a command into a DFA whose transition
+//! A reply is a single value of one of these types, or an array of them:
+//!
+//! ```text
+//! +OK\r\n  -ERR ...\r\n  :1\r\n  $5\r\nvalue\r\n  $-1\r\n
+//! ```
+//!
+//! [`Parser`] compiles the shape of commands and replies into a DFA whose transition
 //! table is injected into the BPF parser program. The kernel side walks the
 //! array and the length of every bulk string, skips the string itself and
 //! captures the ones it was configured to. Their contents are never walked, so
