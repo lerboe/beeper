@@ -10,5 +10,5 @@ authors = [
 repository = "https://github.com/lerboe/beeper"
 readme = "README.md"
 keywords = ["ebpf", "bpf", "libbpf", "l7", "http"]
-description = "Application-Layer Parsing in eBPF"
+description = "Application-layer parsing in eBPF"
 categories = ["os", "os::linux-apis", "network-programming"]
