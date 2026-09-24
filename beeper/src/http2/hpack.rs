@@ -1,4 +1,4 @@
-use crate::{Dfa, dfa::Input, h2::action::*};
+use crate::{Dfa, dfa::Input, http2::action::*};
 use std::collections::HashMap;
 
 /// Builds the transitions of every field representation of RFC 7541 into

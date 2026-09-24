@@ -2,7 +2,7 @@
 use crate::{
     Dfa, Error, MatchId, MessageBuffer,
     dfa::{ANY_STATE, INIT_STATE, fmt_input},
-    h1::action::Action,
+    http1::action::Action,
     pseudo_header::{METHOD, PATH, STATUS},
 };
 use http::HeaderName;
@@ -47,7 +47,7 @@ pub struct Parser {
     captures: HashMap<String, MatchId>,
 }
 
-xbpf::include_bpf!("h1/parser");
+xbpf::include_bpf!("http1/parser");
 
 #[allow(dead_code)]
 impl Parser {
@@ -207,7 +207,7 @@ impl Parser {
     /// # Returns
     ///
     /// The match ID that can be used in eBPF to extract the captured value.
-    pub fn match_h2_preface(&mut self) -> Result<MatchId, Error> {
+    pub fn match_http2_preface(&mut self) -> Result<MatchId, Error> {
         let mid = self.new_match()?;
         self.dfa
             .start_pattern(INIT_STATE)
@@ -396,7 +396,7 @@ impl Parser {
             });
         }
 
-        debug!("Beeper http/1 attached");
+        debug!("Beeper HTTP/1.1 attached");
 
         Ok(AttachedParser { links })
     }

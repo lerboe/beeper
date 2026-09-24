@@ -34,10 +34,10 @@ gRPC          | WIP     |
 
 First, in the Rust program, create a new parser instance, add the desired headers that it should capture, and attach it to an existing eBPF program:
 ```rust
-use beeper::{MessageBuffer, h2, pseudo_header::PATH};
+use beeper::{MessageBuffer, http2, pseudo_header::PATH};
 use http::header::CONTENT_LENGTH;
 
-let mut h2 = h2::Parser::new();
+let mut h2 = http2::Parser::new();
 let path_mid = h2.capture_hdr(&PATH)?;
 let content_length_mid = h2.capture_hdr(&CONTENT_LENGTH)?;
 
@@ -46,8 +46,8 @@ rodata.h2_path_mid = path_mid.into();
 rodata.h2_content_length_mid = content_length_mid.into();
 
 let h2 = h2
-    .parse_fn("parse_h2", MessageBuffer::Msg)
-    .extract_fn("extract_h2_match", MessageBuffer::Msg)
+    .parse_fn("parse_http2", MessageBuffer::Msg)
+    .extract_fn("extract_http2_match", MessageBuffer::Msg)
     .attach(prog_fd)?;
 ```
 
@@ -56,8 +56,8 @@ Next, in your eBPF program, import the header of the protocol you parse, define 
 #include "beeper/http2.h"
 
 // stub funcs
-BEEPER_EXTRACT_MATCH_MSG(extract_h2_match)
-BEEPER_H2_PARSE_MSG(parse_h2)
+BEEPER_EXTRACT_MATCH_MSG(extract_http2_match)
+BEEPER_HTTP2_PARSE_MSG(parse_http2)
 
 // the match ids the parser handed back, set by user space
 volatile const u8 h2_path_mid;
@@ -66,11 +66,11 @@ volatile const u8 h2_content_length_mid;
 SEC("sk_msg")
 int msg_verdict(struct sk_msg_md *msg) {
     struct http_parse_res pres = { 0 };
-    struct h2_frame frame = { 0 };
-    int msg_len = parse_h2(msg, &pres, &frame);
+    struct http2_frame frame = { 0 };
+    int msg_len = parse_http2(msg, &pres, &frame);
     if (msg_len >= 0) {
         struct bytes path = { 0 };
-        if (extract_h2_match(msg, &pres, h2_path_mid, &path) == 0) {
+        if (extract_http2_match(msg, &pres, h2_path_mid, &path) == 0) {
             // note that path can be Huffman-encoded
         }
     }

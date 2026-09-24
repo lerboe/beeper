@@ -12,9 +12,9 @@
 //! the same handful of states.
 //!
 //! The state ids and action kinds below must stay in sync with the `S_*` and
-//! `H2A_*` constants of h2/parser.bpf.c.
+//! `HTTP2A_*` constants of http2/parser.bpf.c.
 
-use crate::{MatchId, StateId, h2::parser::types::h2_action};
+use crate::{MatchId, StateId, http2::parser::types::http2_action};
 
 /// A field name that matched no pattern.
 pub const S_DEAD: StateId = StateId(2);
@@ -129,9 +129,9 @@ impl Action {
     }
 }
 
-impl From<Action> for h2_action {
+impl From<Action> for http2_action {
     fn from(value: Action) -> Self {
-        h2_action {
+        http2_action {
             val: value.val,
             kind: value.kind as u8,
             flags: value.flags,

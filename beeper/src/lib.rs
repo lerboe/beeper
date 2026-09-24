@@ -8,19 +8,19 @@
 //!
 //! The target program declares the functions it wants Beeper to provide with
 //! the `BEEPER_*` macros of `beeper/http1.h` or `beeper/http2.h` and then
-//! names them in the [`h1`] or [`h2`] builder:
+//! names them in the [`http1`] or [`http2`] builder:
 //!
 //! ```no_run
 //! # fn main() -> Result<(), beeper::Error> {
 //! # let prog_fd = 0;
-//! use beeper::{MessageBuffer, h1, pseudo_header::PATH};
+//! use beeper::{MessageBuffer, http1, pseudo_header::PATH};
 //!
-//! let mut parser = h1::Parser::new();
+//! let mut parser = http1::Parser::new();
 //! let path = parser.capture_hdr(&PATH)?;
 //!
 //! let parser = parser
-//!     .parse_fn("parse_h1", MessageBuffer::Msg)
-//!     .extract_fn("extract_h1_match", MessageBuffer::Msg)
+//!     .parse_fn("parse_http1", MessageBuffer::Msg)
+//!     .extract_fn("extract_http1_match", MessageBuffer::Msg)
 //!     .attach(prog_fd)?;
 //! # Ok(())
 //! # }
@@ -39,11 +39,11 @@ mod dfa;
 #[cfg(feature = "build")]
 pub mod build;
 
-#[cfg(feature = "h1")]
-pub mod h1;
+#[cfg(feature = "http1")]
+pub mod http1;
 
-#[cfg(feature = "h2")]
-pub mod h2;
+#[cfg(feature = "http2")]
+pub mod http2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MessageBuffer {

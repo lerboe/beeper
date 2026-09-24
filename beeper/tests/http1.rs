@@ -1,4 +1,4 @@
-use beeper::{MatchId, h1, pseudo_header};
+use beeper::{MatchId, http1, pseudo_header};
 use http::{HeaderName, HeaderValue, header};
 use reqwest::Client;
 use std::net::SocketAddr;
@@ -90,15 +90,15 @@ fn assert_match_bytes_eq(prog: &TestProgram, mid: MatchId, expected: Option<&[u8
 
 /// Attaches a parser capturing `hdrs` and returns it along with the match id
 /// of each of them, in the order they were configured in.
-fn attach_h1_parser(
+fn attach_http1_parser(
     prog_fd: i32,
     hook: Hook,
     match_preface: bool,
     hdrs: &[&str],
-) -> (h1::AttachedParser, Vec<MatchId>) {
-    let mut h1 = h1::Parser::new();
+) -> (http1::AttachedParser, Vec<MatchId>) {
+    let mut h1 = http1::Parser::new();
     if match_preface {
-        h1.match_h2_preface().expect("match preface");
+        h1.match_http2_preface().expect("match preface");
     }
 
     let mut mids = Vec::new();
@@ -108,21 +108,21 @@ fn attach_h1_parser(
 
     let suffix = hook.to_string();
     let h1 = h1
-        .matched_fn("matched_h1")
-        .parse_fn(format!("parse_h1_{suffix}"), hook.into())
-        .extract_fn(format!("extract_h1_match_{suffix}"), hook.into());
+        .matched_fn("matched_http1")
+        .parse_fn(format!("parse_http1_{suffix}"), hook.into())
+        .extract_fn(format!("extract_http1_match_{suffix}"), hook.into());
 
     (h1.attach(prog_fd).expect("attach parser"), mids)
 }
 
 #[tokio::test]
-async fn match_h2_preface() {
+async fn match_http2_preface() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
 
-    let (_h1, _mids) = attach_h1_parser(prog.prog_fd(), Hook::Msg, true, &[]);
+    let (_h1, _mids) = attach_http1_parser(prog.prog_fd(), Hook::Msg, true, &[]);
     let client = Client::builder()
         .http2_prior_knowledge()
         .build()
@@ -143,7 +143,7 @@ async fn parse_simple_header() {
 
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
-    let (_h1, mids) = attach_h1_parser(
+    let (_h1, mids) = attach_http1_parser(
         prog.prog_fd(),
         Hook::Msg,
         true,
@@ -169,7 +169,7 @@ async fn ignore_header_case() {
 
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
-    let (_h1, mids) = attach_h1_parser(
+    let (_h1, mids) = attach_http1_parser(
         prog.prog_fd(),
         Hook::Msg,
         true,
@@ -198,7 +198,7 @@ async fn ignores_header_whitespace() {
 
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
-    let (_h1, mids) = attach_h1_parser(
+    let (_h1, mids) = attach_http1_parser(
         prog.prog_fd(),
         Hook::Msg,
         true,
@@ -241,7 +241,7 @@ async fn parse_subsequent_headers() {
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
 
-    let (_h1, mids) = attach_h1_parser(
+    let (_h1, mids) = attach_http1_parser(
         prog.prog_fd(),
         Hook::Msg,
         true,
@@ -274,7 +274,7 @@ async fn parse_status_line_only() {
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
 
-    let (_h1, mids) = attach_h1_parser(
+    let (_h1, mids) = attach_http1_parser(
         prog.prog_fd(),
         Hook::Msg,
         true,
@@ -302,7 +302,7 @@ async fn parse_status_line_and_subsequent_header() {
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
 
-    let (_h1, mids) = attach_h1_parser(
+    let (_h1, mids) = attach_http1_parser(
         prog.prog_fd(),
         Hook::Msg,
         true,
@@ -335,7 +335,7 @@ async fn parse_status_code() {
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Upstream).expect("attach");
 
-    let (_h1, mids) = attach_h1_parser(
+    let (_h1, mids) = attach_http1_parser(
         prog.prog_fd(),
         Hook::Msg,
         true,
@@ -367,7 +367,7 @@ async fn ignore_a_preface_that_is_not_one() {
 
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
-    let (_h1, _mids) = attach_h1_parser(prog.prog_fd(), Hook::Msg, true, &[]);
+    let (_h1, _mids) = attach_http1_parser(prog.prog_fd(), Hook::Msg, true, &[]);
 
     // the preface asks for the target `*`, which is also the character the DFA
     // spells "any byte" with. Anything else in its place is a different message
@@ -391,7 +391,7 @@ async fn match_a_star_in_a_header_name_literally() {
     // `*` is a legal character of a field name, and one the DFA spells "any
     // byte" with
     let starred = HeaderName::from_bytes(b"x*y").expect("header name");
-    let (_h1, mids) = attach_h1_parser(prog.prog_fd(), Hook::Msg, true, &[starred.as_str()]);
+    let (_h1, mids) = attach_http1_parser(prog.prog_fd(), Hook::Msg, true, &[starred.as_str()]);
 
     let req = format!("GET / HTTP/1.1\r\nHost: {addr}\r\nxzy: beeper\r\n\r\n");
     _ = send_raw(addr, &req).await;
@@ -406,7 +406,7 @@ async fn keep_a_value_that_carries_high_bytes_together() {
 
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
-    let (_h1, mids) = attach_h1_parser(
+    let (_h1, mids) = attach_http1_parser(
         prog.prog_fd(),
         Hook::Msg,
         true,
@@ -434,7 +434,7 @@ async fn capture_nothing_for_an_empty_value() {
 
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
-    let (_h1, mids) = attach_h1_parser(
+    let (_h1, mids) = attach_http1_parser(
         prog.prog_fd(),
         Hook::Msg,
         true,
@@ -461,7 +461,7 @@ async fn parse_a_header_in_the_first_half_of_a_long_message() {
 
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
-    let (_h1, mids) = attach_h1_parser(
+    let (_h1, mids) = attach_http1_parser(
         prog.prog_fd(),
         Hook::Msg,
         true,
@@ -496,7 +496,7 @@ async fn parse_lf_endings() {
 
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
-    let (_h1, mids) = attach_h1_parser(
+    let (_h1, mids) = attach_http1_parser(
         prog.prog_fd(),
         Hook::Msg,
         true,
@@ -523,7 +523,7 @@ async fn parse_lf_endings() {
 
 //     let mut open_obj = OpenObject::new();
 //     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
-//     let (_h1, mids) = attach_h1_parser(prog.prog_fd(), Hook::Msg,  true, &[header::USER_AGENT.as_str()]);
+//     let (_h1, mids) = attach_http1_parser(prog.prog_fd(), Hook::Msg,  true, &[header::USER_AGENT.as_str()]);
 
 //     // section 2.2 of RFC 9112 lets a recipient read a bare LF as a line terminator
 //     let user_agent = HeaderValue::from_static("beeper");
@@ -539,14 +539,14 @@ async fn parse_lf_endings() {
 // }
 
 #[tokio::test]
-async fn match_h2_preface_in_skb() {
+async fn match_http2_preface_in_skb() {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach_to(addr, &mut open_obj, Direction::Downstream, Hook::Skb)
         .expect("attach");
 
-    let (_h1, _mids) = attach_h1_parser(prog.prog_fd(), Hook::Skb, true, &[]);
+    let (_h1, _mids) = attach_http1_parser(prog.prog_fd(), Hook::Skb, true, &[]);
     let client = Client::builder()
         .http2_prior_knowledge()
         .build()
@@ -568,7 +568,7 @@ async fn parse_simple_header_in_skb() {
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach_to(addr, &mut open_obj, Direction::Downstream, Hook::Skb)
         .expect("attach");
-    let (_h1, mids) = attach_h1_parser(
+    let (_h1, mids) = attach_http1_parser(
         prog.prog_fd(),
         Hook::Skb,
         true,
@@ -594,7 +594,7 @@ async fn report_the_fields_that_were_matched() {
 
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
-    let (_h1, mids) = attach_h1_parser(
+    let (_h1, mids) = attach_http1_parser(
         prog.prog_fd(),
         Hook::Msg,
         true,

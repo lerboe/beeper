@@ -8,7 +8,7 @@
 
 use anyhow::Result;
 use as_bytes::AsBytes;
-use beeper::{MatchId, MessageBuffer, h2::Parser};
+use beeper::{MatchId, MessageBuffer, http2::Parser};
 use std::{
     io::{Error, ErrorKind},
     mem::MaybeUninit,

@@ -6,7 +6,7 @@ publish = false
 
 [dependencies]
 axum = { version = "0.8.9", features = ["http2"] }
-beeper = { path = "../beeper", features = ["h1", "h2"] }
+beeper = { path = "../beeper", features = ["http1", "http2"] }
 http = "1.5"
 tokio = { version = "1.53", features = ["full"] }
 tracing = "0.1.44"

@@ -1,7 +1,7 @@
 #![allow(unused_imports)]
 use crate::{
     Dfa, Error, MatchId, MessageBuffer,
-    h2::{action::*, hpack},
+    http2::{action::*, hpack},
 };
 use as_bytes::AsBytes;
 use httlib_huffman as huffman;
@@ -25,7 +25,7 @@ extern crate plain;
 const MAX_MATCHES: u8 = 32;
 
 /// The index the first entry of a dynamic table is stored under. Must stay in
-/// sync with `DYNAMIC_TABLE_BASE` of h2/parser.bpf.c.
+/// sync with `DYNAMIC_TABLE_BASE` of http2/parser.bpf.c.
 const DYNAMIC_TABLE_BASE: u32 = 62;
 
 /// A parser for HTTP/2 messages.
@@ -57,7 +57,7 @@ pub struct Parser {
     captures: HashMap<Vec<u8>, MatchId>,
 }
 
-xbpf::include_bpf!("h2/parser");
+xbpf::include_bpf!("http2/parser");
 
 #[allow(dead_code)]
 impl Parser {
@@ -114,7 +114,7 @@ impl Parser {
     }
 
     /// Specifies the function template in the target program to be replaced with a reader of the
-    /// connection's dynamic table (`BEEPER_H2_GET_DT_ENTRY`). The function will not be replaced
+    /// connection's dynamic table (`BEEPER_HTTP2_GET_DT_ENTRY`). The function will not be replaced
     /// until `attach` is called.
     ///
     /// # Arguments
@@ -207,7 +207,7 @@ impl Parser {
             hf_key.resize(128, 0);
             hf_val.resize(128, 0);
 
-            let hf = h2_hdr_field {
+            let hf = http2_hdr_field {
                 key: hf_key.try_into().unwrap(),
                 key_len,
                 val: hf_val.try_into().unwrap(),
@@ -334,7 +334,7 @@ impl Parser {
         let static_table = MapHandle::from_map_id(id)?;
         self.populate_static_table(&static_table)?;
 
-        debug!("Beeper http/2 attached");
+        debug!("Beeper HTTP/2 attached");
 
         let dynamic_table_info = MapHandle::try_from(&skel.maps.dynamic_table_info)?;
         let dynamic_table = MapHandle::try_from(&skel.maps.dynamic_table)?;

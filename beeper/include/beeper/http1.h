@@ -8,8 +8,8 @@
 #define __BEEPER_HTTP1_H__
 
 // Creates `name`, a stub for the HTTP/1.x message parser
-// (`h1::Parser::parse_fn`, `MessageBuffer::Msg`).
-#define BEEPER_H1_PARSE_MSG(name)                                                                  \
+// (`http1::Parser::parse_fn`, `MessageBuffer::Msg`).
+#define BEEPER_HTTP1_PARSE_MSG(name)                                                                  \
     __noinline int name(struct sk_msg_md *msg, struct http_parse_res *pres __arg_nonnull) {             \
         int ret = -1;                                                                              \
                                                                                                    \
@@ -25,8 +25,8 @@
     }
 
 // Creates `name`, a stub for the HTTP/1.x sk_buff parser
-// (`h1::Parser::parse_fn`, `MessageBuffer::Skb`).
-#define BEEPER_H1_PARSE_SKB(name)                                                                  \
+// (`http1::Parser::parse_fn`, `MessageBuffer::Skb`).
+#define BEEPER_HTTP1_PARSE_SKB(name)                                                                  \
     __noinline int name(struct __sk_buff *skb, u32 off, struct http_parse_res *pres __arg_nonnull,      \
                         struct null_prefix *null_prefix) {                                         \
         int ret = -1;                                                                              \
@@ -45,8 +45,8 @@
     }
 
 // Creates `name`, a stub for the HTTP/1.x buffer parser
-// (`h1::Parser::parse_fn`, `MessageBuffer::DynPtr`).
-#define BEEPER_H1_PARSE_BUF(name)                                                                  \
+// (`http1::Parser::parse_fn`, `MessageBuffer::DynPtr`).
+#define BEEPER_HTTP1_PARSE_BUF(name)                                                                  \
     __noinline int name(const struct bpf_dynptr *buf_ptr, u32 len,                                 \
                         struct http_parse_res *pres __arg_nonnull, struct null_prefix *null_prefix) {   \
         int ret = -1;                                                                              \

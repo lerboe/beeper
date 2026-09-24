@@ -1,5 +1,5 @@
 use ::h2::{RecvStream, client};
-use beeper::{MatchId, h1, h2, pseudo_header};
+use beeper::{MatchId, http1, http2, pseudo_header};
 use bytes::Bytes;
 use httlib_huffman as huffman;
 use http::{HeaderName, HeaderValue, Request, Response, header};
@@ -309,22 +309,22 @@ impl RawClient {
     }
 }
 
-fn attach_h1_parser(prog_fd: i32, hook: Hook) -> h1::AttachedParser {
-    let mut h1 = h1::Parser::new();
-    h1.match_h2_preface().expect("match preface");
+fn attach_http1_parser(prog_fd: i32, hook: Hook) -> http1::AttachedParser {
+    let mut h1 = http1::Parser::new();
+    h1.match_http2_preface().expect("match preface");
 
     let suffix = hook.to_string();
-    h1.matched_fn("matched_h1")
-        .parse_fn(format!("parse_h1_{suffix}"), hook.into())
-        .extract_fn(format!("extract_h1_match_{suffix}"), hook.into())
+    h1.matched_fn("matched_http1")
+        .parse_fn(format!("parse_http1_{suffix}"), hook.into())
+        .extract_fn(format!("extract_http1_match_{suffix}"), hook.into())
         .attach(prog_fd)
         .expect("attach parser")
 }
 
 /// Attaches a parser capturing `hdrs` and returns it along with the match id
 /// of each of them, in the order they were configured in.
-fn attach_h2_parser(prog_fd: i32, hook: Hook, hdrs: &[&str]) -> (h2::AttachedParser, Vec<MatchId>) {
-    let mut h2 = h2::Parser::new();
+fn attach_http2_parser(prog_fd: i32, hook: Hook, hdrs: &[&str]) -> (http2::AttachedParser, Vec<MatchId>) {
+    let mut h2 = http2::Parser::new();
 
     let mut mids = Vec::new();
     for hdr in hdrs {
@@ -336,8 +336,8 @@ fn attach_h2_parser(prog_fd: i32, hook: Hook, hdrs: &[&str]) -> (h2::AttachedPar
 
     let suffix = hook.to_string();
     let h2 = h2
-        .parse_fn(format!("parse_h2_{suffix}"), hook.into())
-        .extract_fn(format!("extract_h2_match_{suffix}"), hook.into())
+        .parse_fn(format!("parse_http2_{suffix}"), hook.into())
+        .extract_fn(format!("extract_http2_match_{suffix}"), hook.into())
         .attach(prog_fd)
         .expect("attach parser");
 
@@ -352,15 +352,15 @@ fn attach_at<'obj>(
     hdrs: &[&str],
 ) -> (
     TestProgram<'obj>,
-    h1::AttachedParser,
-    h2::AttachedParser,
+    http1::AttachedParser,
+    http2::AttachedParser,
     Vec<MatchId>,
 ) {
     let prog = TestProgram::attach_to(addr, open_obj, Direction::Downstream, hook)
         .expect("attach program");
 
-    let h1 = attach_h1_parser(prog.prog_fd(), hook);
-    let (h2, mids) = attach_h2_parser(prog.prog_fd(), hook, hdrs);
+    let h1 = attach_http1_parser(prog.prog_fd(), hook);
+    let (h2, mids) = attach_http2_parser(prog.prog_fd(), hook, hdrs);
 
     (prog, h1, h2, mids)
 }
@@ -385,9 +385,9 @@ async fn parse_header_field_indexed_in_static_table() {
     let mut open_obj = OpenObject::new();
     let prog = TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach");
 
-    let _h1 = attach_h1_parser(prog.prog_fd(), Hook::Msg);
+    let _h1 = attach_http1_parser(prog.prog_fd(), Hook::Msg);
     let (_h2, mids) =
-        attach_h2_parser(prog.prog_fd(), Hook::Msg, &[pseudo_header::METHOD.as_str()]);
+        attach_http2_parser(prog.prog_fd(), Hook::Msg, &[pseudo_header::METHOD.as_str()]);
 
     let client = Client::connect(addr, None).await;
     client.get(format!("http://{}", addr), &[]).await;
@@ -1355,8 +1355,8 @@ async fn ignore_an_index_that_only_wraps_into_the_table() {
     let prog =
         TestProgram::attach(addr, &mut open_obj, Direction::Downstream).expect("attach program");
 
-    let _h1 = attach_h1_parser(prog.prog_fd(), Hook::Msg);
-    let (_h2, mids) = attach_h2_parser(prog.prog_fd(), Hook::Msg, &[header::ACCEPT.as_str()]);
+    let _h1 = attach_http1_parser(prog.prog_fd(), Hook::Msg);
+    let (_h2, mids) = attach_http2_parser(prog.prog_fd(), Hook::Msg, &[header::ACCEPT.as_str()]);
 
     let authority = addr.to_string();
     let secret = HeaderValue::from_static("secret");
@@ -1414,8 +1414,8 @@ async fn match_a_field_name_by_the_whole_name() {
     huffman::encode(b"a&b", &mut coded_long).expect("encode");
     assert!(coded_long.starts_with(&coded_short));
 
-    let _h1 = attach_h1_parser(prog.prog_fd(), Hook::Msg);
-    let (_h2, mids) = attach_h2_parser(prog.prog_fd(), Hook::Msg, &[short.as_str()]);
+    let _h1 = attach_http1_parser(prog.prog_fd(), Hook::Msg);
+    let (_h2, mids) = attach_http2_parser(prog.prog_fd(), Hook::Msg, &[short.as_str()]);
 
     let authority = addr.to_string();
     let mut block = vec![0x82, 0x86, 0x84];

@@ -1,21 +1,21 @@
 //! What the HTTP/1.x parser does upon taking a transition.
 //!
-//! The kinds and flags below must stay in sync with the `H1A_*` and `H1F_*`
-//! constants of h1/parser.bpf.c.
+//! The kinds and flags below must stay in sync with the `HTTP1A_*` and `HTTP1F_*`
+//! constants of http1/parser.bpf.c.
 
-use crate::{MatchId, h1::parser::types::h1_action};
+use crate::{MatchId, http1::parser::types::http1_action};
 
 /// The parser does nothing.
-const H1A_NONE: u8 = 0;
+const HTTP1A_NONE: u8 = 0;
 
 /// A capture starts at the byte behind the transition.
-const H1A_START_CAPTURE: u8 = 1;
+const HTTP1A_START_CAPTURE: u8 = 1;
 
 /// The open capture ends at the byte the transition read.
-const H1A_END_CAPTURE: u8 = 2;
+const HTTP1A_END_CAPTURE: u8 = 2;
 
 /// Parsing is complete, the rest of the message is not a header anymore.
-const H1F_DONE: u8 = 1 << 0;
+const HTTP1F_DONE: u8 = 1 << 0;
 
 /// The action a transition of the HTTP/1.x parser carries.
 ///
@@ -38,15 +38,15 @@ pub enum Action {
     EndCaptureAndDone(MatchId),
 }
 
-impl From<Action> for h1_action {
+impl From<Action> for http1_action {
     fn from(value: Action) -> Self {
         let (kind, flags, mid) = match value {
-            Action::Done => (H1A_NONE, H1F_DONE, 0),
-            Action::StartCapture(mid) => (H1A_START_CAPTURE, 0, mid.0),
-            Action::EndCapture(mid) => (H1A_END_CAPTURE, 0, mid.0),
-            Action::EndCaptureAndDone(mid) => (H1A_END_CAPTURE, H1F_DONE, mid.0),
+            Action::Done => (HTTP1A_NONE, HTTP1F_DONE, 0),
+            Action::StartCapture(mid) => (HTTP1A_START_CAPTURE, 0, mid.0),
+            Action::EndCapture(mid) => (HTTP1A_END_CAPTURE, 0, mid.0),
+            Action::EndCaptureAndDone(mid) => (HTTP1A_END_CAPTURE, HTTP1F_DONE, mid.0),
         };
 
-        h1_action { kind, flags, mid }
+        http1_action { kind, flags, mid }
     }
 }

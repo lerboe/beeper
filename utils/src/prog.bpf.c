@@ -49,19 +49,19 @@ struct {
 } matches SEC(".maps");
 
 // The functions beeper replaces with a parser when a test attaches one.
-BEEPER_MATCHED(matched_h1)
-BEEPER_EXTRACT_MATCH_MSG(extract_h1_match_msg)
-BEEPER_H1_PARSE_MSG(parse_h1_msg)
+BEEPER_MATCHED(matched_http1)
+BEEPER_EXTRACT_MATCH_MSG(extract_http1_match_msg)
+BEEPER_HTTP1_PARSE_MSG(parse_http1_msg)
 
-BEEPER_MATCHED(matched_h2)
-BEEPER_EXTRACT_MATCH_MSG(extract_h2_match_msg)
-BEEPER_H2_PARSE_MSG(parse_h2_msg)
+BEEPER_MATCHED(matched_http2)
+BEEPER_EXTRACT_MATCH_MSG(extract_http2_match_msg)
+BEEPER_HTTP2_PARSE_MSG(parse_http2_msg)
 
-BEEPER_EXTRACT_MATCH_SKB(extract_h1_match_skb)
-BEEPER_H1_PARSE_SKB(parse_h1_skb)
+BEEPER_EXTRACT_MATCH_SKB(extract_http1_match_skb)
+BEEPER_HTTP1_PARSE_SKB(parse_http1_skb)
 
-BEEPER_EXTRACT_MATCH_SKB(extract_h2_match_skb)
-BEEPER_H2_PARSE_SKB(parse_h2_skb)
+BEEPER_EXTRACT_MATCH_SKB(extract_http2_match_skb)
+BEEPER_HTTP2_PARSE_SKB(parse_http2_skb)
 
 extern void *bpf_cast_to_kern_ctx(void *obj) __ksym;
 
@@ -90,7 +90,7 @@ static __always_inline void store_matched(const struct http_parse_res *pres, boo
     u32 mask = 0;
     u32 i = 0;
     bpf_for(i, 0, 32) {
-        bool matched = is_h2 ? matched_h2(pres, i) : matched_h1(pres, i);
+        bool matched = is_h2 ? matched_http2(pres, i) : matched_http1(pres, i);
         if (matched) mask |= (u32)1 << i;
     }
 
@@ -145,8 +145,8 @@ int msg_verdict(struct sk_msg_md *msg) {
     struct http_parse_res pres = { 0 };
 
     if (is_h2) {
-        struct h2_frame frame = { 0 };
-        msg_len = parse_h2_msg(msg, &pres, &frame);
+        struct http2_frame frame = { 0 };
+        msg_len = parse_http2_msg(msg, &pres, &frame);
         if (msg_len < 0) {
             bpf_error("Failed to parse h2 message: %s", msg->data);
             return SK_PASS;
@@ -157,7 +157,7 @@ int msg_verdict(struct sk_msg_md *msg) {
         last_dt_count = frame.dt_count;
     }
     else {
-        msg_len = parse_h1_msg(msg, &pres);
+        msg_len = parse_http1_msg(msg, &pres);
         if (msg_len < 0) {
             // It's possible that this fails because we're actually parsing the body.
             // To avoid this, we'd have to parse the content-length to skip the body.
@@ -165,7 +165,7 @@ int msg_verdict(struct sk_msg_md *msg) {
             return SK_PASS;
         }
 
-        if (matched_h1(&pres, 0)) {
+        if (matched_http1(&pres, 0)) {
             int flag = 1;
             bpf_map_update_elem(&upgraded_conns, &ikey, &flag, BPF_ANY);
             num_upgraded_conns += 1;
@@ -181,7 +181,7 @@ int msg_verdict(struct sk_msg_md *msg) {
         u32 i = 0;
         bpf_for(i, 0, 32) {
             struct bytes str = { 0 };
-            int res = is_h2 ? extract_h2_match_msg(msg, &pres, i, &str) : extract_h1_match_msg(msg, &pres, i, &str);
+            int res = is_h2 ? extract_http2_match_msg(msg, &pres, i, &str) : extract_http1_match_msg(msg, &pres, i, &str);
             store_match(i, res, &str);
         }
     }
@@ -206,8 +206,8 @@ static __always_inline struct ip4_conn skb_conn(const struct __sk_buff *skb) {
     };
 }
 
-#define H2_PREFACE "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
-#define H2_PREFACE_LEN 24
+#define HTTP2_PREFACE "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+#define HTTP2_PREFACE_LEN 24
 
 // Cuts what arrives on a socket into the messages `skb_verdict` parses: an
 // HTTP/2 frame at a time on an upgraded connection, the preface on its own, and
@@ -231,18 +231,18 @@ int skb_parser(struct __sk_buff *skb) {
         return 9 + len;
     }
 
-    const char preface[] = H2_PREFACE;
-    char head[H2_PREFACE_LEN];
-    if (bpf_skb_load_bytes(skb, off, head, H2_PREFACE_LEN) == 0) {
+    const char preface[] = HTTP2_PREFACE;
+    char head[HTTP2_PREFACE_LEN];
+    if (bpf_skb_load_bytes(skb, off, head, HTTP2_PREFACE_LEN) == 0) {
         bool is_preface = true;
-        for (int i = 0; i < H2_PREFACE_LEN; i++) {
+        for (int i = 0; i < HTTP2_PREFACE_LEN; i++) {
             if (head[i] != preface[i]) {
                 is_preface = false;
                 break;
             }
         }
 
-        if (is_preface) return H2_PREFACE_LEN;
+        if (is_preface) return HTTP2_PREFACE_LEN;
     }
 
     return avail;
@@ -268,8 +268,8 @@ int skb_verdict(struct __sk_buff *skb) {
     struct http_parse_res pres = { 0 };
 
     if (is_h2) {
-        struct h2_frame frame = { 0 };
-        int len = parse_h2_skb(skb, off, &pres, &frame, NULL);
+        struct http2_frame frame = { 0 };
+        int len = parse_http2_skb(skb, off, &pres, &frame, NULL);
         if (len < 0) {
             bpf_error("Failed to parse h2 skb");
             return SK_PASS;
@@ -280,9 +280,9 @@ int skb_verdict(struct __sk_buff *skb) {
         last_dt_count = frame.dt_count;
     }
     else {
-        if (parse_h1_skb(skb, off, &pres, NULL) < 0) return SK_PASS;
+        if (parse_http1_skb(skb, off, &pres, NULL) < 0) return SK_PASS;
 
-        if (matched_h1(&pres, 0)) {
+        if (matched_http1(&pres, 0)) {
             int flag = 1;
             bpf_map_update_elem(&upgraded_conns, &ikey, &flag, BPF_ANY);
             num_upgraded_conns += 1;
@@ -297,7 +297,7 @@ int skb_verdict(struct __sk_buff *skb) {
         u32 i = 0;
         bpf_for(i, 0, 32) {
             struct bytes str = { 0 };
-            int res = is_h2 ? extract_h2_match_skb(skb, &pres, i, &str) : extract_h1_match_skb(skb, &pres, i, &str);
+            int res = is_h2 ? extract_http2_match_skb(skb, &pres, i, &str) : extract_http1_match_skb(skb, &pres, i, &str);
             store_match(i, res, &str);
         }
     }

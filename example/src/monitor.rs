@@ -3,7 +3,7 @@
 #![allow(unused_imports)]
 use anyhow::Result;
 use beeper::{
-    MessageBuffer, h1, h2,
+    MessageBuffer, http1, http2,
     pseudo_header::{PATH, STATUS},
 };
 use http::header::ACCEPT_LANGUAGE;
@@ -33,9 +33,9 @@ pub struct Monitor<'obj> {
     #[allow(dead_code)]
     sockops: Link,
     #[allow(dead_code)]
-    h1: h1::AttachedParser,
+    http1: http1::AttachedParser,
     #[allow(dead_code)]
-    h2: h2::AttachedParser,
+    http2: http2::AttachedParser,
 }
 
 impl<'obj> Monitor<'obj> {
@@ -58,8 +58,8 @@ impl<'obj> Monitor<'obj> {
             )),
         }?;
 
-        let mut h1 = h1::Parser::new();
-        let preface_mid = h1.match_h2_preface()?;
+        let mut h1 = http1::Parser::new();
+        let preface_mid = h1.match_http2_preface()?;
         let path_mid = h1.capture_hdr(&PATH)?;
         let lang_mid = h1.capture_hdr(&ACCEPT_LANGUAGE)?;
         let status_mid = h1.capture_hdr(&STATUS)?;
@@ -88,13 +88,13 @@ impl<'obj> Monitor<'obj> {
         let prog_fd = skel.progs.msg_verdict.as_fd().as_raw_fd();
 
         let h1 = h1
-            .parse_fn("parse_h1", MessageBuffer::Msg)
-            .matched_fn("matched_h1")
-            .extract_fn("extract_h1_match", MessageBuffer::Msg)
+            .parse_fn("parse_http1", MessageBuffer::Msg)
+            .matched_fn("matched_http1")
+            .extract_fn("extract_http1_match", MessageBuffer::Msg)
             .attach(prog_fd)?;
 
-        let h2 = h2::Parser::new()
-            .parse_fn("parse_h2", MessageBuffer::Msg)
+        let h2 = http2::Parser::new()
+            .parse_fn("parse_http2", MessageBuffer::Msg)
             .attach(prog_fd)?;
 
         tracing::debug!("Monitor attached");
@@ -102,8 +102,8 @@ impl<'obj> Monitor<'obj> {
         Ok(Self {
             skel,
             sockops,
-            h1,
-            h2,
+            http1: h1,
+            http2: h2,
         })
     }
 }

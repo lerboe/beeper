@@ -11,10 +11,10 @@
 
 // The number of bytes of a name or a value that are kept in a table entry.
 // Longer fields are truncated, which bounds the copies for the verifier.
-// `h2_hdr_field`, which both tables are made of, is declared in beeper/http2.h so
+// `http2_hdr_field`, which both tables are made of, is declared in beeper/http2.h so
 // that a target program reading dynamic table entries with
-// `BEEPER_H2_GET_DT_ENTRY` agrees on its layout.
-#define HEADER_FIELD_MAXLEN BEEPER_H2_FIELD_MAXLEN
+// `BEEPER_HTTP2_GET_DT_ENTRY` agrees on its layout.
+#define HEADER_FIELD_MAXLEN BEEPER_HTTP2_FIELD_MAXLEN
 #define HEADER_FIELD_MASK (HEADER_FIELD_MAXLEN - 1)
 
 // The number of entries of the HPACK static table, see appendix A of RFC 7541.
@@ -29,23 +29,23 @@
 #define SETTINGS_HEADER_TABLE_SIZE 0x1
 
 // The length of a frame header, see section 4.1 of RFC 9113.
-#define H2_FRAME_HDR_LEN 9
+#define HTTP2_FRAME_HDR_LEN 9
 
 // The frame types the parser reads. Every other one is skipped.
-#define H2_HEADERS_FRAME 0x01
-#define H2_SETTINGS_FRAME 0x04
-#define H2_CONTINUATION_FRAME 0x09
+#define HTTP2_HEADERS_FRAME 0x01
+#define HTTP2_SETTINGS_FRAME 0x04
+#define HTTP2_CONTINUATION_FRAME 0x09
 
 // The flags of a HEADERS frame that move the header block within it, and the
 // one saying that the block ends with the frame rather than carrying on into a
 // CONTINUATION frame. See sections 6.2 and 6.10 of RFC 9113.
-#define H2_END_HEADERS_FLAG 0x04
-#define H2_PADDED_FLAG 0x08
-#define H2_PRIORITY_FLAG 0x20
+#define HTTP2_END_HEADERS_FLAG 0x04
+#define HTTP2_PADDED_FLAG 0x08
+#define HTTP2_PRIORITY_FLAG 0x20
 
 // The number of bytes the priority of a HEADERS frame takes up, a stream
 // dependency and a weight.
-#define H2_PRIORITY_LEN 5
+#define HTTP2_PRIORITY_LEN 5
 
 // The HPACK static table. User space populates and freezes it when the parser
 // is attached.
@@ -53,7 +53,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, STATIC_TABLE_SIZE+1);
     __type(key, u32);
-    __type(value, struct h2_hdr_field);
+    __type(value, struct http2_hdr_field);
 } static_table SEC(".maps");
 
 // The dynamic table is per connection, and its entries are addressed by the
@@ -66,7 +66,7 @@ struct dynamic_table_key {
 // An entry of the dynamic table, along with the size it accounts for in the
 // table, which is computed from the decoded lengths of its name and value.
 struct dynamic_table_entry {
-    struct h2_hdr_field field;
+    struct http2_hdr_field field;
     u32 size;
 };
 
@@ -118,7 +118,7 @@ struct {
 //
 // User space fills the rows of `s2ts` these index, and hands out the ids from
 // `S_RESERVED` on to the states of the field name trie. They must stay in sync
-// with the state ids of h2/hpack.rs.
+// with the state ids of http2/hpack.rs.
 
 // A field name that matched no pattern. It carries no transition of its own, so
 // the parser stays in it until the name it is reading ends.
@@ -151,54 +151,54 @@ struct {
 #define S_RESERVED 15
 
 // What the parser does upon taking a transition. Must stay in sync with the
-// action kinds of h2/hpack.rs.
+// action kinds of http2/hpack.rs.
 
 // Nothing.
-#define H2A_NONE 0
+#define HTTP2A_NONE 0
 
 // A field spelled out by nothing but an index: `val` addresses the entry of the
 // static or the dynamic table both its name and its value are read from.
-#define H2A_INDEXED 1
+#define HTTP2A_INDEXED 1
 
 // A field whose name is an index and whose value is spelled out: `val`
 // addresses the entry the name is read from.
-#define H2A_IDX_NAME 2
+#define HTTP2A_IDX_NAME 2
 
 // A field whose name is spelled out as well.
-#define H2A_LIT_NAME 3
+#define HTTP2A_LIT_NAME 3
 
 // The length of a field name, respectively of a value: `val` counts the bytes
 // it occupies on the wire.
-#define H2A_KEY_LEN 4
-#define H2A_VAL_LEN 5
+#define HTTP2A_KEY_LEN 4
+#define HTTP2A_VAL_LEN 5
 
 // A dynamic table size update: `val` is the size the peer resizes to.
-#define H2A_TABLE_SIZE 6
+#define HTTP2A_TABLE_SIZE 6
 
 // The first byte of an integer that does not fit into the prefix of that byte:
 // `val` is the prefix maximum the integer is counted from.
-#define H2A_INT_START 7
+#define HTTP2A_INT_START 7
 
 // A byte of such an integer that is not its last one either.
-#define H2A_INT_CONT 8
+#define HTTP2A_INT_CONT 8
 
 // The name of the field being read just matched a pattern, `val` being the id
 // its value is to be captured under.
-#define H2A_CAPTURE 9
+#define HTTP2A_CAPTURE 9
 
 // The representation is malformed. There is no telling where the next field
 // starts, so the rest of the block is dropped.
-#define H2A_ERR 10
+#define HTTP2A_ERR 10
 
 // The string the action describes is Huffman coded.
-#define H2F_HUFF (1 << 0)
+#define HTTP2F_HUFF (1 << 0)
 
 // The field the action describes is added to the dynamic table.
-#define H2F_ADD_DT (1 << 1)
+#define HTTP2F_ADD_DT (1 << 1)
 
 // The integer the action describes is spread over several bytes, so it is to be
 // read out of the accumulator rather than out of `val`.
-#define H2F_CONT (1 << 2)
+#define HTTP2F_CONT (1 << 2)
 
 // A single action of the DFA. `val` is an index, a length or a table size,
 // depending on `kind`.
@@ -208,7 +208,7 @@ struct {
 // entry. Keeping them on the transition rather than on the state it leads to is
 // what keeps the automaton small: every index a representation can carry is a
 // transition of its own, but all of them lead to the same handful of states.
-struct h2_action {
+struct http2_action {
     u16 val;
     u8 kind;
     u8 flags;
@@ -224,11 +224,11 @@ struct h2_action {
 // actions its transitions carry. User space fills both in before the program is
 // loaded, after which they are read-only.
 volatile const struct trans s2ts[MAX_STATES][MAX_TRANS];
-volatile const struct h2_action a2as[MAX_ACTIONS];
+volatile const struct http2_action a2as[MAX_ACTIONS];
 
 // Reads the action a transition carries. Transition 0 is the one a state
 // without a transition for the byte it read falls back to, and carries none.
-static __always_inline struct h2_action _action(u16 id) {
+static __always_inline struct http2_action _action(u16 id) {
     return a2as[id & (MAX_ACTIONS - 1)];
 }
 
@@ -297,24 +297,24 @@ static __always_inline u32 hpack_huffman_decoded_len(const u8 *src, u16 src__sz)
 // other frame is nothing but its payload.
 //
 // Returns 0, or -1 if the frame is too short to hold what its flags announce.
-static __always_inline int _h2_block(const u8 *data, const u8 *data_end, u32 len, u8 type, u8 flags, u16 *start, u16 *end) {
-    u32 off = H2_FRAME_HDR_LEN;
+static __always_inline int _http2_block(const u8 *data, const u8 *data_end, u32 len, u8 type, u8 flags, u16 *start, u16 *end) {
+    u32 off = HTTP2_FRAME_HDR_LEN;
     u32 pad_len = 0;
 
-    if (type == H2_HEADERS_FRAME) {
-        if ((flags & H2_PADDED_FLAG) != 0) {
+    if (type == HTTP2_HEADERS_FRAME) {
+        if ((flags & HTTP2_PADDED_FLAG) != 0) {
             if (data + off + 1 > data_end) return -1;
             pad_len = data[off];
             off += 1;
         }
 
-        if ((flags & H2_PRIORITY_FLAG) != 0) off += H2_PRIORITY_LEN;
+        if ((flags & HTTP2_PRIORITY_FLAG) != 0) off += HTTP2_PRIORITY_LEN;
     }
 
-    if (off + pad_len > H2_FRAME_HDR_LEN + len) return -1;
+    if (off + pad_len > HTTP2_FRAME_HDR_LEN + len) return -1;
 
     *start = off;
-    *end = H2_FRAME_HDR_LEN + len - pad_len;
+    *end = HTTP2_FRAME_HDR_LEN + len - pad_len;
 
     return 0;
 }
@@ -330,8 +330,8 @@ struct msg_ctx {
 
 // Reads the stream id out of the frame header `data` points at. `data` must be
 // known to hold at least the 9 bytes of a frame header.
-static __always_inline struct h2_frame _new_h2_frame(const u8 *data, u8 type, u8 flags) {
-    return (struct h2_frame) {
+static __always_inline struct http2_frame _new_http2_frame(const u8 *data, u8 type, u8 flags) {
+    return (struct http2_frame) {
         // the top bit of the stream id is reserved
         .sid = ((u32)data[5] << 24 | (u32)data[6] << 16 | (u32)data[7] << 8 | (u32)data[8]) & 0x7FFFFFFF,
         .type = type,
@@ -464,7 +464,7 @@ static __always_inline void _next(u16 state, u8 input, u16 *next_state, u16 *act
 // Looks up the field the HPACK index `idx` refers to, in the static table if it
 // is one of the first `STATIC_TABLE_SIZE` indices and in the dynamic table of
 // `conn` otherwise. `*hf` is NULL if there is no such entry.
-static __always_inline void _get_table_entry(const struct ip4_conn *conn __arg_nonnull, const struct dynamic_table_info *dt_info __arg_nonnull, u32 idx, struct h2_hdr_field **hf) {
+static __always_inline void _get_table_entry(const struct ip4_conn *conn __arg_nonnull, const struct dynamic_table_info *dt_info __arg_nonnull, u32 idx, struct http2_hdr_field **hf) {
     if (!_is_valid_hpack_index(dt_info, idx)) {
         *hf = NULL;
         return;
@@ -483,7 +483,7 @@ static __always_inline void _get_table_entry(const struct ip4_conn *conn __arg_n
 
         // `field` is the first member of `dynamic_table_entry`, so this cast
         // preserves NULL and avoids an extra branch on the lookup result.
-        *hf = (struct h2_hdr_field *)bpf_map_lookup_elem(&dynamic_table, &key);
+        *hf = (struct http2_hdr_field *)bpf_map_lookup_elem(&dynamic_table, &key);
     }
     else {
         *hf = bpf_map_lookup_elem(&static_table, &idx);
@@ -508,8 +508,8 @@ static __always_inline int _match_header_key(const u8 *key __arg_nonnull, u16 ke
         u16 a = 0;
         _next(s, key[j], &s, &a);
 
-        struct h2_action act = _action(a);
-        mid = (act.kind == H2A_CAPTURE) ? (int)(act.val & MAX_MATCH_MASK) : -1;
+        struct http2_action act = _action(a);
+        mid = (act.kind == HTTP2A_CAPTURE) ? (int)(act.val & MAX_MATCH_MASK) : -1;
     }
 
     return mid;
@@ -714,7 +714,7 @@ static __always_inline int _parse_stg_from(const struct msg_ctx *ctx, u16 start,
 // representation, so what is left is the integer a multi byte length or index
 // accumulates into, how many bytes of the string that was announced are still
 // to come, and the field being assembled out of the two.
-struct h2_parse_state {
+struct http2_parse_state {
     // the state of the DFA
     u16 s;
 
@@ -751,12 +751,12 @@ struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 16384);
     __type(key, struct ip4_conn);
-    __type(value, struct h2_parse_state);
+    __type(value, struct http2_parse_state);
 } continued_blocks SEC(".maps");
 
 // Returns the state a header block is read from its first byte with.
-static __always_inline struct h2_parse_state _new_h2_parse_state(void) {
-    return (struct h2_parse_state) {
+static __always_inline struct http2_parse_state _new_http2_parse_state(void) {
+    return (struct http2_parse_state) {
         .s = S_FIELD,
         .k = 0,
         .m = 0,
@@ -772,7 +772,7 @@ static __always_inline struct h2_parse_state _new_h2_parse_state(void) {
         },
         .i = 0,
         .v = 0,
-        .kind = H2A_NONE,
+        .kind = HTTP2A_NONE,
         .flags = 0,
     };
 }
@@ -785,7 +785,7 @@ static __always_inline struct h2_parse_state _new_h2_parse_state(void) {
 // every byte of the block the parser reads.
 //
 // Returns 0, or -1 if the block cannot be read any further.
-__noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struct dynamic_table_info *dt_info __arg_nonnull, struct http_parse_res *pres __arg_nonnull, struct h2_parse_state *ps __arg_nonnull) {
+__noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struct dynamic_table_info *dt_info __arg_nonnull, struct http_parse_res *pres __arg_nonnull, struct http2_parse_state *ps __arg_nonnull) {
     u32 v = ps->v & MAX_BYTES;
 
     bpf_trace("hdr: %d: kind %d, val %d", ps->i, ps->kind, v);
@@ -793,7 +793,7 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
     // a name that is an index has to be read out of a table before it can be
     // matched. Both representations that carry one are handled here, so that the
     // walk over the entry is only built into the program once
-    if (ps->kind == H2A_INDEXED || ps->kind == H2A_IDX_NAME) {
+    if (ps->kind == HTTP2A_INDEXED || ps->kind == HTTP2A_IDX_NAME) {
         u32 idx = ps->v;
         bool in_range = _is_valid_hpack_index(dt_info, idx);
 
@@ -805,7 +805,7 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
             if (slot > 0xffff) slot = 0;
         }
 
-        ps->add_to_dt = (ps->flags & H2F_ADD_DT) != 0;
+        ps->add_to_dt = (ps->flags & HTTP2F_ADD_DT) != 0;
         ps->cid = -1;
 
         // an index that cannot be reported is reported as 0, which names no
@@ -817,7 +817,7 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
             .huff = false,
         };
 
-        struct h2_hdr_field *hf = NULL;
+        struct http2_hdr_field *hf = NULL;
         _get_table_entry(&ctx->conn, dt_info, idx, &hf);
         if (hf == NULL) return 0;
 
@@ -827,7 +827,7 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
         int mid = _match_header_key(hf->key, key_len);
         if (mid < 0) return 0;
 
-        if (ps->kind == H2A_IDX_NAME) {
+        if (ps->kind == HTTP2A_IDX_NAME) {
             ps->cid = mid;
             return 0;
         }
@@ -844,18 +844,18 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
         return 0;
     }
 
-    if (ps->kind == H2A_LIT_NAME) {
-        ps->add_to_dt = (ps->flags & H2F_ADD_DT) != 0;
+    if (ps->kind == HTTP2A_LIT_NAME) {
+        ps->add_to_dt = (ps->flags & HTTP2F_ADD_DT) != 0;
         ps->cid = -1;
         return 0;
     }
 
-    if (ps->kind == H2A_KEY_LEN) {
+    if (ps->kind == HTTP2A_KEY_LEN) {
         ps->key = (struct http_match) {
             .idx = ps->i + 1,
             .len = v,
             .in_msg = true,
-            .huff = (ps->flags & H2F_HUFF) != 0,
+            .huff = (ps->flags & HTTP2F_HUFF) != 0,
         };
 
         ps->skip = v;
@@ -865,12 +865,12 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
         return 0;
     }
 
-    if (ps->kind == H2A_VAL_LEN) {
+    if (ps->kind == HTTP2A_VAL_LEN) {
         struct http_match val = (struct http_match) {
             .idx = ps->i + 1,
             .len = v,
             .in_msg = true,
-            .huff = (ps->flags & H2F_HUFF) != 0,
+            .huff = (ps->flags & HTTP2F_HUFF) != 0,
         };
 
         if (ps->add_to_dt) {
@@ -888,13 +888,13 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
         return 0;
     }
 
-    if (ps->kind == H2A_TABLE_SIZE) {
+    if (ps->kind == HTTP2A_TABLE_SIZE) {
         bpf_debug("hdr: table size update: %u", ps->v);
         dt_info->max_size = ps->v;
         return 0;
     }
 
-    if (ps->kind == H2A_ERR) {
+    if (ps->kind == HTTP2A_ERR) {
         bpf_debug("hdr: malformed representation at %d", ps->i);
         return -1;
     }
@@ -906,14 +906,14 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
 // the values of the fields whose name matches a pattern in `pres`. Fields the
 // peer adds to its dynamic table are added to the mirrored one, so that later
 // blocks can resolve the indices referring to them. `ps` is where the walk
-// picks up, which for the beginning of a block is `_new_h2_parse_state`.
+// picks up, which for the beginning of a block is `_new_http2_parse_state`.
 //
 // `null_prefix` is the length of the run of NUL bytes at the beginning of the
 // buffer that is to be skipped rather than parsed; it is updated as those bytes
 // are consumed. It may be NULL if the data cannot carry such a prefix.
 //
 // Returns the offset it stopped at, which is `end` if the whole block was read.
-static __always_inline int _parse_hdr_from(const struct msg_ctx *ctx, u16 start, u16 end, struct dynamic_table_info *dt_info, struct h2_parse_state *ps, struct http_parse_res *pres, struct null_prefix *null_prefix) {
+static __always_inline int _parse_hdr_from(const struct msg_ctx *ctx, u16 start, u16 end, struct dynamic_table_info *dt_info, struct http2_parse_state *ps, struct http_parse_res *pres, struct null_prefix *null_prefix) {
     const u8 *data = ctx->data;
     const u8 *data_end = ctx->data_end;
 
@@ -938,8 +938,8 @@ static __always_inline int _parse_hdr_from(const struct msg_ctx *ctx, u16 start,
                 u16 a = 0;
                 _next(ps->s, c, &ps->s, &a);
 
-                struct h2_action act = _action(a);
-                ps->cid = (act.kind == H2A_CAPTURE) ? (s8)(act.val & MAX_MATCH_MASK) : -1;
+                struct http2_action act = _action(a);
+                ps->cid = (act.kind == HTTP2A_CAPTURE) ? (s8)(act.val & MAX_MATCH_MASK) : -1;
             }
 
             ps->skip--;
@@ -950,14 +950,14 @@ static __always_inline int _parse_hdr_from(const struct msg_ctx *ctx, u16 start,
 
         u16 a = 0;
         _next(ps->s, c, &ps->s, &a);
-        struct h2_action act = _action(a);
+        struct http2_action act = _action(a);
 
-        if (act.kind == H2A_INT_START) {
+        if (act.kind == HTTP2A_INT_START) {
             ps->k = act.val;
             ps->m = 0;
             continue;
         }
-        if (act.kind == H2A_INT_CONT) {
+        if (act.kind == HTTP2A_INT_CONT) {
             // an integer wider than the longest block the parser reads is of no
             // use, and shifting by more than the width of the accumulator is
             // not defined. Such an integer is left short, which makes the field
@@ -972,7 +972,7 @@ static __always_inline int _parse_hdr_from(const struct msg_ctx *ctx, u16 start,
 
         ps->i = i;
         ps->v = act.val;
-        if ((act.flags & H2F_CONT) != 0) {
+        if ((act.flags & HTTP2F_CONT) != 0) {
             ps->v = ps->k;
             if (ps->m <= 28) ps->v += (u32)(c & 0x7F) << ps->m;
         }
@@ -998,9 +998,9 @@ static __always_inline int _parse_hdr_frame(const struct msg_ctx *ctx, u16 start
     struct dynamic_table_info *dt_info = _get_dynamic_table(&ctx->conn);
     if (!dt_info) return start;
 
-    struct h2_parse_state ps = _new_h2_parse_state();
-    if (type == H2_CONTINUATION_FRAME) {
-        struct h2_parse_state *resumed = bpf_map_lookup_elem(&continued_blocks, &ctx->conn);
+    struct http2_parse_state ps = _new_http2_parse_state();
+    if (type == HTTP2_CONTINUATION_FRAME) {
+        struct http2_parse_state *resumed = bpf_map_lookup_elem(&continued_blocks, &ctx->conn);
         if (resumed == NULL) {
             bpf_debug("hdr: a continuation of a block that was not followed");
             return end;
@@ -1011,7 +1011,7 @@ static __always_inline int _parse_hdr_frame(const struct msg_ctx *ctx, u16 start
 
     int res = _parse_hdr_from(ctx, start, end, dt_info, &ps, pres, null_prefix);
 
-    if ((flags & H2_END_HEADERS_FLAG) != 0) {
+    if ((flags & HTTP2_END_HEADERS_FLAG) != 0) {
         bpf_map_delete_elem(&continued_blocks, &ctx->conn);
         return res;
     }
@@ -1034,15 +1034,15 @@ static __always_inline int _parse_hdr_frame(const struct msg_ctx *ctx, u16 start
 // Whether a frame carries anything the parser reads: a header block, or the
 // settings of a SETTINGS frame that is not an acknowledgement.
 static __always_inline bool _is_parsed_frame(u8 type, u8 flags) {
-    bool is_hdr = (type == H2_HEADERS_FRAME || type == H2_CONTINUATION_FRAME);
-    bool is_stg = (type == H2_SETTINGS_FRAME && flags == 0);
+    bool is_hdr = (type == HTTP2_HEADERS_FRAME || type == HTTP2_CONTINUATION_FRAME);
+    bool is_stg = (type == HTTP2_SETTINGS_FRAME && flags == 0);
 
     return is_hdr || is_stg;
 }
 
 // Describes the dynamic table of `conn` in `frame` for a frame that leaves it
 // untouched.
-static __always_inline void _skip_frame(const struct ip4_conn *conn, struct h2_frame *frame) {
+static __always_inline void _skip_frame(const struct ip4_conn *conn, struct http2_frame *frame) {
     struct dynamic_table_info *dt_info = bpf_map_lookup_elem(&dynamic_table_info, conn);
     u32 count = dt_info ? dt_info->count : 0;
 
@@ -1056,12 +1056,12 @@ static __always_inline void _skip_frame(const struct ip4_conn *conn, struct h2_f
 // the mirrored dynamic table. The captured ranges are offsets into `ctx`.
 //
 // Returns 0, or -1 if the frame could not be read to its end.
-static __always_inline int _parse_frame(const struct msg_ctx *ctx, u32 off, u32 len, u8 type, u8 flags, struct http_parse_res *pres, struct h2_frame *frame, struct null_prefix *null_prefix) {
+static __always_inline int _parse_frame(const struct msg_ctx *ctx, u32 off, u32 len, u8 type, u8 flags, struct http_parse_res *pres, struct http2_frame *frame, struct null_prefix *null_prefix) {
     if (off > MAX_BYTES) return -1;
     bpf_clamp_uminmax(off, 0, MAX_BYTES);
 
     u16 start = 0, end = 0;
-    if (_h2_block(ctx->data + off, ctx->data_end, len, type, flags, &start, &end) < 0) return -1;
+    if (_http2_block(ctx->data + off, ctx->data_end, len, type, flags, &start, &end) < 0) return -1;
 
     // the parser walks at most `MAX_BYTES` into the data, so a frame reaching
     // past them could not be read to its end anyway
@@ -1075,7 +1075,7 @@ static __always_inline int _parse_frame(const struct msg_ctx *ctx, u32 off, u32 
     frame->dt_count_before = dt_info ? dt_info->count : 0;
 
     int res;
-    if (type == H2_SETTINGS_FRAME) {
+    if (type == HTTP2_SETTINGS_FRAME) {
         u16 s = S_FIELD;
         res = _parse_stg_from(ctx, start, end, &s, pres, null_prefix);
     } else {
@@ -1099,18 +1099,18 @@ static __always_inline int _parse_frame(const struct msg_ctx *ctx, u32 off, u32 
 // Returns the number of bytes the frame occupies, or a negative value if the
 // message ends before the frame does.
 SEC("freplace")
-int parse_msg(struct sk_msg_md *msg, struct http_parse_res *pres __arg_nonnull, struct h2_frame *frame __arg_nonnull) {
+int parse_msg(struct sk_msg_md *msg, struct http_parse_res *pres __arg_nonnull, struct http2_frame *frame __arg_nonnull) {
     u8 *data = (u8 *)(long)msg->data;
     u8 *data_end = (u8 *)(long)msg->data_end;
 
-    if (data + H2_FRAME_HDR_LEN > data_end) return 0;
+    if (data + HTTP2_FRAME_HDR_LEN > data_end) return 0;
 
     u32 len = data[0] << 16 | data[1] << 8 | data[2];
     u8 type = data[3];
     u8 flags = data[4];
-    u32 frame_len = H2_FRAME_HDR_LEN + len;
+    u32 frame_len = HTTP2_FRAME_HDR_LEN + len;
 
-    *frame = _new_h2_frame(data, type, flags);
+    *frame = _new_http2_frame(data, type, flags);
 
     bpf_debug("Parsing HTTP/2 message with length %d, type %d, flags %d", len, type, flags);
 
@@ -1136,31 +1136,31 @@ int parse_msg(struct sk_msg_md *msg, struct http_parse_res *pres __arg_nonnull, 
 // sk_buff. See `parse_msg` for what is parsed and for the return value, which
 // is counted from the start of the frame.
 SEC("freplace")
-int parse_skb(struct __sk_buff *skb, u32 off, struct http_parse_res *pres __arg_nonnull, struct h2_frame *frame __arg_nonnull, struct null_prefix *null_prefix) {
+int parse_skb(struct __sk_buff *skb, u32 off, struct http_parse_res *pres __arg_nonnull, struct http2_frame *frame __arg_nonnull, struct null_prefix *null_prefix) {
     if (off > MAX_BYTES) return -1;
-    if (skb->len < off + H2_FRAME_HDR_LEN) return 0;
+    if (skb->len < off + HTTP2_FRAME_HDR_LEN) return 0;
     bpf_clamp_uminmax(off, 0, MAX_BYTES);
 
     u8 *data = (u8 *)(long)skb->data;
     u8 *data_end = (u8 *)(long)skb->data_end;
 
     // the linear part may well be empty, with everything in the fragments
-    if (data + off + H2_FRAME_HDR_LEN > data_end) {
-        if (bpf_skb_pull_data(skb, off + H2_FRAME_HDR_LEN) < 0) return 0;
+    if (data + off + HTTP2_FRAME_HDR_LEN > data_end) {
+        if (bpf_skb_pull_data(skb, off + HTTP2_FRAME_HDR_LEN) < 0) return 0;
 
         data = (u8 *)(long)skb->data;
         data_end = (u8 *)(long)skb->data_end;
     }
 
     u8 *hdr = data + off;
-    if (hdr + H2_FRAME_HDR_LEN > data_end) return 0;
+    if (hdr + HTTP2_FRAME_HDR_LEN > data_end) return 0;
 
     u32 len = hdr[0] << 16 | hdr[1] << 8 | hdr[2];
     u8 type = hdr[3];
     u8 flags = hdr[4];
-    u32 frame_len = H2_FRAME_HDR_LEN + len;
+    u32 frame_len = HTTP2_FRAME_HDR_LEN + len;
 
-    *frame = _new_h2_frame(hdr, type, flags);
+    *frame = _new_http2_frame(hdr, type, flags);
 
     bpf_debug("Parsing HTTP/2 sk_buff with length %d, type %d, flags %d", len, type, flags);
 
@@ -1185,11 +1185,11 @@ int parse_skb(struct __sk_buff *skb, u32 off, struct http_parse_res *pres __arg_
 // as `_get_table_entry` counts it. Returns 0 on success, -1 if there is no
 // such entry.
 SEC("freplace")
-int get_dt_entry(const struct ip4_conn *conn __arg_nonnull, u32 idx, struct h2_hdr_field *out __arg_nonnull) {
+int get_dt_entry(const struct ip4_conn *conn __arg_nonnull, u32 idx, struct http2_hdr_field *out __arg_nonnull) {
     struct dynamic_table_info *dt_info = bpf_map_lookup_elem(&dynamic_table_info, conn);
     if (dt_info == NULL) return -1;
 
-    struct h2_hdr_field *hf = NULL;
+    struct http2_hdr_field *hf = NULL;
     _get_table_entry(conn, dt_info, idx, &hf);
     if (hf == NULL) return -1;
 

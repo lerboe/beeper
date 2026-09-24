@@ -14,29 +14,29 @@ const u16 s_init = 0;
 const u16 s_any = 1;
 
 // What the parser does upon taking a transition. Must stay in sync with the
-// action kinds of h1/action.rs.
+// action kinds of http1/action.rs.
 
 // Nothing.
-#define H1A_NONE 0
+#define HTTP1A_NONE 0
 
 // A capture starts at the byte behind the transition: `cid` names the one whose
 // start index is to be written down.
-#define H1A_START_CAPTURE 1
+#define HTTP1A_START_CAPTURE 1
 
 // The open capture ends at the byte the transition read: `cid` names the one
 // whose start index is to be read back, `mid` the match its range is reported
 // under.
-#define H1A_END_CAPTURE 2
+#define HTTP1A_END_CAPTURE 2
 
 // Parsing is complete, the rest of the message is not a header anymore.
-#define H1F_DONE (1 << 0)
+#define HTTP1F_DONE (1 << 0)
 
 // A single action of the DFA.
 //
 // Actions are kept in a table of their own so that a transition only has to
 // name the index of the one it carries, which leaves room for saying more than
 // the 16 bits of a transition would hold.
-struct h1_action {
+struct http1_action {
     u8 kind;
     u8 flags;
     u8 mid;
@@ -53,11 +53,11 @@ struct h1_action {
 // actions its transitions carry. User space fills both in before the program is
 // loaded, after which they are read-only.
 volatile const struct trans s2ts[MAX_STATES][MAX_TRANS];
-volatile const struct h1_action a2as[MAX_ACTIONS];
+volatile const struct http1_action a2as[MAX_ACTIONS];
 
 // Reads the action a transition carries. Transition 0 is the one a state
 // without a transition for the byte it read falls back to, and carries none.
-static __always_inline struct h1_action _action(u16 id) {
+static __always_inline struct http1_action _action(u16 id) {
     return a2as[id & (MAX_ACTIONS - 1)];
 }
 
@@ -120,13 +120,13 @@ static __always_inline int _parse_from(u8 *data, u8 *data_end, u16 start, struct
             _next(s_any, c, s, &a);
         }
 
-        struct h1_action act = _action(a);
-        if (act.kind == H1A_START_CAPTURE) {
+        struct http1_action act = _action(a);
+        if (act.kind == HTTP1A_START_CAPTURE) {
             u16 mid = act.mid & MAX_MATCH_MASK;
             bpf_debug("start capture range (%d) in [%d, ...]", mid, i+1);
             cidx[mid] = i + 1;
         }
-        else if (act.kind == H1A_END_CAPTURE) {
+        else if (act.kind == HTTP1A_END_CAPTURE) {
             u16 mid = act.mid & MAX_MATCH_MASK;
             bpf_debug("end capture range (%d) in [%d, %d]", mid, cidx[mid], i - cidx[mid] + 1);
 
@@ -137,7 +137,7 @@ static __always_inline int _parse_from(u8 *data, u8 *data_end, u16 start, struct
             };
         }
 
-        if ((act.flags & H1F_DONE) != 0) {
+        if ((act.flags & HTTP1F_DONE) != 0) {
             bpf_debug("done parsing at %d", i);
             return i+1;
         }

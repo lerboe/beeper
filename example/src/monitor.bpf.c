@@ -42,16 +42,16 @@ volatile const u8 h1_accept_language_mid;
 volatile const u8 h1_status_mid;
 
 // The frame type carrying a message's body, see section 6.1 of RFC 9113.
-#define H2_DATA_FRAME 0x00
+#define HTTP2_DATA_FRAME 0x00
 
 // The functions beeper replaces with an HTTP/1.1 parser.
-BEEPER_MATCHED(matched_h1)
-BEEPER_EXTRACT_MATCH_MSG(extract_h1_match)
-BEEPER_H1_PARSE_MSG(parse_h1)
+BEEPER_MATCHED(matched_http1)
+BEEPER_EXTRACT_MATCH_MSG(extract_http1_match)
+BEEPER_HTTP1_PARSE_MSG(parse_http1)
 
 // The function beeper replaces with an HTTP/2 parser. Its header fields are
 // not captured, so there is no extract stub to replace.
-BEEPER_H2_PARSE_MSG(parse_h2)
+BEEPER_HTTP2_PARSE_MSG(parse_http2)
 
 // The size of the buffer a value is copied into before it is logged.
 #define FIELD_MAXLEN 128
@@ -84,17 +84,17 @@ static __always_inline void copy_bounded(const void *ptr, u32 len, char buf[FIEL
 
 // Logs an HTTP/1.1 request: its path and its Accept-Language header, if it
 // sent one.
-static __always_inline void log_h1_request(struct sk_msg_md *msg, struct http_parse_res *pres) {
+static __always_inline void log_http1_request(struct sk_msg_md *msg, struct http_parse_res *pres) {
     u32 zero = 0;
     struct log_scratch *scratch = bpf_map_lookup_elem(&log_scratch_map, &zero);
     if (!scratch) return;
 
     struct bytes path = { 0 };
-    if (extract_h1_match(msg, pres, h1_path_mid, &path) < 0) return;
+    if (extract_http1_match(msg, pres, h1_path_mid, &path) < 0) return;
     copy_bounded(path.ptr, path.len, scratch->a);
 
     struct bytes lang = { 0 };
-    if (extract_h1_match(msg, pres, h1_accept_language_mid, &lang) == 0) {
+    if (extract_http1_match(msg, pres, h1_accept_language_mid, &lang) == 0) {
         copy_bounded(lang.ptr, lang.len, scratch->b);
         bpf_debug("--> %s accept-language: %s", scratch->a, scratch->b);
     } else {
@@ -104,13 +104,13 @@ static __always_inline void log_h1_request(struct sk_msg_md *msg, struct http_pa
 
 // Logs an HTTP/1.1 response: its status and its body, which sits right behind
 // the header block `hdr_len` bytes into the message.
-static __always_inline void log_h1_response(struct sk_msg_md *msg, struct http_parse_res *pres, int hdr_len) {
+static __always_inline void log_http1_response(struct sk_msg_md *msg, struct http_parse_res *pres, int hdr_len) {
     u32 zero = 0;
     struct log_scratch *scratch = bpf_map_lookup_elem(&log_scratch_map, &zero);
     if (!scratch) return;
 
     struct bytes status = { 0 };
-    if (extract_h1_match(msg, pres, h1_status_mid, &status) < 0) return;
+    if (extract_http1_match(msg, pres, h1_status_mid, &status) < 0) return;
     copy_bounded(status.ptr, status.len, scratch->a);
 
     copy_bounded((u8 *)(long)msg->data + hdr_len, msg->size - hdr_len, scratch->b);
@@ -120,10 +120,10 @@ static __always_inline void log_h1_response(struct sk_msg_md *msg, struct http_p
 
 // Logs an HTTP/2 frame. Its header fields are Huffman coded, so only its type
 // and stream are logged, except for a DATA frame, whose body is plain text.
-static __always_inline void log_h2_frame(struct sk_msg_md *msg, struct h2_frame *frame, int frame_len, bool is_downstream) {
+static __always_inline void log_http2_frame(struct sk_msg_md *msg, struct http2_frame *frame, int frame_len, bool is_downstream) {
     const char *arrow = is_downstream ? "-->" : "<--";
 
-    if (frame->type == H2_DATA_FRAME) {
+    if (frame->type == HTTP2_DATA_FRAME) {
         u32 zero = 0;
         struct log_scratch *scratch = bpf_map_lookup_elem(&log_scratch_map, &zero);
         if (!scratch) return;
@@ -160,22 +160,22 @@ int msg_verdict(struct sk_msg_md *msg) {
     struct http_parse_res pres = { 0 };
 
     if (is_h2) {
-        struct h2_frame frame = { 0 };
-        msg_len = parse_h2(msg, &pres, &frame);
+        struct http2_frame frame = { 0 };
+        msg_len = parse_http2(msg, &pres, &frame);
         if (msg_len < 0) {
             bpf_error("Failed to parse h2 message");
             return SK_PASS;
         }
 
-        log_h2_frame(msg, &frame, msg_len, is_downstream);
+        log_http2_frame(msg, &frame, msg_len, is_downstream);
     }
     else {
-        msg_len = parse_h1(msg, &pres);
+        msg_len = parse_http1(msg, &pres);
         if (msg_len < 0) {
             return SK_PASS;
         }
 
-        if (matched_h1(&pres, h1_preface_mid)) {
+        if (matched_http1(&pres, h1_preface_mid)) {
             bpf_trace("Upgrading connection to HTTP/2");
 
             // the preface only ever arrives on the client's own socket, but
@@ -193,9 +193,9 @@ int msg_verdict(struct sk_msg_md *msg) {
         }
 
         if (is_downstream) {
-            log_h1_request(msg, &pres);
+            log_http1_request(msg, &pres);
         } else {
-            log_h1_response(msg, &pres, msg_len);
+            log_http1_response(msg, &pres, msg_len);
         }
     }
 
