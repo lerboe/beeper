@@ -85,6 +85,10 @@ u32 last_dt_count = 0;
 // parsed, one bit per id.
 u32 last_matches = 0;
 
+// The HTTP/2 frames handed to the parser, and the ones it failed to parse.
+u64 num_h2_frames = 0;
+u64 num_h2_errors = 0;
+
 // Records which of the 32 match ids the parser captured a value for.
 static __always_inline void store_matched(const struct http_parse_res *pres, bool is_h2) {
     u32 mask = 0;
@@ -147,7 +151,9 @@ int msg_verdict(struct sk_msg_md *msg) {
     if (is_h2) {
         struct http2_frame frame = { 0 };
         msg_len = parse_http2_msg(msg, &pres, &frame);
+        __sync_fetch_and_add(&num_h2_frames, 1);
         if (msg_len < 0) {
+            __sync_fetch_and_add(&num_h2_errors, 1);
             bpf_error("Failed to parse h2 message: %s", msg->data);
             return SK_PASS;
         }
@@ -270,7 +276,9 @@ int skb_verdict(struct __sk_buff *skb) {
     if (is_h2) {
         struct http2_frame frame = { 0 };
         int len = parse_http2_skb(skb, off, &pres, &frame, NULL);
+        __sync_fetch_and_add(&num_h2_frames, 1);
         if (len < 0) {
+            __sync_fetch_and_add(&num_h2_errors, 1);
             bpf_error("Failed to parse h2 skb");
             return SK_PASS;
         }
