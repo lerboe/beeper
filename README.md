@@ -65,7 +65,7 @@ volatile const u8 h2_content_length_mid;
 
 SEC("sk_msg")
 int msg_verdict(struct sk_msg_md *msg) {
-    struct parse_res pres = { 0 };
+    struct http_parse_res pres = { 0 };
     struct h2_frame frame = { 0 };
     int msg_len = parse_h2(msg, &pres, &frame);
     if (msg_len >= 0) {

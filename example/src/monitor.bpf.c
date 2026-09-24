@@ -84,7 +84,7 @@ static __always_inline void copy_bounded(const void *ptr, u32 len, char buf[FIEL
 
 // Logs an HTTP/1.1 request: its path and its Accept-Language header, if it
 // sent one.
-static __always_inline void log_h1_request(struct sk_msg_md *msg, struct parse_res *pres) {
+static __always_inline void log_h1_request(struct sk_msg_md *msg, struct http_parse_res *pres) {
     u32 zero = 0;
     struct log_scratch *scratch = bpf_map_lookup_elem(&log_scratch_map, &zero);
     if (!scratch) return;
@@ -104,7 +104,7 @@ static __always_inline void log_h1_request(struct sk_msg_md *msg, struct parse_r
 
 // Logs an HTTP/1.1 response: its status and its body, which sits right behind
 // the header block `hdr_len` bytes into the message.
-static __always_inline void log_h1_response(struct sk_msg_md *msg, struct parse_res *pres, int hdr_len) {
+static __always_inline void log_h1_response(struct sk_msg_md *msg, struct http_parse_res *pres, int hdr_len) {
     u32 zero = 0;
     struct log_scratch *scratch = bpf_map_lookup_elem(&log_scratch_map, &zero);
     if (!scratch) return;
@@ -157,7 +157,7 @@ int msg_verdict(struct sk_msg_md *msg) {
 
     bool is_h2 = (bpf_map_lookup_elem(&upgraded_conns, &ikey) != NULL);
     int msg_len;
-    struct parse_res pres = { 0 };
+    struct http_parse_res pres = { 0 };
 
     if (is_h2) {
         struct h2_frame frame = { 0 };

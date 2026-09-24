@@ -34,7 +34,7 @@ volatile const u32 ip4;
 volatile const u32 port;
 
 // parse the responses the server sends instead of the requests it receives
-volatile const bool parse_resp;
+volatile const bool http_parse_resp;
 
 // the parsers run at the `sk_skb` hook rather than at `sk_msg`
 volatile const bool hook_skb;
@@ -86,7 +86,7 @@ u32 last_dt_count = 0;
 u32 last_matches = 0;
 
 // Records which of the 32 match ids the parser captured a value for.
-static __always_inline void store_matched(const struct parse_res *pres, bool is_h2) {
+static __always_inline void store_matched(const struct http_parse_res *pres, bool is_h2) {
     u32 mask = 0;
     u32 i = 0;
     bpf_for(i, 0, 32) {
@@ -135,14 +135,14 @@ int msg_verdict(struct sk_msg_md *msg) {
 
     // requests travel downstream, responses upstream. only one direction is parsed,
     // the other one would just clear the matches of the first
-    if (is_downstream == parse_resp) {
+    if (is_downstream == http_parse_resp) {
         return SK_PASS;
     }
 
     bool is_h2 = (bpf_map_lookup_elem(&upgraded_conns, &ikey) != NULL);
     bool store_matches = false;
     int msg_len = 0;
-    struct parse_res pres = { 0 };
+    struct http_parse_res pres = { 0 };
 
     if (is_h2) {
         struct h2_frame frame = { 0 };
@@ -258,14 +258,14 @@ int skb_verdict(struct __sk_buff *skb) {
     bool is_downstream = (ikey.local.ip4 == ip4 && ikey.local.port == port);
     bpf_trace("Processing %dB skb on [%pI4:%u->%pI4:%u] (downstream: %d)", skb->len, &ikey.local.ip4, ikey.local.port, &ikey.remote.ip4, ikey.remote.port, is_downstream);
 
-    if (is_downstream == parse_resp) {
+    if (is_downstream == http_parse_resp) {
         return SK_PASS;
     }
 
     u32 off = strp_offset(skb);
     bool is_h2 = (bpf_map_lookup_elem(&upgraded_conns, &ikey) != NULL);
     bool store_matches = false;
-    struct parse_res pres = { 0 };
+    struct http_parse_res pres = { 0 };
 
     if (is_h2) {
         struct h2_frame frame = { 0 };
@@ -335,8 +335,8 @@ int monitor_sockets(struct bpf_sock_ops *ops) {
         // ends of the connection. Only the end that is parsed goes into the
         // map: a stream parser cuts up everything the map holds, and cutting a
         // direction this program does not parse stalls it.
-        bool parsed_here = hook_skb ? (parse_resp ? is_client : is_server)
-                                    : (parse_resp ? is_server : is_client);
+        bool parsed_here = hook_skb ? (http_parse_resp ? is_client : is_server)
+                                    : (http_parse_resp ? is_server : is_client);
 
         if (parsed_here) {
             if (bpf_sock_hash_update(ops, &sock_map, &skey, BPF_ANY) < 0) {

@@ -402,7 +402,7 @@ static __always_inline bool _is_valid_hpack_index(const struct dynamic_table_inf
 // itself or, if the peer only referenced the field by index, in the static or
 // the dynamic table. `is_key` selects the name of a table entry over its value.
 // `*out` is left untouched if the match cannot be resolved.
-static __always_inline void _extract_match(const struct msg_ctx *ctx, const struct hdr_match *m, bool is_key, u8 **out, u32 *len, bool *huff) {
+static __always_inline void _extract_match(const struct msg_ctx *ctx, const struct http_match *m, bool is_key, u8 **out, u32 *len, bool *huff) {
     if (m->in_msg) {
         if (ctx->data + m->idx + m->len > ctx->data_end) return;
         *out = ctx->data + m->idx;
@@ -580,7 +580,7 @@ static __always_inline u32 _try_evict_dynamic_table_entries(const struct msg_ctx
 //
 // Returns 0 if the entry was added, -1 if it could not be resolved or does not
 // fit into the table even when emptied, in which case the peer drops it too.
-static __always_inline int _add_dynamic_table_entry(const struct msg_ctx *ctx __arg_nonnull, struct dynamic_table_info *dt_info __arg_nonnull, const struct hdr_match *key __arg_nonnull, const struct hdr_match *val __arg_nonnull) {
+static __always_inline int _add_dynamic_table_entry(const struct msg_ctx *ctx __arg_nonnull, struct dynamic_table_info *dt_info __arg_nonnull, const struct http_match *key __arg_nonnull, const struct http_match *val __arg_nonnull) {
     if (dt_info->dirty) return -1;
 
     u8 *key_ptr = NULL;
@@ -657,7 +657,7 @@ static __always_inline int _add_dynamic_table_entry(const struct msg_ctx *ctx __
 // the ones that resize the dynamic table. Returns the offset it stopped at.
 //
 // See `_parse_hdr_from` for `start`, `end` and `null_prefix`.
-static __always_inline int _parse_stg_from(const struct msg_ctx *ctx, u16 start, u16 end, u16 *s, struct parse_res *pres, struct null_prefix *null_prefix) {
+static __always_inline int _parse_stg_from(const struct msg_ctx *ctx, u16 start, u16 end, u16 *s, struct http_parse_res *pres, struct null_prefix *null_prefix) {
     const u8 *data = ctx->data;
     const u8 *data_end = ctx->data_end;
     u32 len = (u32)(data_end - data);
@@ -735,7 +735,7 @@ struct h2_parse_state {
     u8 add_to_dt;
 
     // the name of that field
-    struct hdr_match key;
+    struct http_match key;
 
     // the offset of the byte being read, and the action and the integer of the
     // transition it took
@@ -785,7 +785,7 @@ static __always_inline struct h2_parse_state _new_h2_parse_state(void) {
 // every byte of the block the parser reads.
 //
 // Returns 0, or -1 if the block cannot be read any further.
-__noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struct dynamic_table_info *dt_info __arg_nonnull, struct parse_res *pres __arg_nonnull, struct h2_parse_state *ps __arg_nonnull) {
+__noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struct dynamic_table_info *dt_info __arg_nonnull, struct http_parse_res *pres __arg_nonnull, struct h2_parse_state *ps __arg_nonnull) {
     u32 v = ps->v & MAX_BYTES;
 
     bpf_trace("hdr: %d: kind %d, val %d", ps->i, ps->kind, v);
@@ -810,7 +810,7 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
 
         // an index that cannot be reported is reported as 0, which names no
         // entry either
-        ps->key = (struct hdr_match) {
+        ps->key = (struct http_match) {
             .idx = slot,
             .len = 0,
             .in_msg = false,
@@ -834,7 +834,7 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
 
         // both halves of the field are in the table, so the value is reported
         // as the index it is to be read back with
-        pres->ms[mid & MAX_MATCH_MASK] = (struct hdr_match) {
+        pres->ms[mid & MAX_MATCH_MASK] = (struct http_match) {
             .idx = slot,
             .len = HEADER_FIELD_MASK,
             .in_msg = false,
@@ -851,7 +851,7 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
     }
 
     if (ps->kind == H2A_KEY_LEN) {
-        ps->key = (struct hdr_match) {
+        ps->key = (struct http_match) {
             .idx = ps->i + 1,
             .len = v,
             .in_msg = true,
@@ -866,7 +866,7 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
     }
 
     if (ps->kind == H2A_VAL_LEN) {
-        struct hdr_match val = (struct hdr_match) {
+        struct http_match val = (struct http_match) {
             .idx = ps->i + 1,
             .len = v,
             .in_msg = true,
@@ -913,7 +913,7 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
 // are consumed. It may be NULL if the data cannot carry such a prefix.
 //
 // Returns the offset it stopped at, which is `end` if the whole block was read.
-static __always_inline int _parse_hdr_from(const struct msg_ctx *ctx, u16 start, u16 end, struct dynamic_table_info *dt_info, struct h2_parse_state *ps, struct parse_res *pres, struct null_prefix *null_prefix) {
+static __always_inline int _parse_hdr_from(const struct msg_ctx *ctx, u16 start, u16 end, struct dynamic_table_info *dt_info, struct h2_parse_state *ps, struct http_parse_res *pres, struct null_prefix *null_prefix) {
     const u8 *data = ctx->data;
     const u8 *data_end = ctx->data_end;
 
@@ -994,7 +994,7 @@ static __always_inline int _parse_hdr_from(const struct msg_ctx *ctx, u16 start,
 // mirrored, so the dynamic table is marked as drifted.
 //
 // Returns the offset it stopped at, see `_parse_hdr_from`.
-static __always_inline int _parse_hdr_frame(const struct msg_ctx *ctx, u16 start, u16 end, u8 type, u8 flags, struct parse_res *pres, struct null_prefix *null_prefix) {
+static __always_inline int _parse_hdr_frame(const struct msg_ctx *ctx, u16 start, u16 end, u8 type, u8 flags, struct http_parse_res *pres, struct null_prefix *null_prefix) {
     struct dynamic_table_info *dt_info = _get_dynamic_table(&ctx->conn);
     if (!dt_info) return start;
 
@@ -1056,7 +1056,7 @@ static __always_inline void _skip_frame(const struct ip4_conn *conn, struct h2_f
 // the mirrored dynamic table. The captured ranges are offsets into `ctx`.
 //
 // Returns 0, or -1 if the frame could not be read to its end.
-static __always_inline int _parse_frame(const struct msg_ctx *ctx, u32 off, u32 len, u8 type, u8 flags, struct parse_res *pres, struct h2_frame *frame, struct null_prefix *null_prefix) {
+static __always_inline int _parse_frame(const struct msg_ctx *ctx, u32 off, u32 len, u8 type, u8 flags, struct http_parse_res *pres, struct h2_frame *frame, struct null_prefix *null_prefix) {
     if (off > MAX_BYTES) return -1;
     bpf_clamp_uminmax(off, 0, MAX_BYTES);
 
@@ -1099,7 +1099,7 @@ static __always_inline int _parse_frame(const struct msg_ctx *ctx, u32 off, u32 
 // Returns the number of bytes the frame occupies, or a negative value if the
 // message ends before the frame does.
 SEC("freplace")
-int parse_msg(struct sk_msg_md *msg, struct parse_res *pres __arg_nonnull, struct h2_frame *frame __arg_nonnull) {
+int parse_msg(struct sk_msg_md *msg, struct http_parse_res *pres __arg_nonnull, struct h2_frame *frame __arg_nonnull) {
     u8 *data = (u8 *)(long)msg->data;
     u8 *data_end = (u8 *)(long)msg->data_end;
 
@@ -1136,7 +1136,7 @@ int parse_msg(struct sk_msg_md *msg, struct parse_res *pres __arg_nonnull, struc
 // sk_buff. See `parse_msg` for what is parsed and for the return value, which
 // is counted from the start of the frame.
 SEC("freplace")
-int parse_skb(struct __sk_buff *skb, u32 off, struct parse_res *pres __arg_nonnull, struct h2_frame *frame __arg_nonnull, struct null_prefix *null_prefix) {
+int parse_skb(struct __sk_buff *skb, u32 off, struct http_parse_res *pres __arg_nonnull, struct h2_frame *frame __arg_nonnull, struct null_prefix *null_prefix) {
     if (off > MAX_BYTES) return -1;
     if (skb->len < off + H2_FRAME_HDR_LEN) return 0;
     bpf_clamp_uminmax(off, 0, MAX_BYTES);
@@ -1200,7 +1200,7 @@ int get_dt_entry(const struct ip4_conn *conn __arg_nonnull, u32 idx, struct h2_h
 
 // Points `str` at the value captured for the match `m`, resolving it against
 // `ctx`. Returns 0 on success, -1 if the value cannot be resolved.
-static __always_inline int _extract_str(const struct msg_ctx *ctx, const struct hdr_match *m, struct bytes *str) {
+static __always_inline int _extract_str(const struct msg_ctx *ctx, const struct http_match *m, struct bytes *str) {
     u8 *ptr = NULL;
     u32 len = 0;
     _extract_match(ctx, m, false, &ptr, &len, NULL);
@@ -1215,10 +1215,10 @@ static __always_inline int _extract_str(const struct msg_ctx *ctx, const struct 
 
 // Returns whether the parser captured a value for the match `idx`.
 SEC("freplace")
-bool matched(const struct parse_res *pres __arg_nonnull, u8 idx) {
+bool matched(const struct http_parse_res *pres __arg_nonnull, u8 idx) {
     if (idx >= MAX_MATCHES) return false;
 
-    struct hdr_match m = pres->ms[idx & MAX_MATCH_MASK];
+    struct http_match m = pres->ms[idx & MAX_MATCH_MASK];
     return (m.len > 0);
 }
 
@@ -1230,10 +1230,10 @@ bool matched(const struct parse_res *pres __arg_nonnull, u8 idx) {
 // Returns 0 on success, -1 if nothing was captured for `idx` or if the value
 // can no longer be resolved.
 SEC("freplace")
-int extract_match_msg(const struct sk_msg_md *msg, const struct parse_res *pres __arg_nonnull, u8 idx, struct bytes *str __arg_nonnull) {
+int extract_match_msg(const struct sk_msg_md *msg, const struct http_parse_res *pres __arg_nonnull, u8 idx, struct bytes *str __arg_nonnull) {
     if (idx >= MAX_MATCHES) return -1;
 
-    struct hdr_match m = pres->ms[idx & MAX_MATCH_MASK];
+    struct http_match m = pres->ms[idx & MAX_MATCH_MASK];
     if (m.len == 0) return -1;
 
     struct msg_ctx ctx = _new_msg_ctx(msg);
@@ -1244,10 +1244,10 @@ int extract_match_msg(const struct sk_msg_md *msg, const struct parse_res *pres 
 // points into `skb` is only valid until the program invalidates its data
 // pointers.
 SEC("freplace")
-int extract_match_skb(const struct __sk_buff *skb, const struct parse_res *pres __arg_nonnull, u8 idx, struct bytes *str __arg_nonnull) {
+int extract_match_skb(const struct __sk_buff *skb, const struct http_parse_res *pres __arg_nonnull, u8 idx, struct bytes *str __arg_nonnull) {
     if (idx >= MAX_MATCHES) return -1;
 
-    struct hdr_match m = pres->ms[idx & MAX_MATCH_MASK];
+    struct http_match m = pres->ms[idx & MAX_MATCH_MASK];
     if (m.len == 0) return -1;
 
     struct msg_ctx ctx = _new_skb_ctx(skb);

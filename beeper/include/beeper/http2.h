@@ -40,7 +40,7 @@ struct h2_hdr_field {
 // Creates `name`, a stub for the HTTP/2 message parser
 // (`h2::Parser::parse_fn`, `MessageBuffer::Msg`).
 #define BEEPER_H2_PARSE_MSG(name)                                                                  \
-    __noinline int name(struct sk_msg_md *msg, struct parse_res *pres __arg_nonnull,               \
+    __noinline int name(struct sk_msg_md *msg, struct http_parse_res *pres __arg_nonnull,               \
                         struct h2_frame *frame __arg_nonnull) {                                    \
         int ret = -1;                                                                              \
                                                                                                    \
@@ -59,7 +59,7 @@ struct h2_hdr_field {
 // Creates `name`, a stub for the HTTP/2 sk_buff parser
 // (`h2::Parser::parse_fn`, `MessageBuffer::Skb`).
 #define BEEPER_H2_PARSE_SKB(name)                                                                  \
-    __noinline int name(struct __sk_buff *skb, u32 off, struct parse_res *pres __arg_nonnull,      \
+    __noinline int name(struct __sk_buff *skb, u32 off, struct http_parse_res *pres __arg_nonnull,      \
                         struct h2_frame *frame __arg_nonnull, struct null_prefix *null_prefix) {   \
         int ret = -1;                                                                              \
                                                                                                    \
@@ -81,7 +81,7 @@ struct h2_hdr_field {
 // (`h2::Parser::parse_fn`, `MessageBuffer::DynPtr`).
 #define BEEPER_H2_PARSE_BUF(name)                                                                  \
     __noinline int name(const struct bpf_dynptr *buf_ptr, struct ip4_conn *conn,                   \
-                        struct parse_res *pres __arg_nonnull,                                      \
+                        struct http_parse_res *pres __arg_nonnull,                                      \
                         struct h2_frame *frame __arg_nonnull,                                      \
                         struct null_prefix *null_prefix) {                                         \
         int ret = -1;                                                                              \

@@ -126,7 +126,8 @@ impl<'obj> TestProgram<'obj> {
 
         open_skel.maps.rodata_data.as_mut().unwrap().ip4 = ip4;
         open_skel.maps.rodata_data.as_mut().unwrap().port = address.port() as u32;
-        open_skel.maps.rodata_data.as_mut().unwrap().parse_resp = direction == Direction::Upstream;
+        open_skel.maps.rodata_data.as_mut().unwrap().http_parse_resp =
+            direction == Direction::Upstream;
         open_skel.maps.rodata_data.as_mut().unwrap().hook_skb = hook == Hook::Skb;
 
         let skel = open_skel.load()?;

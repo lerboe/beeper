@@ -20,11 +20,11 @@ char LICENSE[] SEC("license") = "GPL";
 // bounds the parsing loop.
 #define MAX_BYTES 0x7FFF
 
-// The number of matches a `parse_res` holds, i.e. the number of ranges a parser
+// The number of matches a `http_parse_res` holds, i.e. the number of ranges a parser
 // can be configured to capture.
 #define MAX_MATCHES 32
 
-// Masks a match id down to a valid index into `parse_res`, so that the verifier
+// Masks a match id down to a valid index into `http_parse_res`, so that the verifier
 // can see that the access is in bounds.
 #define MAX_MATCH_MASK 31
 

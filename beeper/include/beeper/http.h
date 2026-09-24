@@ -13,7 +13,7 @@
 // not spelled out on the wire and `idx` is the HPACK index it has to be read
 // from the static or the dynamic table with. `huff` says whether the bytes are
 // Huffman coded, which HPACK leaves to the sender.
-struct hdr_match {
+struct http_match {
     u16 idx;
     u16 len;
     bool in_msg;
@@ -23,8 +23,8 @@ struct hdr_match {
 // The result of parsing a single message, holding one entry per match id the
 // parser was configured with. It is what `matched` and `extract_match` read the
 // captured ranges out of.
-struct parse_res {
-    struct hdr_match ms[MAX_MATCHES];
+struct http_parse_res {
+    struct http_match ms[MAX_MATCHES];
 };
 
 // Stubs for the parser programs beeper attaches with `freplace`.
@@ -38,7 +38,7 @@ struct parse_res {
 // Creates `name`, a stub reporting whether the match at `idx` was found
 // (`matched_fn`).
 #define BEEPER_MATCHED(name)                                                                       \
-    __noinline bool name(const struct parse_res *pres __arg_nonnull, u8 idx) {                     \
+    __noinline bool name(const struct http_parse_res *pres __arg_nonnull, u8 idx) {                     \
         bool ret = false;                                                                          \
                                                                                                    \
         __sink(pres);                                                                              \
@@ -51,7 +51,7 @@ struct parse_res {
 // Creates `name`, a stub reading the match at `idx` out of `msg`
 // (`extract_fn`, `MessageBuffer::Msg`).
 #define BEEPER_EXTRACT_MATCH_MSG(name)                                                             \
-    __noinline int name(const struct sk_msg_md *msg, const struct parse_res *pres __arg_nonnull,   \
+    __noinline int name(const struct sk_msg_md *msg, const struct http_parse_res *pres __arg_nonnull,   \
                         u8 idx, struct bytes *str __arg_nonnull) {                                 \
         int ret = -1;                                                                              \
                                                                                                    \
@@ -67,7 +67,7 @@ struct parse_res {
 // Creates `name`, a stub reading the match at `idx` out of `skb`
 // (`extract_fn`, `MessageBuffer::Skb`).
 #define BEEPER_EXTRACT_MATCH_SKB(name)                                                             \
-    __noinline int name(const struct __sk_buff *skb, const struct parse_res *pres __arg_nonnull,   \
+    __noinline int name(const struct __sk_buff *skb, const struct http_parse_res *pres __arg_nonnull,   \
                         u8 idx, struct bytes *str __arg_nonnull) {                                 \
         int ret = -1;                                                                              \
                                                                                                    \

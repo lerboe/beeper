@@ -94,7 +94,7 @@ static __always_inline void _next(u16 state, u8 input, u16 *next_state, u16 *act
 //
 // Returns the number of bytes it consumed once the DFA is done, or minus the
 // number of bytes it looked at if the data ran out first.
-static __always_inline int _parse_from(u8 *data, u8 *data_end, u16 start, struct hdr_match *ms, u32* cidx, u16* s, struct null_prefix *null_prefix) {
+static __always_inline int _parse_from(u8 *data, u8 *data_end, u16 start, struct http_match *ms, u32* cidx, u16* s, struct null_prefix *null_prefix) {
     u32 len = (u32)(data_end - data);
     bpf_clamp_uminmax(len, 0, MAX_BYTES);
 
@@ -130,7 +130,7 @@ static __always_inline int _parse_from(u8 *data, u8 *data_end, u16 start, struct
             u16 mid = act.mid & MAX_MATCH_MASK;
             bpf_debug("end capture range (%d) in [%d, %d]", mid, cidx[mid], i - cidx[mid] + 1);
 
-            ms[mid] = (struct hdr_match) {
+            ms[mid] = (struct http_match) {
                 .idx = cidx[mid],
                 .len = i - cidx[mid] + 1,
                 .in_msg = true
@@ -154,7 +154,7 @@ static __always_inline int _parse_from(u8 *data, u8 *data_end, u16 start, struct
 // Returns the number of bytes the header block occupies, or a negative value if
 // the message ended before the header block did.
 SEC("freplace")
-int parse_msg(struct sk_msg_md *msg, struct parse_res *pres __arg_nonnull) {
+int parse_msg(struct sk_msg_md *msg, struct http_parse_res *pres __arg_nonnull) {
     u32 cidx[MAX_MATCHES] = { 0 };
     u16 s = s_init;
     u8 *data = (u8 *)(long)msg->data;
@@ -180,7 +180,7 @@ int parse_msg(struct sk_msg_md *msg, struct parse_res *pres __arg_nonnull) {
 // sk_buff, the return value is counted from the start of the message. See
 // `parse_msg` for the return value.
 SEC("freplace")
-int parse_skb(struct __sk_buff *skb, u32 off, struct parse_res *pres __arg_nonnull, struct null_prefix *null_prefix) {
+int parse_skb(struct __sk_buff *skb, u32 off, struct http_parse_res *pres __arg_nonnull, struct null_prefix *null_prefix) {
     if (off >= MAX_BYTES || off >= skb->len) return 0;
 
     u8 *data = (u8 *)(long)skb->data;
@@ -202,10 +202,10 @@ int parse_skb(struct __sk_buff *skb, u32 off, struct parse_res *pres __arg_nonnu
 
 // Returns whether the parser captured a range for the match `idx`.
 SEC("freplace")
-bool matched(const struct parse_res *pres __arg_nonnull, u8 idx) {
+bool matched(const struct http_parse_res *pres __arg_nonnull, u8 idx) {
     if (idx >= MAX_MATCHES) return false;
 
-    struct hdr_match m = pres->ms[idx & MAX_MATCH_MASK];
+    struct http_match m = pres->ms[idx & MAX_MATCH_MASK];
     return (m.len > 0);
 }
 
@@ -215,10 +215,10 @@ bool matched(const struct parse_res *pres __arg_nonnull, u8 idx) {
 // Returns 0 on success, -1 if nothing was captured for `idx` or if the range
 // lies outside of the part of the message the program can read.
 SEC("freplace")
-int extract_match_msg(const struct sk_msg_md *msg, const struct parse_res *pres __arg_nonnull, u8 idx, struct bytes* str __arg_nonnull) {
+int extract_match_msg(const struct sk_msg_md *msg, const struct http_parse_res *pres __arg_nonnull, u8 idx, struct bytes* str __arg_nonnull) {
     if (idx >= MAX_MATCHES) return -1;
 
-    struct hdr_match m = pres->ms[idx & MAX_MATCH_MASK];
+    struct http_match m = pres->ms[idx & MAX_MATCH_MASK];
     if (m.len == 0) return -1;
 
     u8 *data = (u8 *)(long)msg->data;
@@ -236,10 +236,10 @@ int extract_match_msg(const struct sk_msg_md *msg, const struct parse_res *pres 
 // points into `skb`, so it is only valid until the program invalidates its data
 // pointers.
 SEC("freplace")
-int extract_match_skb(const struct __sk_buff *skb, const struct parse_res *pres __arg_nonnull, u8 idx, struct bytes* str __arg_nonnull) {
+int extract_match_skb(const struct __sk_buff *skb, const struct http_parse_res *pres __arg_nonnull, u8 idx, struct bytes* str __arg_nonnull) {
     if (idx >= MAX_MATCHES) return -1;
 
-    struct hdr_match m = pres->ms[idx & MAX_MATCH_MASK];
+    struct http_match m = pres->ms[idx & MAX_MATCH_MASK];
     if (m.len == 0) return -1;
 
     u8 *data = (u8 *)(long)skb->data;
