@@ -47,14 +47,16 @@ const EXPECTED_PARSE_ERRORS: &[&str] = &[
 ];
 
 /// The cases in which the echo server's own verdict hinges on timing: it may
-/// answer a request before the frame that makes it malformed has been read.
-/// They flip on the bare server as well, so only their parse errors count.
+/// answer a request before the frame that makes it malformed has been read,
+/// e.g. once the DATA it got add up to the content-length. They flip on the
+/// bare server as well, so only their parse errors count.
 const RACY_CASES: &[&str] = &[
     // a second HEADERS frame without END_STREAM, trailers that carry a
     // pseudo-header, and a content-length the DATA frames disagree with
     "http2/8.1/1",
     "http2/8.1.2.1/3",
     "http2/8.1.2.6/1",
+    "http2/8.1.2.6/2",
 ];
 
 /// How often a case whose verdict differs from the one without the parser is
