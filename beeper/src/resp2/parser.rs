@@ -158,6 +158,9 @@ mod tests {
             s = to;
 
             match action {
+                Some(Action::LenDigit) if !c.is_ascii_digit() => {
+                    (s, len) = (ANY_STATE, 0);
+                }
                 Some(Action::LenDigit) => len = len * 10 + (c - b'0') as usize,
                 Some(Action::Skip(mid)) => {
                     skip = std::mem::take(&mut len);
@@ -240,6 +243,12 @@ mod tests {
 
         let args = vec![b"arg".as_slice(); MAX_ARGS + 1];
         assert_eq!(walk(&parser, &cmd(&args)), None);
+    }
+
+    #[test]
+    fn ignore_a_command_whose_length_is_no_number() {
+        let (parser, _) = parser();
+        assert_eq!(walk(&parser, b"*1\r\n$-1\r\n"), None);
     }
 
     #[test]

@@ -169,9 +169,13 @@ static __always_inline int _parse_from(u8 *data, u8 *data_end, u16 start, struct
             };
         }
         else if (act.kind == DFAA_LEN_DIGIT) {
-            // anything but a digit makes for a length that runs past any message
+            // anything but a digit, or a length longer than any message, is no
+            // length at all, and the message falls out of the pattern. Nothing
+            // is skipped for it, which would leave the verifier with a constant
+            // to count down byte by byte
             if (c < '0' || c > '9' || w->len > MAX_BYTES) {
-                w->len = MAX_BYTES + 1;
+                w->s = s_any;
+                w->len = 0;
             } else {
                 w->len = w->len * 10 + (c - '0');
             }
