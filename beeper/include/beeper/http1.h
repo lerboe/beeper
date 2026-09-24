@@ -9,40 +9,11 @@
 
 // Creates `name`, a stub for the HTTP/1.x message parser
 // (`http1::Parser::parse_fn`, `MessageBuffer::Msg`).
-#define BEEPER_HTTP1_PARSE_MSG(name)                                                                  \
-    __noinline int name(struct sk_msg_md *msg, struct http_parse_res *pres __arg_nonnull) {             \
-        int ret = -1;                                                                              \
-                                                                                                   \
-        __sink(msg);                                                                               \
-        __sink(pres);                                                                              \
-        __sink(ret);                                                                               \
-                                                                                                   \
-        /* the replacement pulls in the whole message, so the stub has to do */                    \
-        /* the same for the verifier to invalidate the caller's data pointers */                   \
-        bpf_msg_pull_data(msg, 0, msg->size, 0);                                                   \
-                                                                                                   \
-        return ret;                                                                                \
-    }
+#define BEEPER_HTTP1_PARSE_MSG(name) __BEEPER_PARSE_MSG(name, http_parse_res)
 
 // Creates `name`, a stub for the HTTP/1.x sk_buff parser
 // (`http1::Parser::parse_fn`, `MessageBuffer::Skb`).
-#define BEEPER_HTTP1_PARSE_SKB(name)                                                                  \
-    __noinline int name(struct __sk_buff *skb, u32 off, struct http_parse_res *pres __arg_nonnull,      \
-                        struct null_prefix *null_prefix) {                                         \
-        int ret = -1;                                                                              \
-                                                                                                   \
-        __sink(skb);                                                                               \
-        __sink(off);                                                                               \
-        __sink(pres);                                                                              \
-        __sink(null_prefix);                                                                       \
-        __sink(ret);                                                                               \
-                                                                                                   \
-        /* the replacement pulls in the whole sk_buff, so the stub has to do */                    \
-        /* the same for the verifier to invalidate the caller's data pointers */                   \
-        bpf_skb_pull_data(skb, skb->len);                                                          \
-                                                                                                   \
-        return ret;                                                                                \
-    }
+#define BEEPER_HTTP1_PARSE_SKB(name) __BEEPER_PARSE_SKB(name, http_parse_res)
 
 // Creates `name`, a stub for the HTTP/1.x buffer parser
 // (`http1::Parser::parse_fn`, `MessageBuffer::DynPtr`).

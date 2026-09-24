@@ -5,9 +5,10 @@
 
 // The protocol agnostic core of the interface between a BPF program and the
 // parsers beeper attaches to it: the verifier bounds every parser is built
-// with and the types that carry no protocol of their own. What every HTTP
-// parser shares lives in `beeper/http.h`, what a single version adds in
-// `beeper/http1.h` and `beeper/http2.h`.
+// with, the types that carry no protocol of their own and the stubs of the
+// functions a parser replaces. What every HTTP parser shares lives in
+// `beeper/http.h`, what a single version adds in `beeper/http1.h` and
+// `beeper/http2.h`. RESP2 lives in `beeper/resp2.h`.
 
 #ifndef __BEEPER_H__
 #define __BEEPER_H__
@@ -86,5 +87,95 @@ struct trans {
 #ifndef __sink
 #define __sink(expr) asm volatile("" : "+g"(expr))
 #endif
+
+// Stubs for the parser programs beeper attaches with `freplace`, generic over
+// the struct `res` a parser reports its results in.
+//
+// The header of every protocol turns them into the `BEEPER_*` macros a program
+// declares the functions it hands to a parser with. Each one expands to a
+// global (`__noinline`) function with the exact signature the corresponding
+// parser program expects, which includes the name of `res`.
+
+// Creates `name`, a stub reporting whether the match at `idx` was found
+// (`matched_fn`).
+#define __BEEPER_MATCHED(name, res)                                                                \
+    __noinline bool name(const struct res *pres __arg_nonnull, u8 idx) {                          \
+        bool ret = false;                                                                          \
+                                                                                                   \
+        __sink(pres);                                                                              \
+        __sink(idx);                                                                               \
+        __sink(ret);                                                                               \
+                                                                                                   \
+        return ret;                                                                                \
+    }
+
+// Creates `name`, a stub reading the match at `idx` out of `msg`
+// (`extract_fn`, `MessageBuffer::Msg`).
+#define __BEEPER_EXTRACT_MATCH_MSG(name, res)                                                      \
+    __noinline int name(const struct sk_msg_md *msg, const struct res *pres __arg_nonnull,        \
+                        u8 idx, struct bytes *str __arg_nonnull) {                                 \
+        int ret = -1;                                                                              \
+                                                                                                   \
+        __sink(msg);                                                                               \
+        __sink(pres);                                                                              \
+        __sink(idx);                                                                               \
+        __sink(str);                                                                               \
+        __sink(ret);                                                                               \
+                                                                                                   \
+        return ret;                                                                                \
+    }
+
+// Creates `name`, a stub reading the match at `idx` out of `skb`
+// (`extract_fn`, `MessageBuffer::Skb`).
+#define __BEEPER_EXTRACT_MATCH_SKB(name, res)                                                      \
+    __noinline int name(const struct __sk_buff *skb, const struct res *pres __arg_nonnull,        \
+                        u8 idx, struct bytes *str __arg_nonnull) {                                 \
+        int ret = -1;                                                                              \
+                                                                                                   \
+        __sink(skb);                                                                               \
+        __sink(pres);                                                                              \
+        __sink(idx);                                                                               \
+        __sink(str);                                                                               \
+        __sink(ret);                                                                               \
+                                                                                                   \
+        return ret;                                                                                \
+    }
+
+// Creates `name`, a stub for a DFA parser of messages
+// (`parse_fn`, `MessageBuffer::Msg`).
+#define __BEEPER_PARSE_MSG(name, res)                                                              \
+    __noinline int name(struct sk_msg_md *msg, struct res *pres __arg_nonnull) {                  \
+        int ret = -1;                                                                              \
+                                                                                                   \
+        __sink(msg);                                                                               \
+        __sink(pres);                                                                              \
+        __sink(ret);                                                                               \
+                                                                                                   \
+        /* the replacement pulls in the whole message, so the stub has to do */                    \
+        /* the same for the verifier to invalidate the caller's data pointers */                   \
+        bpf_msg_pull_data(msg, 0, msg->size, 0);                                                   \
+                                                                                                   \
+        return ret;                                                                                \
+    }
+
+// Creates `name`, a stub for a DFA parser of sk_buffs
+// (`parse_fn`, `MessageBuffer::Skb`).
+#define __BEEPER_PARSE_SKB(name, res)                                                              \
+    __noinline int name(struct __sk_buff *skb, u32 off, struct res *pres __arg_nonnull,           \
+                        struct null_prefix *null_prefix) {                                         \
+        int ret = -1;                                                                              \
+                                                                                                   \
+        __sink(skb);                                                                               \
+        __sink(off);                                                                               \
+        __sink(pres);                                                                              \
+        __sink(null_prefix);                                                                       \
+        __sink(ret);                                                                               \
+                                                                                                   \
+        /* the replacement pulls in the whole sk_buff, so the stub has to do */                    \
+        /* the same for the verifier to invalidate the caller's data pointers */                   \
+        bpf_skb_pull_data(skb, skb->len);                                                          \
+                                                                                                   \
+        return ret;                                                                                \
+    }
 
 #endif // __BEEPER_H__

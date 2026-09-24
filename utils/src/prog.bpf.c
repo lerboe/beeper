@@ -1,5 +1,6 @@
 #include "beeper/http1.h"
 #include "beeper/http2.h"
+#include "beeper/resp2.h"
 #include "xbpf.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
@@ -39,6 +40,9 @@ volatile const bool http_parse_resp;
 // the parsers run at the `sk_skb` hook rather than at `sk_msg`
 volatile const bool hook_skb;
 
+// the connections speak RESP2 rather than HTTP
+volatile const bool parse_resp2;
+
 // What the parser captured in the message parsed last, keyed by match id. An id
 // with nothing captured for it is absent from the map.
 struct {
@@ -62,6 +66,12 @@ BEEPER_HTTP1_PARSE_SKB(parse_http1_skb)
 
 BEEPER_EXTRACT_MATCH_SKB(extract_http2_match_skb)
 BEEPER_HTTP2_PARSE_SKB(parse_http2_skb)
+
+BEEPER_RESP2_MATCHED(matched_resp2)
+BEEPER_RESP2_EXTRACT_MATCH_MSG(extract_resp2_match_msg)
+BEEPER_RESP2_PARSE_MSG(parse_resp2_msg)
+BEEPER_RESP2_EXTRACT_MATCH_SKB(extract_resp2_match_skb)
+BEEPER_RESP2_PARSE_SKB(parse_resp2_skb)
 
 extern void *bpf_cast_to_kern_ctx(void *obj) __ksym;
 
@@ -113,6 +123,50 @@ static __always_inline void store_match(u32 i, int res, const struct bytes *str)
     bpf_map_update_elem(&matches, &i, tmp, BPF_ANY);
 }
 
+// Parses the RESP2 command a message starts with and records the captured
+// arguments in `matches`. The verdict covers that command only, so that the
+// program runs again for the next one of a pipeline.
+static __always_inline int resp2_msg_verdict(struct sk_msg_md *msg) {
+    struct resp2_parse_res pres = { 0 };
+    int msg_len = parse_resp2_msg(msg, &pres);
+    if (msg_len < 0) return SK_PASS;
+
+    u32 mask = 0;
+    u32 i = 0;
+    bpf_for(i, 0, 32) {
+        if (matched_resp2(&pres, i)) mask |= (u32)1 << i;
+
+        struct bytes str = { 0 };
+        int res = extract_resp2_match_msg(msg, &pres, i, &str);
+        store_match(i, res, &str);
+    }
+    last_matches = mask;
+
+    bpf_msg_apply_bytes(msg, msg_len);
+
+    return SK_PASS;
+}
+
+// Same as `resp2_msg_verdict`, for the message that starts `off` bytes into
+// `skb`.
+static __always_inline int resp2_skb_verdict(struct __sk_buff *skb, u32 off) {
+    struct resp2_parse_res pres = { 0 };
+    if (parse_resp2_skb(skb, off, &pres, NULL) < 0) return SK_PASS;
+
+    u32 mask = 0;
+    u32 i = 0;
+    bpf_for(i, 0, 32) {
+        if (matched_resp2(&pres, i)) mask |= (u32)1 << i;
+
+        struct bytes str = { 0 };
+        int res = extract_resp2_match_skb(skb, &pres, i, &str);
+        store_match(i, res, &str);
+    }
+    last_matches = mask;
+
+    return SK_PASS;
+}
+
 // Parses the messages of the connection under test and records the captured
 // ranges in `matches`. A message that carries the HTTP/2 preface upgrades its
 // connection, after which its messages are parsed as HTTP/2.
@@ -137,6 +191,10 @@ int msg_verdict(struct sk_msg_md *msg) {
     // the other one would just clear the matches of the first
     if (is_downstream == http_parse_resp) {
         return SK_PASS;
+    }
+
+    if (parse_resp2) {
+        return resp2_msg_verdict(msg);
     }
 
     bool is_h2 = (bpf_map_lookup_elem(&upgraded_conns, &ikey) != NULL);
@@ -263,6 +321,10 @@ int skb_verdict(struct __sk_buff *skb) {
     }
 
     u32 off = strp_offset(skb);
+    if (parse_resp2) {
+        return resp2_skb_verdict(skb, off);
+    }
+
     bool is_h2 = (bpf_map_lookup_elem(&upgraded_conns, &ikey) != NULL);
     bool store_matches = false;
     struct http_parse_res pres = { 0 };

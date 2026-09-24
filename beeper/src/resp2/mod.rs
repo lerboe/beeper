@@ -1,12 +1,19 @@
 //! RESP2 parsing.
 //!
-//! [`Parser`] compiles the configured patterns into a DFA whose transition
-//! table is injected into the BPF parser program. The kernel side walks a
-//! message byte by byte, follows the table and runs the action of every state it
-//! enters, which is what turns a pattern into a captured range.
+//! RESP2 is the protocol Redis clients speak. A command is an array of bulk
+//! strings, each of which is prefixed with its length:
+//!
+//! ```text
+//! *3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n
+//! ```
+//!
+//! [`Parser`] compiles the shape of a command into a DFA whose transition
+//! table is injected into the BPF parser program. The kernel side walks the
+//! array and the length of every bulk string, skips the string itself and
+//! captures the ones it was configured to. Their contents are never walked, so
+//! they may hold any byte, CRLF included.
 
-mod action;
 mod parser;
 
-pub use parser::AttachedParser;
-pub use parser::Parser;
+pub use crate::dfa::parser::AttachedParser;
+pub use parser::{MAX_ARGS, Parser, Resp2};

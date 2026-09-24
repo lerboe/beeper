@@ -1,3 +1,9 @@
+//! The DFA the patterns of a parser are compiled into, and the parser that
+//! walks it in the kernel.
+
+pub(crate) mod action;
+pub(crate) mod parser;
+
 use crate::StateId;
 use std::{collections::HashMap, fmt::Debug, ops::RangeBounds};
 use tracing::trace;
@@ -22,7 +28,7 @@ pub(crate) type Input = u16;
 ///
 /// It is not a byte, so that a pattern holding the byte it used to be spelled
 /// with, `*`, matches that byte and nothing else.
-const ANY_INPUT: Input = 0x100;
+pub(crate) const ANY_INPUT: Input = 0x100;
 
 /// A single transition of a [`Dfa`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -369,7 +375,7 @@ pub(crate) fn fmt_input(input: Input) -> String {
 
 type EdgeMap<A> = HashMap<StateId, HashMap<Input, Edge<A>>>;
 
-/// The DFA the patterns of a [`Parser`](super::Parser) are compiled into.
+/// The DFA the patterns of a [`Parser`](parser::Parser) are compiled into.
 ///
 /// It is injected into the BPF parser program as a table of transitions,
 /// indexed by state and input, which is why states are shared between

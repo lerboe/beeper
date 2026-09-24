@@ -40,7 +40,7 @@ jobs:
             - name: Install apt dependencies
               uses: awalsh128/cache-apt-pkgs-action@v1
               with:
-                  packages: clang-18 llvm-18 libelf-dev zlib1g-dev linux-headers-${{ steps.kernel.outputs.release }}
+                  packages: clang-18 llvm-18 libelf-dev zlib1g-dev redis-server linux-headers-${{ steps.kernel.outputs.release }}
                   version: 1.0
             - name: Configure apt dependencies
               run: |
@@ -67,3 +67,5 @@ jobs:
               run: cargo test --profile=${{ matrix.profile }} --locked --verbose -p beeper --test http1 -- --include-ignored
             - name: Run HTTP/2 tests
               run: cargo test --profile=${{ matrix.profile }} --locked --verbose -p beeper --test http2 -- --include-ignored
+            - name: Run RESP2 tests
+              run: cargo test --profile=${{ matrix.profile }} --locked --verbose -p beeper --test resp2 -- --include-ignored

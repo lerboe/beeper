@@ -27,57 +27,20 @@ struct http_parse_res {
     struct http_match ms[MAX_MATCHES];
 };
 
-// Stubs for the parser programs beeper attaches with `freplace`.
-//
-// A program that uses a beeper parser declares the functions it passes to the
-// `matched_fn` and `extract_fn` builder methods with these macros. Each one
-// expands to a global (`__noinline`) function with the exact signature the
-// corresponding parser program expects. The macros for `parse_fn` are declared
-// in the header of the protocol version the parser speaks.
+// Stubs for the parser programs beeper attaches with `freplace`, see
+// `beeper/beeper.h`. The macros for `parse_fn` are declared in the header of the
+// protocol version the parser speaks.
 
 // Creates `name`, a stub reporting whether the match at `idx` was found
 // (`matched_fn`).
-#define BEEPER_MATCHED(name)                                                                       \
-    __noinline bool name(const struct http_parse_res *pres __arg_nonnull, u8 idx) {                     \
-        bool ret = false;                                                                          \
-                                                                                                   \
-        __sink(pres);                                                                              \
-        __sink(idx);                                                                               \
-        __sink(ret);                                                                               \
-                                                                                                   \
-        return ret;                                                                                \
-    }
+#define BEEPER_MATCHED(name) __BEEPER_MATCHED(name, http_parse_res)
 
 // Creates `name`, a stub reading the match at `idx` out of `msg`
 // (`extract_fn`, `MessageBuffer::Msg`).
-#define BEEPER_EXTRACT_MATCH_MSG(name)                                                             \
-    __noinline int name(const struct sk_msg_md *msg, const struct http_parse_res *pres __arg_nonnull,   \
-                        u8 idx, struct bytes *str __arg_nonnull) {                                 \
-        int ret = -1;                                                                              \
-                                                                                                   \
-        __sink(msg);                                                                               \
-        __sink(pres);                                                                              \
-        __sink(idx);                                                                               \
-        __sink(str);                                                                               \
-        __sink(ret);                                                                               \
-                                                                                                   \
-        return ret;                                                                                \
-    }
+#define BEEPER_EXTRACT_MATCH_MSG(name) __BEEPER_EXTRACT_MATCH_MSG(name, http_parse_res)
 
 // Creates `name`, a stub reading the match at `idx` out of `skb`
 // (`extract_fn`, `MessageBuffer::Skb`).
-#define BEEPER_EXTRACT_MATCH_SKB(name)                                                             \
-    __noinline int name(const struct __sk_buff *skb, const struct http_parse_res *pres __arg_nonnull,   \
-                        u8 idx, struct bytes *str __arg_nonnull) {                                 \
-        int ret = -1;                                                                              \
-                                                                                                   \
-        __sink(skb);                                                                               \
-        __sink(pres);                                                                              \
-        __sink(idx);                                                                               \
-        __sink(str);                                                                               \
-        __sink(ret);                                                                               \
-                                                                                                   \
-        return ret;                                                                                \
-    }
+#define BEEPER_EXTRACT_MATCH_SKB(name) __BEEPER_EXTRACT_MATCH_SKB(name, http_parse_res)
 
 #endif // __BEEPER_HTTP_H__
