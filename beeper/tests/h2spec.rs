@@ -27,7 +27,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
 };
-use tokio::process::Command;
+use tokio::{process::Command, sync::OnceCell};
 use utils::{
     server,
     test::{Direction, Hook, TestProgram},
@@ -47,6 +47,12 @@ const RETRIES: usize = 2;
 
 /// Returns the h2spec binary, downloading it first if needed.
 async fn h2spec() -> PathBuf {
+    // the tests run alongside each other, and only one of them downloads it
+    static BIN: OnceCell<PathBuf> = OnceCell::const_new();
+    BIN.get_or_init(fetch_h2spec).await.clone()
+}
+
+async fn fetch_h2spec() -> PathBuf {
     if let Some(bin) = std::env::var_os("H2SPEC") {
         return bin.into();
     }
@@ -149,7 +155,8 @@ impl fmt::Display for Verdict {
 
 /// Runs the case `id` against the server at `addr`.
 async fn run_case(bin: &Path, addr: SocketAddr, id: &str) -> Verdict {
-    let report = Path::new(env!("CARGO_TARGET_TMPDIR")).join("h2spec-report.xml");
+    // the tests run alongside each other, each against a server of its own
+    let report = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("h2spec-{}.xml", addr.port()));
     _ = std::fs::remove_file(&report);
 
     let out = Command::new(bin)
