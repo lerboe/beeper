@@ -196,7 +196,7 @@ dependencies = [
  "tokio",
  "tracing",
  "utils",
- "xbpf 0.0.4",
+ "xbpf",
 ]
 
 [[package]]
@@ -449,7 +449,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "xbpf 0.0.3",
+ "xbpf",
 ]
 
 [[package]]
@@ -2014,7 +2014,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "xbpf 0.0.3",
+ "xbpf",
 ]
 
 [[package]]
@@ -2308,20 +2308,6 @@ name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
-
-[[package]]
-name = "xbpf"
-version = "0.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4279f972c12786565d3e9ce5fc9c2412a773fc260bca14df836b91a347b0781"
-dependencies = [
- "glob",
- "libbpf-cargo",
- "libbpf-rs",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
 
 [[package]]
 name = "xbpf"
