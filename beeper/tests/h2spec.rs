@@ -2,9 +2,9 @@
 //! through the HTTP/2 parser.
 //!
 //! h2spec tests servers, and beeper is not one: it only watches the traffic of
-//! the echo server of `utils`. So every case is run twice, once against the
-//! bare server and once with the parser attached, and the parser passes a case
-//! if
+//! the echo server of `utils`. So every case is run twice, against a bare
+//! server and against one whose requests the parser reads, and the parser
+//! passes a case if
 //!
 //! * h2spec comes to the same verdict both times, i.e. the parser neither
 //!   stalled nor corrupted the connection, and
@@ -39,10 +39,16 @@ const H2SPEC_VERSION: &str = "v2.6.0";
 
 /// The cases in which the parser is expected to give up on a frame, because
 /// h2spec sends a malformed one on purpose.
-const EXPECTED_PARSE_ERRORS: &[&str] = &[];
+const EXPECTED_PARSE_ERRORS: &[&str] = &[
+    // a field indexed with 0, which no table entry has
+    "hpack/6.1/1",
+    // a HEADERS frame whose padding is longer than its payload
+    "http2/6.2/4",
+];
 
 /// How often a case whose verdict differs from the one without the parser is
-/// retried. A few cases hinge on timeouts, which a loaded machine can miss.
+/// retried, on both servers. A few cases hinge on timeouts, which a loaded
+/// machine can miss, the bare server included.
 const RETRIES: usize = 2;
 
 /// Returns the h2spec binary, downloading it first if needed.
@@ -153,8 +159,9 @@ impl fmt::Display for Verdict {
     }
 }
 
-/// Runs the case `id` against the server at `addr`.
-async fn run_case(bin: &Path, addr: SocketAddr, id: &str) -> Verdict {
+/// Runs the case `id` against the server at `addr`, and returns h2spec's
+/// verdict along with what it printed, which says why a case failed.
+async fn run_case(bin: &Path, addr: SocketAddr, id: &str) -> (Verdict, String) {
     // the tests run alongside each other, each against a server of its own
     let report = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("h2spec-{}.xml", addr.port()));
     _ = std::fs::remove_file(&report);
@@ -168,42 +175,56 @@ async fn run_case(bin: &Path, addr: SocketAddr, id: &str) -> Verdict {
         .output()
         .await
         .expect("run h2spec");
+    let log = String::from_utf8_lossy(&out.stdout).into_owned();
 
     let report = std::fs::read_to_string(&report).unwrap_or_default();
     if !report.contains("<testcase") {
         panic!("h2spec {id} ran no case: {out:?}");
     }
 
-    if report.contains("<failure") || report.contains("<error") {
+    let verdict = if report.contains("<failure") || report.contains("<error") {
         Verdict::Failed
     } else if report.contains("<skipped") {
         Verdict::Skipped
     } else {
         Verdict::Passed
-    }
+    };
+
+    (verdict, log)
 }
 
-/// What a case came to with the parser attached.
+/// What a case came to without and with the parser attached.
 struct Outcome {
-    verdict: Verdict,
+    bare: Verdict,
+    parsed: Verdict,
+
+    /// What h2spec printed with the parser attached.
+    log: String,
 
     /// The HTTP/2 frames the parser saw, and the ones it gave up on.
     frames: u64,
     errors: u64,
 }
 
-async fn run_case_parsed(
+/// Runs the case `id` against both servers, `bare` and `parsed`, the second of
+/// which `prog` parses the traffic of.
+async fn run_case_twice(
     bin: &Path,
-    addr: SocketAddr,
+    bare: SocketAddr,
+    parsed: SocketAddr,
     id: &str,
     prog: &TestProgram<'_>,
 ) -> Outcome {
+    let (bare, _) = run_case(bin, bare, id).await;
+
     let (frames, errors) = prog.h2_frame_counts();
-    let verdict = run_case(bin, addr, id).await;
+    let (verdict, log) = run_case(bin, parsed, id).await;
     let (frames_after, errors_after) = prog.h2_frame_counts();
 
     Outcome {
-        verdict,
+        bare,
+        parsed: verdict,
+        log,
         frames: frames_after - frames,
         errors: errors_after - errors,
     }
@@ -253,27 +274,26 @@ fn attach_http2_parser(prog_fd: i32, hook: Hook) -> (http2::AttachedParser, Vec<
 async fn conformance(hook: Hook) {
     let bin = h2spec().await;
     let cases = cases(&bin).await;
-    let addr = server::launch().await.expect("launch server");
 
-    let mut baseline = BTreeMap::new();
-    for id in &cases {
-        baseline.insert(id.as_str(), run_case(&bin, addr, id).await);
-    }
+    // the program only parses the connections to the address it is attached
+    // to, so the bare server is left alone
+    let bare = server::launch().await.expect("launch server");
+    let parsed = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let prog = TestProgram::attach_to(addr, &mut open_obj, Direction::Downstream, hook)
+    let prog = TestProgram::attach_to(parsed, &mut open_obj, Direction::Downstream, hook)
         .expect("attach program");
     let _h1 = attach_http1_parser(prog.prog_fd(), hook);
     let _h2 = attach_http2_parser(prog.prog_fd(), hook);
 
     let mut outcomes = BTreeMap::new();
     for id in &cases {
-        let mut outcome = run_case_parsed(&bin, addr, id, &prog).await;
+        let mut outcome = run_case_twice(&bin, bare, parsed, id, &prog).await;
         for _ in 0..RETRIES {
-            if outcome.verdict == baseline[id.as_str()] {
+            if outcome.bare == outcome.parsed {
                 break;
             }
-            outcome = run_case_parsed(&bin, addr, id, &prog).await;
+            outcome = run_case_twice(&bin, bare, parsed, id, &prog).await;
         }
 
         outcomes.insert(id.as_str(), outcome);
@@ -285,29 +305,27 @@ async fn conformance(hook: Hook) {
         "{:<20} {:<8} {:<8} {:>6} {:>6}",
         "case", "bare", "parsed", "frames", "errors"
     );
-    for (id, outcome) in &outcomes {
-        let bare = baseline[id];
-        let flag = if outcome.verdict != bare {
+    for (id, o) in &outcomes {
+        let flag = if o.bare != o.parsed {
             problems.push(format!(
-                "{id}: {bare} without the parser, {} with it",
-                outcome.verdict
+                "{id}: {} without the parser, {} with it\n{}",
+                o.bare,
+                o.parsed,
+                o.log.trim_end()
             ));
             " <- verdict"
-        } else if outcome.errors > 0 && !EXPECTED_PARSE_ERRORS.contains(id) {
-            problems.push(format!(
-                "{id}: the parser failed on {} frame(s)",
-                outcome.errors
-            ));
+        } else if o.errors > 0 && !EXPECTED_PARSE_ERRORS.contains(id) {
+            problems.push(format!("{id}: the parser failed on {} frame(s)", o.errors));
             " <- parse error"
         } else {
             ""
         };
 
         println!(
-            "{id:<20} {bare:<8} {:<8} {:>6} {:>6}{flag}",
-            outcome.verdict, outcome.frames, outcome.errors
+            "{id:<20} {:<8} {:<8} {:>6} {:>6}{flag}",
+            o.bare, o.parsed, o.frames, o.errors
         );
-        frames += outcome.frames;
+        frames += o.frames;
     }
 
     let stale: Vec<_> = EXPECTED_PARSE_ERRORS
@@ -352,7 +370,7 @@ async fn h2spec_server() {
 
     let mut failed = Vec::new();
     for id in &cases {
-        let verdict = run_case(&bin, addr, id).await;
+        let (verdict, _) = run_case(&bin, addr, id).await;
         println!("{id:<20} {verdict}");
         if verdict == Verdict::Failed {
             failed.push(id.as_str());
