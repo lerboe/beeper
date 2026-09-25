@@ -4,6 +4,7 @@ use xbpf::build::Builder;
 fn main() {
     Builder::new()
         .clang_arg(clang_args().iter())
+        .tracing_ring_buf_size(16384)
         .export_headers()
         .build();
 }

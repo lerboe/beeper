@@ -162,6 +162,15 @@ int msg_verdict(struct sk_msg_md *msg) {
     if (is_h2) {
         struct http2_frame frame = { 0 };
         msg_len = parse_http2(msg, &pres, &frame);
+
+        // a frame written in pieces is parsed once all of it has arrived, the
+        // 9 bytes being the frame header
+        u32 frame_len = 9 + frame.len;
+        if (msg_len == 0 || (msg_len < 0 && frame_len > msg->size)) {
+            bpf_msg_cork_bytes(msg, msg_len == 0 ? 9 : frame_len);
+            return SK_PASS;
+        }
+
         if (msg_len < 0) {
             bpf_error("Failed to parse h2 message");
             return SK_PASS;

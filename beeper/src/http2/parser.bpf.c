@@ -330,8 +330,9 @@ struct msg_ctx {
 
 // Reads the stream id out of the frame header `data` points at. `data` must be
 // known to hold at least the 9 bytes of a frame header.
-static __always_inline struct http2_frame _new_http2_frame(const u8 *data, u8 type, u8 flags) {
+static __always_inline struct http2_frame _new_http2_frame(const u8 *data, u32 len, u8 type, u8 flags) {
     return (struct http2_frame) {
+        .len = len,
         // the top bit of the stream id is reserved
         .sid = ((u32)data[5] << 24 | (u32)data[6] << 16 | (u32)data[7] << 8 | (u32)data[8]) & 0x7FFFFFFF,
         .type = type,
@@ -678,6 +679,8 @@ static __always_inline int _parse_stg_from(const struct msg_ctx *ctx, u16 start,
     u32 val = 0;
 
     bpf_for(i, start, len+1) {
+        // the byte past the frame belongs to the next one
+        if (i >= len) break;
         if (data + i + 1 > data_end) break;
         u8 c = data[i];
 
@@ -891,6 +894,12 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
     if (ps->kind == HTTP2A_TABLE_SIZE) {
         bpf_debug("hdr: table size update: %u", ps->v);
         dt_info->max_size = ps->v;
+
+        // a table that shrinks evicts its oldest entries right away, see
+        // section 4.3 of RFC 7541. Evicting them only once the next entry is
+        // added would miss an update to 0 that clears the table, followed by
+        // one that grows it back
+        _try_evict_dynamic_table_entries(ctx, dt_info, 0);
         return 0;
     }
 
@@ -1096,8 +1105,11 @@ static __always_inline int _parse_frame(const struct msg_ctx *ctx, u32 off, u32 
 // parsed. A message may carry several frames, so a caller has to keep calling
 // this until the message is consumed.
 //
-// Returns the number of bytes the frame occupies, or a negative value if the
-// message ends before the frame does.
+// Returns the number of bytes the frame occupies, 0 if the message is too short
+// to hold a frame header, or a negative value if the frame cannot be parsed.
+// That includes a frame that is longer than the message, which happens when the
+// peer writes a frame in pieces: `frame->len` then says how long it is, so that
+// the caller can cork the message until the rest has arrived.
 SEC("freplace")
 int parse_msg(struct sk_msg_md *msg, struct http_parse_res *pres __arg_nonnull, struct http2_frame *frame __arg_nonnull) {
     u8 *data = (u8 *)(long)msg->data;
@@ -1110,7 +1122,7 @@ int parse_msg(struct sk_msg_md *msg, struct http_parse_res *pres __arg_nonnull, 
     u8 flags = data[4];
     u32 frame_len = HTTP2_FRAME_HDR_LEN + len;
 
-    *frame = _new_http2_frame(data, type, flags);
+    *frame = _new_http2_frame(data, len, type, flags);
 
     bpf_debug("Parsing HTTP/2 message with length %d, type %d, flags %d", len, type, flags);
 
@@ -1160,7 +1172,7 @@ int parse_skb(struct __sk_buff *skb, u32 off, struct http_parse_res *pres __arg_
     u8 flags = hdr[4];
     u32 frame_len = HTTP2_FRAME_HDR_LEN + len;
 
-    *frame = _new_http2_frame(hdr, type, flags);
+    *frame = _new_http2_frame(hdr, len, type, flags);
 
     bpf_debug("Parsing HTTP/2 sk_buff with length %d, type %d, flags %d", len, type, flags);
 
