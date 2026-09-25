@@ -7,8 +7,9 @@
 //! user space.
 //!
 //! The target program declares the functions it wants Beeper to provide with
-//! the `BEEPER_*` macros of `beeper/http1.h` or `beeper/http2.h` and then
-//! names them in the [`http1`] or [`http2`] builder:
+//! the `BEEPER_*` macros of `beeper/http1.h`, `beeper/http2.h` or
+//! `beeper/resp2.h` and then names them in the [`http1`], [`http2`] or
+//! [`resp2`] builder:
 //!
 //! ```no_run
 //! # fn main() -> Result<(), beeper::Error> {
@@ -30,6 +31,7 @@
 //! the parser stays in place until it is dropped.
 
 pub(crate) use dfa::Dfa;
+pub use dfa::parser::{AttachedParser, Parser};
 use httlib_huffman::EncoderError;
 use std::fmt::Display;
 use xbpf::libbpf;
@@ -44,6 +46,9 @@ pub mod http1;
 
 #[cfg(feature = "http2")]
 pub mod http2;
+
+#[cfg(feature = "resp2")]
+pub mod resp2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MessageBuffer {
@@ -66,6 +71,10 @@ pub enum Error {
     /// into eBPF.
     ParserExceedsStateLimit,
 
+    /// The argument lies past the last one a parser can capture. The limit is
+    /// carried along.
+    ArgLimitExceeded(usize),
+
     /// The parser program could not be loaded into the kernel, or not attached
     /// to the program it should replace a function of.
     Bpf(libbpf::Error),
@@ -82,6 +91,7 @@ impl std::error::Error for Error {
             Error::Bpf(err) => Some(err),
             Error::MatchLimitExceeded(_)
             | Error::ParserExceedsStateLimit
+            | Error::ArgLimitExceeded(_)
             | Error::MalformedTableEntry(_) => None,
         }
     }
@@ -116,6 +126,12 @@ impl Display for Error {
             }
             Error::ParserExceedsStateLimit => {
                 write!(f, "the patterns do not fit into the parser program")
+            }
+            Error::ArgLimitExceeded(limit) => {
+                write!(
+                    f,
+                    "a parser captures at most the first {limit} arguments of a command"
+                )
             }
             Error::Bpf(err) => write!(f, "the parser program cannot be loaded: {err}"),
             Error::MalformedTableEntry(err) => {

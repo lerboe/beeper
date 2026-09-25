@@ -1,3 +1,9 @@
+//! The DFA the patterns of a parser are compiled into, and the parser that
+//! walks it in the kernel.
+
+pub(crate) mod action;
+pub(crate) mod parser;
+
 use crate::StateId;
 use std::{collections::HashMap, fmt::Debug, ops::RangeBounds};
 use tracing::trace;
@@ -22,7 +28,7 @@ pub(crate) type Input = u16;
 ///
 /// It is not a byte, so that a pattern holding the byte it used to be spelled
 /// with, `*`, matches that byte and nothing else.
-const ANY_INPUT: Input = 0x100;
+pub(crate) const ANY_INPUT: Input = 0x100;
 
 /// A single transition of a [`Dfa`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,7 +186,7 @@ impl<A: Copy + Debug + PartialEq + Eq> DfaBuilder<'_, A> {
         to: Option<StateId>,
         case_sensitive: bool,
     ) -> StateId {
-        let to = to.unwrap_or(self.dfa.next_state(&from, &input));
+        let to = to.unwrap_or_else(|| self.dfa.next_state(&from, &input));
 
         self.dfa.insert_edge(from, input, to, None);
         if !case_sensitive && let Some(other) = other_case(input) {
@@ -320,6 +326,19 @@ impl<A: Copy + Debug + PartialEq + Eq> DfaBuilder<'_, A> {
         self
     }
 
+    /// Appends `input` to the pattern, case sensitively, and lets its last
+    /// byte lead into `to`, so that the pattern joins another one there.
+    pub fn push_to(&mut self, input: &str, to: StateId) -> &mut Self {
+        let (last, init) = input
+            .as_bytes()
+            .split_last()
+            .expect("Cannot push an empty input");
+
+        self.push_inner(init, true);
+        self.push_edge(Input::from(*last), Some(to), true);
+        self
+    }
+
     /// Matches the given input string but sets the final state
     /// to the state the DFA would be in if it started from [`ANY_STATE`].
     pub fn restart_with(&mut self, input: &str) {
@@ -369,7 +388,7 @@ pub(crate) fn fmt_input(input: Input) -> String {
 
 type EdgeMap<A> = HashMap<StateId, HashMap<Input, Edge<A>>>;
 
-/// The DFA the patterns of a [`Parser`](super::Parser) are compiled into.
+/// The DFA the patterns of a [`Parser`](parser::Parser) are compiled into.
 ///
 /// It is injected into the BPF parser program as a table of transitions,
 /// indexed by state and input, which is why states are shared between

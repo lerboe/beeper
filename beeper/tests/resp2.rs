@@ -1,0 +1,374 @@
+use beeper::{MatchId, resp2};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+};
+use utils::{
+    server,
+    test::{Direction, Hook, TestProgram},
+};
+use xbpf::OpenObject;
+
+/// Asserts that the parser captured `expected` for `mid` in the last command
+/// it parsed, or nothing if `expected` is `None`.
+fn assert_match_eq(prog: &TestProgram, mid: MatchId, expected: Option<&[u8]>) {
+    let actual = prog.get_match(mid).expect("get_match");
+    assert_eq!(
+        actual.as_deref().map(String::from_utf8_lossy),
+        expected.map(String::from_utf8_lossy),
+        "get_match({mid:?})"
+    );
+}
+
+/// Encodes `args` as the array of bulk strings a client sends a command as.
+fn cmd(args: &[&[u8]]) -> Vec<u8> {
+    let mut msg = format!("*{}\r\n", args.len()).into_bytes();
+    for arg in args {
+        msg.extend(format!("${}\r\n", arg.len()).bytes());
+        msg.extend(*arg);
+        msg.extend(b"\r\n");
+    }
+    msg
+}
+
+/// Writes `req` to `stream` in a single write and asserts that the server
+/// answers it with `reply`.
+async fn request(stream: &mut TcpStream, req: &[u8], reply: &[u8]) {
+    stream.write_all(req).await.expect("write request");
+
+    let mut buf = vec![0; reply.len()];
+    stream.read_exact(&mut buf).await.expect("read reply");
+    assert_eq!(
+        String::from_utf8_lossy(&buf),
+        String::from_utf8_lossy(reply)
+    );
+}
+
+/// Attaches a parser capturing the arguments at `args` and returns it along
+/// with the match id of each of them, in the order they were configured in.
+fn attach_resp2_parser(
+    prog_fd: i32,
+    hook: Hook,
+    args: &[usize],
+) -> (resp2::AttachedParser, Vec<MatchId>) {
+    let mut parser = resp2::Parser::new();
+
+    let mut mids = Vec::new();
+    for &arg in args {
+        mids.push(parser.capture_arg(arg).expect("capture argument"));
+    }
+
+    (attach(parser, prog_fd, hook), mids)
+}
+
+/// Attaches a parser capturing the payload of a reply and returns it along
+/// with the match id of the payload.
+fn attach_reply_parser(prog_fd: i32, hook: Hook) -> (resp2::AttachedParser, MatchId) {
+    let mut parser = resp2::Parser::new();
+    let mid = parser.capture_reply().expect("capture reply");
+
+    (attach(parser, prog_fd, hook), mid)
+}
+
+/// Attaches `parser` to the functions of the test program at `hook`.
+fn attach(parser: resp2::Parser, prog_fd: i32, hook: Hook) -> resp2::AttachedParser {
+    let suffix = hook.to_string();
+    parser
+        .matched_fn("matched_resp2")
+        .parse_fn(format!("parse_resp2_{suffix}"), hook.into())
+        .extract_fn(format!("extract_resp2_match_{suffix}"), hook.into())
+        .attach(prog_fd)
+        .expect("attach parser")
+}
+
+/// Sets `key` to `value` on a fresh Redis at `hook` and asserts that the
+/// command, the key and the value are captured.
+async fn set_a_key_at(hook: Hook) {
+    let redis = server::launch_redis().await.expect("launch redis");
+
+    let mut open_obj = OpenObject::new();
+    let prog = TestProgram::attach_resp2(redis.addr, &mut open_obj, Direction::Downstream, hook)
+        .expect("attach");
+    let (_resp2, mids) = attach_resp2_parser(prog.prog_fd(), hook, &[0, 1, 2]);
+
+    let mut stream = TcpStream::connect(redis.addr).await.expect("connect");
+    request(&mut stream, &cmd(&[b"SET", b"key", b"value"]), b"+OK\r\n").await;
+
+    assert_match_eq(&prog, mids[0], Some(b"SET"));
+    assert_match_eq(&prog, mids[1], Some(b"key"));
+    assert_match_eq(&prog, mids[2], Some(b"value"));
+}
+
+/// Gets a key that was set before on a fresh Redis at `hook` and asserts that
+/// the command and the key are captured, and nothing for the value a `GET`
+/// does not have.
+async fn get_a_key_at(hook: Hook) {
+    let redis = server::launch_redis().await.expect("launch redis");
+
+    let mut open_obj = OpenObject::new();
+    let prog = TestProgram::attach_resp2(redis.addr, &mut open_obj, Direction::Downstream, hook)
+        .expect("attach");
+    let (_resp2, mids) = attach_resp2_parser(prog.prog_fd(), hook, &[0, 1, 2]);
+
+    let mut stream = TcpStream::connect(redis.addr).await.expect("connect");
+    request(&mut stream, &cmd(&[b"SET", b"key", b"value"]), b"+OK\r\n").await;
+    request(&mut stream, &cmd(&[b"GET", b"key"]), b"$5\r\nvalue\r\n").await;
+
+    assert_match_eq(&prog, mids[0], Some(b"GET"));
+    assert_match_eq(&prog, mids[1], Some(b"key"));
+    assert_match_eq(&prog, mids[2], None);
+}
+
+#[tokio::test]
+async fn set_a_key() {
+    set_a_key_at(Hook::Msg).await;
+}
+
+#[tokio::test]
+async fn set_a_key_in_skb() {
+    set_a_key_at(Hook::Skb).await;
+}
+
+#[tokio::test]
+async fn get_a_key() {
+    get_a_key_at(Hook::Msg).await;
+}
+
+#[tokio::test]
+async fn get_a_key_in_skb() {
+    get_a_key_at(Hook::Skb).await;
+}
+
+#[tokio::test]
+async fn parse_every_command_of_a_pipeline() {
+    let redis = server::launch_redis().await.expect("launch redis");
+
+    let mut open_obj = OpenObject::new();
+    let prog =
+        TestProgram::attach_resp2(redis.addr, &mut open_obj, Direction::Downstream, Hook::Msg)
+            .expect("attach");
+    let (_resp2, mids) = attach_resp2_parser(prog.prog_fd(), Hook::Msg, &[0, 1, 2]);
+
+    // both commands go out in a single message. The parser only reaches the
+    // second one if it reports exactly where the first one ends
+    let req = [cmd(&[b"SET", b"key", b"value"]), cmd(&[b"GET", b"other"])].concat();
+
+    let mut stream = TcpStream::connect(redis.addr).await.expect("connect");
+    request(&mut stream, &req, b"+OK\r\n$-1\r\n").await;
+
+    assert_match_eq(&prog, mids[0], Some(b"GET"));
+    assert_match_eq(&prog, mids[1], Some(b"other"));
+    assert_match_eq(&prog, mids[2], None);
+}
+
+#[tokio::test]
+async fn capture_a_value_that_holds_crlf() {
+    let redis = server::launch_redis().await.expect("launch redis");
+
+    let mut open_obj = OpenObject::new();
+    let prog =
+        TestProgram::attach_resp2(redis.addr, &mut open_obj, Direction::Downstream, Hook::Msg)
+            .expect("attach");
+    let (_resp2, mids) = attach_resp2_parser(prog.prog_fd(), Hook::Msg, &[1, 2]);
+
+    // the value looks like the start of another command
+    let value = b"a\r\n*1\r\n$1\r\nb";
+    let mut stream = TcpStream::connect(redis.addr).await.expect("connect");
+    request(&mut stream, &cmd(&[b"SET", b"key", value]), b"+OK\r\n").await;
+
+    assert_match_eq(&prog, mids[0], Some(b"key"));
+    assert_match_eq(&prog, mids[1], Some(value));
+}
+
+#[tokio::test]
+async fn capture_nothing_for_an_empty_value() {
+    let redis = server::launch_redis().await.expect("launch redis");
+
+    let mut open_obj = OpenObject::new();
+    let prog =
+        TestProgram::attach_resp2(redis.addr, &mut open_obj, Direction::Downstream, Hook::Msg)
+            .expect("attach");
+    let (_resp2, mids) = attach_resp2_parser(prog.prog_fd(), Hook::Msg, &[1, 2]);
+
+    let mut stream = TcpStream::connect(redis.addr).await.expect("connect");
+    request(&mut stream, &cmd(&[b"SET", b"key", b""]), b"+OK\r\n").await;
+
+    assert_match_eq(&prog, mids[0], Some(b"key"));
+    assert_match_eq(&prog, mids[1], None);
+}
+
+#[tokio::test]
+async fn ignore_an_inline_command() {
+    let redis = server::launch_redis().await.expect("launch redis");
+
+    let mut open_obj = OpenObject::new();
+    let prog =
+        TestProgram::attach_resp2(redis.addr, &mut open_obj, Direction::Downstream, Hook::Msg)
+            .expect("attach");
+    let (_resp2, mids) = attach_resp2_parser(prog.prog_fd(), Hook::Msg, &[0, 1, 2]);
+
+    // Redis accepts commands typed into a telnet session, which are no RESP
+    let mut stream = TcpStream::connect(redis.addr).await.expect("connect");
+    request(&mut stream, b"SET key value\r\n", b"+OK\r\n").await;
+
+    for mid in mids {
+        assert_match_eq(&prog, mid, None);
+    }
+}
+
+#[tokio::test]
+async fn report_the_arguments_that_were_matched() {
+    let redis = server::launch_redis().await.expect("launch redis");
+
+    let mut open_obj = OpenObject::new();
+    let prog =
+        TestProgram::attach_resp2(redis.addr, &mut open_obj, Direction::Downstream, Hook::Msg)
+            .expect("attach");
+    let (_resp2, mids) = attach_resp2_parser(prog.prog_fd(), Hook::Msg, &[0, 1, 2]);
+
+    let mut stream = TcpStream::connect(redis.addr).await.expect("connect");
+    request(&mut stream, &cmd(&[b"GET", b"key"]), b"$-1\r\n").await;
+
+    // a GET has no third argument
+    assert_eq!(
+        prog.last_matches(),
+        1 << u8::from(mids[0]) | 1 << u8::from(mids[1]),
+        "only the command and the key are matched"
+    );
+}
+
+/// Sets a key and gets it back from a fresh Redis, parsing the replies at
+/// `hook`, and asserts that the payload of each one is captured.
+async fn capture_replies_at(hook: Hook) {
+    let redis = server::launch_redis().await.expect("launch redis");
+
+    let mut open_obj = OpenObject::new();
+    let prog = TestProgram::attach_resp2(redis.addr, &mut open_obj, Direction::Upstream, hook)
+        .expect("attach");
+    let (_resp2, mid) = attach_reply_parser(prog.prog_fd(), hook);
+
+    let mut stream = TcpStream::connect(redis.addr).await.expect("connect");
+    request(&mut stream, &cmd(&[b"SET", b"key", b"value"]), b"+OK\r\n").await;
+    assert_match_eq(&prog, mid, Some(b"OK"));
+
+    request(&mut stream, &cmd(&[b"GET", b"key"]), b"$5\r\nvalue\r\n").await;
+    assert_match_eq(&prog, mid, Some(b"value"));
+
+    // a null bulk string is parsed too, and clears what the last reply left
+    request(&mut stream, &cmd(&[b"GET", b"other"]), b"$-1\r\n").await;
+    assert_match_eq(&prog, mid, None);
+}
+
+#[tokio::test]
+async fn capture_replies() {
+    capture_replies_at(Hook::Msg).await;
+}
+
+#[tokio::test]
+async fn capture_replies_in_skb() {
+    capture_replies_at(Hook::Skb).await;
+}
+
+#[tokio::test]
+async fn capture_an_error_and_an_integer_reply() {
+    let redis = server::launch_redis().await.expect("launch redis");
+
+    let mut open_obj = OpenObject::new();
+    let prog = TestProgram::attach_resp2(redis.addr, &mut open_obj, Direction::Upstream, Hook::Msg)
+        .expect("attach");
+    let (_resp2, mid) = attach_reply_parser(prog.prog_fd(), Hook::Msg);
+
+    let err = b"ERR wrong number of arguments for 'get' command";
+    let mut stream = TcpStream::connect(redis.addr).await.expect("connect");
+    request(
+        &mut stream,
+        &cmd(&[b"GET"]),
+        &[b"-", &err[..], b"\r\n"].concat(),
+    )
+    .await;
+    assert_match_eq(&prog, mid, Some(err));
+
+    request(&mut stream, &cmd(&[b"INCR", b"counter"]), b":1\r\n").await;
+    assert_match_eq(&prog, mid, Some(b"1"));
+}
+
+#[tokio::test]
+async fn parse_every_reply_of_a_pipeline() {
+    let redis = server::launch_redis().await.expect("launch redis");
+
+    let mut open_obj = OpenObject::new();
+    let prog = TestProgram::attach_resp2(redis.addr, &mut open_obj, Direction::Upstream, Hook::Msg)
+        .expect("attach");
+    let (_resp2, mid) = attach_reply_parser(prog.prog_fd(), Hook::Msg);
+
+    // Redis answers a pipeline with a single message. The parser only reaches
+    // the second reply if it reports exactly where the first one ends
+    let req = [cmd(&[b"SET", b"key", b"value"]), cmd(&[b"GET", b"key"])].concat();
+
+    let mut stream = TcpStream::connect(redis.addr).await.expect("connect");
+    request(&mut stream, &req, b"+OK\r\n$5\r\nvalue\r\n").await;
+
+    assert_match_eq(&prog, mid, Some(b"value"));
+}
+
+#[tokio::test]
+async fn capture_bulk_string_elements_of_an_array_reply() {
+    let redis = server::launch_redis().await.expect("launch redis");
+
+    let mut open_obj = OpenObject::new();
+    let prog = TestProgram::attach_resp2(redis.addr, &mut open_obj, Direction::Upstream, Hook::Msg)
+        .expect("attach");
+    let (_resp2, mids) = attach_resp2_parser(prog.prog_fd(), Hook::Msg, &[0, 1]);
+
+    let mut stream = TcpStream::connect(redis.addr).await.expect("connect");
+    request(&mut stream, &cmd(&[b"SET", b"a", b"x"]), b"+OK\r\n").await;
+
+    // the missing key is a null element
+    let reply = b"*2\r\n$1\r\nx\r\n$-1\r\n";
+    request(&mut stream, &cmd(&[b"MGET", b"a", b"missing"]), reply).await;
+
+    assert_match_eq(&prog, mids[0], Some(b"x"));
+    assert_match_eq(&prog, mids[1], None);
+}
+
+#[tokio::test]
+async fn capture_integer_elements_of_an_array_reply() {
+    let redis = server::launch_redis().await.expect("launch redis");
+
+    let mut open_obj = OpenObject::new();
+    let prog = TestProgram::attach_resp2(redis.addr, &mut open_obj, Direction::Upstream, Hook::Msg)
+        .expect("attach");
+    let (_resp2, mids) = attach_resp2_parser(prog.prog_fd(), Hook::Msg, &[0, 1]);
+
+    let mut stream = TcpStream::connect(redis.addr).await.expect("connect");
+    request(&mut stream, &cmd(&[b"SADD", b"s", b"m"]), b":1\r\n").await;
+
+    let reply = b"*2\r\n:1\r\n:0\r\n";
+    request(&mut stream, &cmd(&[b"SMISMEMBER", b"s", b"m", b"n"]), reply).await;
+
+    assert_match_eq(&prog, mids[0], Some(b"1"));
+    assert_match_eq(&prog, mids[1], Some(b"0"));
+}
+
+#[tokio::test]
+async fn capture_simple_string_and_error_elements_of_an_array_reply() {
+    let redis = server::launch_redis().await.expect("launch redis");
+
+    let mut open_obj = OpenObject::new();
+    let prog = TestProgram::attach_resp2(redis.addr, &mut open_obj, Direction::Upstream, Hook::Msg)
+        .expect("attach");
+    let (_resp2, mids) = attach_resp2_parser(prog.prog_fd(), Hook::Msg, &[0, 1]);
+
+    // a transaction replies with the reply of every command it ran
+    let mut stream = TcpStream::connect(redis.addr).await.expect("connect");
+    request(&mut stream, &cmd(&[b"MULTI"]), b"+OK\r\n").await;
+    request(&mut stream, &cmd(&[b"SET", b"k", b"v"]), b"+QUEUED\r\n").await;
+    request(&mut stream, &cmd(&[b"INCR", b"k"]), b"+QUEUED\r\n").await;
+
+    let err = b"ERR value is not an integer or out of range";
+    let reply = [b"*2\r\n+OK\r\n-", &err[..], b"\r\n"].concat();
+    request(&mut stream, &cmd(&[b"EXEC"]), &reply).await;
+
+    assert_match_eq(&prog, mids[0], Some(b"OK"));
+    assert_match_eq(&prog, mids[1], Some(err));
+}

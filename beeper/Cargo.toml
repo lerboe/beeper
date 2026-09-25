@@ -11,10 +11,11 @@ description.workspace = true
 categories.workspace = true
 
 [features]
-default = ["http1", "http2"]
+default = ["http1", "http2", "resp2"]
 build = []
 http1 = []
 http2 = []
+resp2 = []
 
 [dependencies]
 as-bytes = "0.2.0"

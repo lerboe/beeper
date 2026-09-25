@@ -103,6 +103,27 @@ impl<'obj> TestProgram<'obj> {
         direction: Direction,
         hook: Hook,
     ) -> Result<Self> {
+        Self::load(address, open_obj, direction, hook, false)
+    }
+
+    /// Same as [`TestProgram::attach_to`], for connections that speak RESP2
+    /// rather than HTTP.
+    pub fn attach_resp2<A: ToSocketAddrs>(
+        address: A,
+        open_obj: &'obj mut MaybeUninit<libbpf_rs::OpenObject>,
+        direction: Direction,
+        hook: Hook,
+    ) -> Result<Self> {
+        Self::load(address, open_obj, direction, hook, true)
+    }
+
+    fn load<A: ToSocketAddrs>(
+        address: A,
+        open_obj: &'obj mut MaybeUninit<libbpf_rs::OpenObject>,
+        direction: Direction,
+        hook: Hook,
+        resp2: bool,
+    ) -> Result<Self> {
         let address = address
             .to_socket_addrs()?
             .next()
@@ -129,6 +150,7 @@ impl<'obj> TestProgram<'obj> {
         open_skel.maps.rodata_data.as_mut().unwrap().http_parse_resp =
             direction == Direction::Upstream;
         open_skel.maps.rodata_data.as_mut().unwrap().hook_skb = hook == Hook::Skb;
+        open_skel.maps.rodata_data.as_mut().unwrap().parse_resp2 = resp2;
 
         let skel = open_skel.load()?;
         let sock_map_fd = skel.maps.sock_map.as_fd().as_raw_fd();
