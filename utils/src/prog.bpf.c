@@ -10,6 +10,9 @@
 // travelling in the direction under test and stores what the parser captured in
 // `matches`, where the test can read it back from user space.
 
+// The length of an HTTP/2 frame header.
+#define HTTP2_FRAME_HDR_LEN 9
+
 // The connections that carried an HTTP/2 preface and are parsed as HTTP/2 from
 // then on.
 struct {
@@ -85,6 +88,10 @@ u32 last_dt_count = 0;
 // parsed, one bit per id.
 u32 last_matches = 0;
 
+// The HTTP/2 frames handed to the parser, and the ones it failed to parse.
+u64 num_h2_frames = 0;
+u64 num_h2_errors = 0;
+
 // Records which of the 32 match ids the parser captured a value for.
 static __always_inline void store_matched(const struct http_parse_res *pres, bool is_h2) {
     u32 mask = 0;
@@ -147,7 +154,17 @@ int msg_verdict(struct sk_msg_md *msg) {
     if (is_h2) {
         struct http2_frame frame = { 0 };
         msg_len = parse_http2_msg(msg, &pres, &frame);
+
+        // a frame written in pieces is parsed once all of it has arrived
+        u32 frame_len = HTTP2_FRAME_HDR_LEN + frame.len;
+        if (msg_len == 0 || (msg_len < 0 && frame_len > msg->size)) {
+            bpf_msg_cork_bytes(msg, msg_len == 0 ? HTTP2_FRAME_HDR_LEN : frame_len);
+            return SK_PASS;
+        }
+
+        __sync_fetch_and_add(&num_h2_frames, 1);
         if (msg_len < 0) {
+            __sync_fetch_and_add(&num_h2_errors, 1);
             bpf_error("Failed to parse h2 message: %s", msg->data);
             return SK_PASS;
         }
@@ -270,7 +287,9 @@ int skb_verdict(struct __sk_buff *skb) {
     if (is_h2) {
         struct http2_frame frame = { 0 };
         int len = parse_http2_skb(skb, off, &pres, &frame, NULL);
+        __sync_fetch_and_add(&num_h2_frames, 1);
         if (len < 0) {
+            __sync_fetch_and_add(&num_h2_errors, 1);
             bpf_error("Failed to parse h2 skb");
             return SK_PASS;
         }

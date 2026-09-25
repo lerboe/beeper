@@ -17,6 +17,12 @@ struct http2_frame {
     // this frame.
     u32 dt_count_before;
     u32 dt_count;
+
+    // The length of the frame's payload, as its header announces it. A parser
+    // that returns a negative value for a frame that is longer than the
+    // message leaves it here, so that the caller can wait for the rest of it,
+    // e.g. with `bpf_msg_cork_bytes`.
+    u32 len;
 };
 
 // The number of bytes of a name or a value that are kept in a dynamic table

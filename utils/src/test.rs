@@ -195,6 +195,16 @@ impl<'obj> TestProgram<'obj> {
         self.skel.maps.bss_data.as_ref().unwrap().last_matches
     }
 
+    /// Returns the number of HTTP/2 frames handed to the parser so far, and the
+    /// number of those it failed to parse.
+    pub fn h2_frame_counts(&self) -> (u64, u64) {
+        let bss = self.skel.maps.bss_data.as_ref().unwrap();
+        // the program updates the counters while user space reads them
+        let frames = unsafe { std::ptr::read_volatile(&bss.num_h2_frames) };
+        let errors = unsafe { std::ptr::read_volatile(&bss.num_h2_errors) };
+        (frames, errors)
+    }
+
     pub fn last_dt_counts(&self) -> (u32, u32) {
         let bss = self.skel.maps.bss_data.as_ref().unwrap();
         (bss.last_dt_count_before, bss.last_dt_count)
