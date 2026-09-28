@@ -63,7 +63,7 @@ impl Parser {
     }
 
     /// Specifies the name of the stub function defined with `BEEPER_HTTP1_PARSE_*`
-    /// in the target program. When calling [`attach`](Parser::attach), Beeper will insert its logic
+    /// in the target program. When calling [`Parser::attach`], Beeper will insert its logic
     /// into the given template using the
     /// [BPF_PROG_TYPE_EXT](https://docs.ebpf.io/linux/program-type/BPF_PROG_TYPE_EXT/)
     /// program type.
@@ -81,7 +81,7 @@ impl Parser {
     }
 
     /// Specifies the name of the stub function defined with `BEEPER_MATCHED`
-    /// in the target program. When calling [`attach`](Parser::attach), Beeper will insert its logic
+    /// in the target program. When calling [`Parser::attach`], Beeper will insert its logic
     /// into the given template using the
     /// [BPF_PROG_TYPE_EXT](https://docs.ebpf.io/linux/program-type/BPF_PROG_TYPE_EXT/)
     /// program type.
@@ -99,7 +99,7 @@ impl Parser {
     }
 
     /// Specifies the name of the stub function defined with `BEEPER_EXTRACT_MATCH_*`
-    /// in the target program. When calling [`attach`](Parser::attach), Beeper will insert its logic
+    /// in the target program. When calling [`Parser::attach`], Beeper will insert its logic
     /// into the given template using the
     /// [BPF_PROG_TYPE_EXT](https://docs.ebpf.io/linux/program-type/BPF_PROG_TYPE_EXT/)
     /// program type.
@@ -137,7 +137,7 @@ impl Parser {
     /// The field is matched case insensitively and its value is captured up to
     /// the end of the line, without the optional whitespace that may follow the
     /// colon. This function also accepts pseudo header fields (see
-    /// [`PseudoHeaderName`](crate::PseudoHeaderName)).
+    /// [`crate::PseudoHeaderName`]).
     ///
     /// # Errors
     ///

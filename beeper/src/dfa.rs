@@ -2,26 +2,17 @@ use crate::StateId;
 use std::{collections::HashMap, fmt::Debug, ops::RangeBounds};
 use tracing::trace;
 
-/// The state a message is parsed from. Only patterns that must appear at the
-/// very beginning of a message are anchored here.
+/// The state a message is parsed from.
 pub const INIT_STATE: StateId = StateId(0);
 
-/// The state input that matches no pattern leads back to. Patterns that may
-/// appear anywhere in the header block are anchored here.
+/// The fallback state, to which all edges lead to if no input matched.
 pub const ANY_STATE: StateId = StateId(1);
 
 /// What a transition is matched on: a byte of the message, or [`ANY_INPUT`].
-///
-/// It is wider than a byte so that the two cannot be confused. A pattern is
-/// free to spell out any byte there is, [`ANY_INPUT`] included, and the parser
-/// program reserves a column of its transition table for the latter.
 pub(crate) type Input = u16;
 
 /// The input a state matches any byte with. The parser only follows it if the
 /// state has no transition for the byte it read.
-///
-/// It is not a byte, so that a pattern holding the byte it used to be spelled
-/// with, `*`, matches that byte and nothing else.
 const ANY_INPUT: Input = 0x100;
 
 /// A single transition of a [`Dfa`].
@@ -30,8 +21,7 @@ struct Edge<A: PartialEq + Eq> {
     /// The state the transition leads to.
     to: StateId,
 
-    /// The action it carries, if it carries one of its own rather than the one
-    /// of the state it leads to.
+    /// The action it carries.
     action: Option<A>,
 }
 
@@ -56,9 +46,7 @@ pub struct DfaBuilder<'a, A: Copy + Debug + PartialEq + Eq> {
     /// The state the pattern has been built up to.
     state: StateId,
 
-    /// Inputs that may appear before the next one. They are only built into
-    /// the DFA once that input is known, as each of them has to lead back to
-    /// the state it branched off of, or be joined with it.
+    /// Inputs that may appear before the next one.
     optional_prefixes: Vec<OptionalPrefix>,
 
     /// The states the optional prefixes that were pushed since the last input
@@ -169,10 +157,10 @@ impl<A: Copy + Debug + PartialEq + Eq> DfaBuilder<'_, A> {
         self.state = to;
     }
 
-    /// Inserts an edge for both the lower and the upper case of `input`,
-    /// carrying `action`, and returns the state they lead to. If `to` is
-    /// `None`, the edge leads to the state the DFA already has for `input`, or
-    /// to a new one.
+    /// Inserts an edge for both the lower and the upper case of `input`
+    /// if `case_sensitive` is `false`, carrying `action`, and returns the state
+    ///  they lead to. If `to` is `None`, the edge leads to the state the DFA
+    /// already has for `input`, or to a new one.
     fn push_edge_from(
         &mut self,
         from: StateId,
@@ -206,6 +194,7 @@ impl<A: Copy + Debug + PartialEq + Eq> DfaBuilder<'_, A> {
         self.push_inner(input.as_bytes(), false)
     }
 
+    /// Appends `input` to the pattern, one edge per character.
     fn push_inner(&mut self, input: &[u8], case_sensitive: bool) -> &mut Self {
         for b in input {
             self.push_edge(Input::from(*b), None, case_sensitive);
@@ -266,6 +255,8 @@ impl<A: Copy + Debug + PartialEq + Eq> DfaBuilder<'_, A> {
         self.push_options_inner(inputs, false)
     }
 
+    /// Adds a set of patterns to the DFA, one of which must match
+    /// for the DFA to accept an input.
     fn push_options_inner(&mut self, inputs: &[&str], case_sensitive: bool) -> &mut Self {
         let Some(longest) = inputs.iter().copied().max_by_key(|input| input.len()) else {
             return self;
@@ -370,12 +361,6 @@ pub(crate) fn fmt_input(input: Input) -> String {
 type EdgeMap<A> = HashMap<StateId, HashMap<Input, Edge<A>>>;
 
 /// The DFA the patterns of a [`Parser`](super::Parser) are compiled into.
-///
-/// It is injected into the BPF parser program as a table of transitions,
-/// indexed by state and input, which is why states are shared between
-/// patterns wherever possible. A transition names the action it carries by the
-/// index it is held under in [`Dfa::actions`], so that an action can say more
-/// than the 16 bits of a transition have room for.
 pub(crate) struct Dfa<A: Copy + Debug + PartialEq + Eq> {
     /// The number of states, including [`INIT_STATE`] and [`ANY_STATE`].
     num_states: u16,
@@ -435,8 +420,7 @@ impl<A: Copy + Debug + PartialEq + Eq> Dfa<A> {
     /// # Panics
     ///
     /// Panics if `from` already has an edge for `input` that leads somewhere
-    /// else, as that would make the automaton non-deterministic, or if it
-    /// carries an action `action` cannot be combined with.
+    /// else.
     pub fn insert_edge(&mut self, from: StateId, input: Input, to: StateId, action: Option<A>) {
         let edges = self.edges.entry(from).or_default();
         let Some(old) = edges.get_mut(&input) else {
@@ -450,9 +434,6 @@ impl<A: Copy + Debug + PartialEq + Eq> Dfa<A> {
             old.to
         );
 
-        // patterns share their transitions wherever they run alongside each
-        // other, so one walking over a transition another already laid down
-        // leaves the action on it alone
         match (old.action, action) {
             (_, None) => {}
             (None, Some(action)) => old.action = Some(action),
@@ -489,8 +470,7 @@ impl<A: Copy + Debug + PartialEq + Eq> Dfa<A> {
     }
 
     /// Returns an iterator over the transitions of the DFA, each paired with
-    /// the id of the action it carries: its own if it has one, and the one of
-    /// the state it leads to otherwise.
+    /// the id of the action it carries.
     pub fn iter_transitions(
         &self,
     ) -> impl Iterator<Item = (StateId, Input, StateId, Option<A>)> + '_ {

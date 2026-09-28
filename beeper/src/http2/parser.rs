@@ -63,7 +63,7 @@ xbpf::include_bpf!("http2/parser");
 impl Parser {
     /// Creates a new HTTP/2 parser.
     ///
-    /// Additional configuration must be done through the builder methods before calling `attach`.
+    /// Additional configuration must be done through the builder methods before calling [`Parser::attach`].
     pub fn new() -> Parser {
         let dfa = hpack::dfa();
 
@@ -79,7 +79,7 @@ impl Parser {
     }
 
     /// Specifies the name of the stub function defined with `BEEPER_HTTP2_PARSE_*`
-    /// in the target program. When calling [`attach`](Parser::attach), Beeper will insert its logic
+    /// in the target program. When calling [`], Beeper will insert its logic
     /// into the given template using the
     /// [BPF_PROG_TYPE_EXT](https://docs.ebpf.io/linux/program-type/BPF_PROG_TYPE_EXT/)
     /// program type.
@@ -97,7 +97,7 @@ impl Parser {
     }
 
     /// Specifies the name of the stub function defined with `BEEPER_MATCHED`
-    /// in the target program. When calling [`attach`](Parser::attach), Beeper will insert its logic
+    /// in the target program. When calling [`], Beeper will insert its logic
     /// into the given template using the
     /// [BPF_PROG_TYPE_EXT](https://docs.ebpf.io/linux/program-type/BPF_PROG_TYPE_EXT/)
     /// program type.
@@ -115,7 +115,7 @@ impl Parser {
     }
 
     /// Specifies the name of the stub function defined with `BEEPER_EXTRACT_MATCH_*`
-    /// in the target program. When calling [`attach`](Parser::attach), Beeper will insert its logic
+    /// in the target program. When calling [`], Beeper will insert its logic
     /// into the given template using the
     /// [BPF_PROG_TYPE_EXT](https://docs.ebpf.io/linux/program-type/BPF_PROG_TYPE_EXT/)
     /// program type.
@@ -133,7 +133,7 @@ impl Parser {
     }
 
     /// Specifies the name of the stub function defined with `BEEPER_HTTP2_GET_DT_ENTRY`
-    /// in the target program. When calling [`attach`](Parser::attach), Beeper will insert its logic
+    /// in the target program. When calling [`Parser::attach`], Beeper will insert its logic
     /// into the given template using the
     /// [BPF_PROG_TYPE_EXT](https://docs.ebpf.io/linux/program-type/BPF_PROG_TYPE_EXT/)
     /// program type.
@@ -155,7 +155,7 @@ impl Parser {
     /// The matched field values are possibly Huffman-encoded. If the eBPF must
     /// check for a specific header, it must therefore compare against the
     /// encoded and decoded case. This function also accepts pseudo header fields
-    /// (see [`PseudoHeaderName`](crate::PseudoHeaderName)).
+    /// (see [`crate::PseudoHeaderName`]).
     ///
     /// # Errors
     ///
