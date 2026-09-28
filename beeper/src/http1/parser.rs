@@ -62,8 +62,9 @@ impl Parser {
         }
     }
 
-    /// Specifies the name of the function template in the target program. When calling
-    /// [`attach`], Beeper will insert its logic into the given template using the
+    /// Specifies the name of the stub function defined with `BEEPER_HTTP1_PARSE_*`
+    /// in the target program. When calling [`attach`], Beeper will insert its logic
+    /// into the given template using the
     /// [BPF_PROG_TYPE_EXT](https://docs.ebpf.io/linux/program-type/BPF_PROG_TYPE_EXT/)
     /// program type.
     ///
@@ -76,8 +77,9 @@ impl Parser {
         self
     }
 
-    /// Specifies the name of the function template in the target program. When calling
-    /// [`attach`], Beeper will insert its logic into the given template using the
+    /// Specifies the name of the stub function defined with `BEEPER_MATCHED`
+    /// in the target program. When calling [`attach`], Beeper will insert its logic
+    /// into the given template using the
     /// [BPF_PROG_TYPE_EXT](https://docs.ebpf.io/linux/program-type/BPF_PROG_TYPE_EXT/)
     /// program type.
     ///
@@ -89,14 +91,15 @@ impl Parser {
         self
     }
 
-    /// Specifies the name of the function template in the target program. When calling
-    /// [`attach`], Beeper will insert its logic into the given template using the
+    /// Specifies the name of the stub function defined with `BEEPER_EXTRACT_MATCH_*`
+    /// in the target program. When calling [`attach`], Beeper will insert its logic
+    /// into the given template using the
     /// [BPF_PROG_TYPE_EXT](https://docs.ebpf.io/linux/program-type/BPF_PROG_TYPE_EXT/)
     /// program type.
     ///
     /// # Arguments
     ///
-    /// * `extract_fn` - The name of the function to replace in the target program
+    /// * `parse_fn` - The name of the function to replace in the target program
     /// * `msg_buf` - The type of buffer to parse
     pub fn extract_fn<S: ToString>(mut self, extract_fn: S, msg_buf: MessageBuffer) -> Parser {
         self.extract_fns.insert(msg_buf, extract_fn.to_string());

@@ -1,10 +1,11 @@
 //! HTTP/2 parsing.
 //!
-//! HTTP/2 does not spell its header fields out on the wire. HPACK either
-//! replaces a field with an index into the static or the dynamic table, or
-//! Huffman encodes it. [`Parser`] therefore matches the Huffman encoded field
-//! name against its DFA and mirrors the peer's dynamic table in a BPF map, so
-//! that indexed fields can be resolved in the kernel as well.
+//! [`Parser`] compiles the configured patterns into a DFA whose edges
+//! are injected into the BPF parser program. The kernel walks the message
+//! byte by byte, follows the edges and runs each action it encounters.
+//!
+//! Note that [`Parser`] operates directly on the Huffman-encoded bytes,
+//! and manages a copy of the dynamic table for each connection.
 
 use std::net::SocketAddr;
 

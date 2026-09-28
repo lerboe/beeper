@@ -1,4 +1,4 @@
-//! The DFA actions for [`http1::parser`].
+//! The DFA actions for [`http1::Parser`].
 //!
 //! The actions reside on the edge of the DFA and are executed by the eBPF
 //! runtime when it consumes the input associated with that edge.
@@ -20,7 +20,7 @@ const HTTP1A_END_CAPTURE: u8 = 2;
 /// Terminate parsing and skipping the remainder of the message.
 const HTTP1F_DONE: u8 = 1 << 0;
 
-/// The DFA actions for [`http1::parser`], wrapped for convenience
+/// The DFA actions for [`http1::Parser`], wrapped for convenience
 /// in an enum for usage in [`Dfa`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Action {
@@ -40,6 +40,7 @@ pub enum Action {
 }
 
 impl From<Action> for http1_action {
+    /// Converts the Rust-based [`Action`] into the eBPF-based `http1_action`.
     fn from(value: Action) -> Self {
         let (kind, flags, mid) = match value {
             Action::Done => (HTTP1A_NONE, HTTP1F_DONE, 0),

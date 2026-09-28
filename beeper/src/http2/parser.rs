@@ -78,8 +78,11 @@ impl Parser {
         }
     }
 
-    /// Specifies the function template in the target program to be replaced with an HTTP/1.1
-    /// parser. The function will not be replaced until `attach` is called.
+    /// Specifies the name of the stub function defined with `BEEPER_HTTP2_PARSE_*`
+    /// in the target program. When calling [`attach`], Beeper will insert its logic
+    /// into the given template using the
+    /// [BPF_PROG_TYPE_EXT](https://docs.ebpf.io/linux/program-type/BPF_PROG_TYPE_EXT/)
+    /// program type.
     ///
     /// # Arguments
     ///
@@ -90,36 +93,44 @@ impl Parser {
         self
     }
 
-    /// Specifies the function template in the target program to be called when a pattern match
-    /// is completed. The function will not be replaced until `attach` is called.
+    /// Specifies the name of the stub function defined with `BEEPER_MATCHED`
+    /// in the target program. When calling [`attach`], Beeper will insert its logic
+    /// into the given template using the
+    /// [BPF_PROG_TYPE_EXT](https://docs.ebpf.io/linux/program-type/BPF_PROG_TYPE_EXT/)
+    /// program type.
     ///
     /// # Arguments
     ///
-    /// * `matched_fn` - The name of the matched callback function in the target program
+    /// * `matched_fn` - The name of the function to replace in the target program
     pub fn matched_fn<S: ToString>(mut self, matched_fn: S) -> Parser {
         self.matched_fn = Some(matched_fn.to_string());
         self
     }
 
-    /// Specifies the function template in the target program to be called when extracting
-    /// matched content. The function will not be replaced until `attach` is called.
+    /// Specifies the name of the stub function defined with `BEEPER_EXTRACT_MATCH_*`
+    /// in the target program. When calling [`attach`], Beeper will insert its logic
+    /// into the given template using the
+    /// [BPF_PROG_TYPE_EXT](https://docs.ebpf.io/linux/program-type/BPF_PROG_TYPE_EXT/)
+    /// program type.
     ///
     /// # Arguments
     ///
-    /// * `extract_fn` - The name of the extract callback function in the target program
-    /// * `msg_buf` - The type of buffer to extract the match from
+    /// * `extract_fn` - The name of the function to replace in the target program
+    /// * `msg_buf` - The type of buffer to parse
     pub fn extract_fn<S: ToString>(mut self, extract_fn: S, msg_buf: MessageBuffer) -> Parser {
         self.extract_fns.insert(msg_buf, extract_fn.to_string());
         self
     }
 
-    /// Specifies the function template in the target program to be replaced with a reader of the
-    /// connection's dynamic table (`BEEPER_HTTP2_GET_DT_ENTRY`). The function will not be replaced
-    /// until `attach` is called.
+    /// Specifies the name of the stub function defined with `BEEPER_HTTP2_GET_DT_ENTRY`
+    /// in the target program. When calling [`attach`], Beeper will insert its logic
+    /// into the given template using the
+    /// [BPF_PROG_TYPE_EXT](https://docs.ebpf.io/linux/program-type/BPF_PROG_TYPE_EXT/)
+    /// program type.
     ///
     /// # Arguments
     ///
-    /// * `get_dynamic_table_entry_fn` - The name of the dynamic table entry reader function in the target program
+    /// * `get_dynamic_table_entry` - The name of the function to replace in the target program
     pub fn get_dynamic_table_entry<S: ToString>(mut self, get_dynamic_table_entry_fn: S) -> Parser {
         self.get_dynamic_table_entry_fn = Some(get_dynamic_table_entry_fn.to_string());
         self
@@ -127,11 +138,10 @@ impl Parser {
 
     /// Configures the parser to capture the value of a header field.
     ///
-    /// The field name is matched in its Huffman encoded form, which is how
-    /// HPACK puts it on the wire. Fields the peer replaced with an index into
-    /// the static or the dynamic table are matched against the entry the index
-    /// resolves to. A [`PseudoHeader`] carries the leading colon HTTP/2 spells
-    /// it with, see [`crate::PseudoHeader`].
+    /// The matched field values are possibly Huffman-encoded. If the eBPF must
+    /// check for a specific header, it must therefore compare against the
+    /// encoded and decoded case. This function also accepts pseudo header fields
+    /// (see [`PseudoHeaderName`]).
     ///
     /// # Arguments
     ///
@@ -141,13 +151,11 @@ impl Parser {
     /// # Errors
     ///
     /// Returns an error if `name` cannot be Huffman encoded, or if the parser
-    /// already captures as many fields as the parser program has room for.
+    /// already captures the maximum number of fields.
     ///
     /// # Returns
     ///
-    /// The match ID that can be used in eBPF to extract the captured value. A
-    /// header that is already captured keeps the ID it was given the first
-    /// time, rather than being captured a second time under a new one.
+    /// The match ID that can be used in eBPF to extract the captured value.
     pub fn capture_hdr<H: AsRef<[u8]>>(&mut self, name: H) -> Result<MatchId, Error> {
         let name = name.as_ref();
         if let Some(&mid) = self.captures.get(name) {
@@ -242,11 +250,11 @@ impl Parser {
     }
 
     /// Loads the configured parser and attaches it to the target program.
+    ///
     /// Every function configured with [`Parser::parse_fn`],
-    /// [`Parser::matched_fn`], [`Parser::extract_fn`] or
-    /// [`Parser::get_dynamic_table_entry`] is replaced in the target program,
-    /// the remaining parser programs are left unloaded. Loading the parser also
-    /// populates the HPACK static table.
+    /// [`Parser::matched_fn`] or [`Parser::extract_fn`] is replaced in the
+    /// target program, the remaining parser programs are left
+    /// unloaded.
     ///
     /// # Arguments
     ///
@@ -347,15 +355,12 @@ impl Parser {
         })
     }
 
-    /// Writes the transition table of the DFA and the actions its transitions
-    /// carry into the read-only data of the parser program. This has to happen
-    /// before the program is loaded, as the kernel freezes the section
-    /// afterwards.
+    /// Writes the DFA into the read-only data of the parser program.
     ///
     /// # Errors
     ///
-    /// Returns an error if the patterns do not fit into the tables the parser
-    /// program reserves for them.
+    /// Returns an error if the DFA exceeds the eBPF limits on the number
+    /// of states, edges, or actions.
     fn inject(&self, skel: &mut OpenParserSkel) -> Result<(), Error> {
         let Some(data) = skel.maps.rodata_data.as_mut() else {
             panic!("the parser program has no read-only data to inject into");
@@ -426,10 +431,7 @@ pub struct AttachedParser {
     links: Vec<Link>,
 }
 
-/// The state of the dynamic table the parser mirrors for a connection.
-///
-/// This is mostly useful to assert that the kernel side stayed in sync with the
-/// peer's own table.
+/// The state of the dynamic table the parser mirrors for a single connection.
 #[repr(C)]
 #[derive(Default, Clone)]
 pub struct DynamicTableInfo {
@@ -451,10 +453,8 @@ pub struct DynamicTableInfo {
     /// trusted.
     ///
     /// It drifts when a header block is split over a HEADERS frame and the
-    /// CONTINUATION frames following it in the middle of a field, see section
-    /// 6.10 of RFC 9113: the parser cannot address the half of the field that
-    /// is in the frame before, so the entry the peer adds is one it cannot
-    /// mirror. A table that has drifted is neither added to nor resolved from.
+    /// CONTINUATION frames following it in the middle of a field (see [Section
+    /// 6.10 of RFC 9113](https://datatracker.ietf.org/doc/html/rfc7541#section-6.10).
     pub dirty: u32,
 }
 
@@ -494,6 +494,15 @@ impl AttachedParser {
             Err(err) => Some(Err(err.into())),
         }
     }
+
+    /// Removes the dynamic table for a specific connection.
+    ///
+    /// This function should be called once a connection has closed, in order to
+    /// free up space in the eBPF map.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the dynamic table cannot be modified.
     pub fn forget_conn(&self, local: SocketAddr, remote: SocketAddr) -> Result<(), Error> {
         let conn = ip4_conn {
             local: local.into(),

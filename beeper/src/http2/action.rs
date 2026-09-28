@@ -1,86 +1,78 @@
-//! The shape of an HPACK header field representation, compiled into
-//! transitions.
+//! The DFA actions for [`http2::Parser`].
 //!
-//! A field is a sequence of integers and strings, and which one comes next is
-//! decided by the bytes read so far, so it can be walked with the same
-//! automaton as the field names themselves. Section 6 of RFC 7541 spells the
-//! representations out.
-//!
-//! The value an integer carries lives on the transition rather than in the
-//! state it leads to, which is what keeps the automaton small: every index a
-//! representation can carry is a transition of its own, but all of them lead to
-//! the same handful of states.
+//! The actions reside on the edge of the DFA and are executed by the eBPF
+//! runtime when it consumes the input associated with that edge.
 //!
 //! The state ids and action kinds below must stay in sync with the `S_*` and
 //! `HTTP2A_*` constants of http2/parser.bpf.c.
 
 use crate::{MatchId, StateId, http2::parser::types::http2_action};
 
-/// A field name that matched no pattern.
+/// Fallback state when no header field matched.
 pub const S_DEAD: StateId = StateId(2);
 
-/// At the first byte of a field representation.
+/// State marking the first byte of a field.
 pub const S_FIELD: StateId = StateId(3);
 
-/// At the first byte of the length of a field name.
+/// State marking the first byte of a field length.
 pub const S_KEY_LEN: StateId = StateId(4);
 
-/// At the first byte of the length of a field value.
+/// State marking the first byte of a field value.
 pub const S_VAL_LEN: StateId = StateId(5);
 
 /// The root of the trie of the field names to capture.
 pub const S_NAME: StateId = StateId(6);
 
-/// The continuation of the index of an indexed field.
+/// Continuation of the index of an indexed field.
 pub const S_IDX7_CONT: StateId = StateId(7);
 
-/// The continuation of the name index of a field that is added to the dynamic
+/// Continuation of the name index of a field that is added to the dynamic
 /// table.
 pub const S_IDX6_CONT: StateId = StateId(8);
 
-/// The continuation of the name index of a field that is not.
+/// Continuation of the name index of a field that is not.
 pub const S_IDX4_CONT: StateId = StateId(9);
 
-/// The continuation of a dynamic table size update.
+/// Continuation of a dynamic table size update.
 pub const S_STG_CONT: StateId = StateId(10);
 
-/// The continuation of the length of a field name.
+/// Continuation of the length of a field name.
 pub const S_KEY_LEN_CONT: StateId = StateId(11);
 
-/// The continuation of the length of a Huffman coded field name.
+/// Continuation of the length of a Huffman coded field name.
 pub const S_KEY_LEN_CONT_HUFF: StateId = StateId(12);
 
-/// The continuation of the length of a field value.
+/// Continuation of the length of a field value.
 pub const S_VAL_LEN_CONT: StateId = StateId(13);
 
-/// The continuation of the length of a Huffman coded field value.
+/// Continuation of the length of a Huffman coded field value.
 pub const S_VAL_LEN_CONT_HUFF: StateId = StateId(14);
 
-/// The number of state ids the ones above reserve.
+/// Number of reserved states (see definitions above).
 pub const S_RESERVED: u16 = 15;
 
-/// The string the action describes is Huffman coded.
+/// Boolean indicating that the string is Huffman-encoded.
 pub const F_HUFF: u8 = 1 << 0;
 
-/// The field the action describes is added to the dynamic table.
+/// Boolean indicating that the string should be cached in the
+/// dynamic table.
 pub const F_ADD_DT: u8 = 1 << 1;
 
-/// The integer the action describes is spread over several bytes, so the parser
-/// takes it from its accumulator rather than from [`Action::val`].
+/// Boolean indicating that the integer continues in the next
+/// byte.
 pub const F_CONT: u8 = 1 << 2;
 
-/// What the parser does upon taking a transition.
+/// The different kinds of [`Action`]s.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Kind {
-    /// A field spelled out by nothing but an index, which addresses the entry
-    /// both its name and its value are read from.
+    /// Indexed header field representation
     Indexed = 1,
 
-    /// A field whose name is an index and whose value is spelled out.
+    /// Literal header field -- indexed name.
     IdxName,
 
-    /// A field whose name is spelled out as well.
+    /// Literal header field -- new name.
     LitName,
 
     /// The length of a field name.
@@ -106,9 +98,8 @@ pub enum Kind {
     Err,
 }
 
-/// A single action of the automaton, as the BPF parser reads it.
-///
-/// `val` is an index, a length or a table size, depending on `kind`.
+/// The DFA actions for [`http2::Parser`], wrapped for convenience
+/// in an struct for usage in [`Dfa`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Action {
     pub kind: Kind,
@@ -117,19 +108,20 @@ pub struct Action {
 }
 
 impl Action {
-    /// Returns the action of a transition of `kind` carrying `val`.
+    /// Returns the action of an edge of `kind` carrying `val`.
     pub const fn new(kind: Kind, val: u16, flags: u8) -> Action {
         Action { kind, val, flags }
     }
 
     /// Returns the action capturing the value of the field whose name the
-    /// automaton just matched, under the id `cid`.
+    /// DFA just matched, identified by the match id `mid`.
     pub const fn capture(mid: MatchId) -> Action {
         Action::new(Kind::Capture, mid.0 as u16, 0)
     }
 }
 
 impl From<Action> for http2_action {
+    /// Converts the Rust-based [`Action`] into the eBPF-based `http2_action`.
     fn from(value: Action) -> Self {
         http2_action {
             val: value.val,

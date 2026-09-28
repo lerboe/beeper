@@ -1,9 +1,8 @@
 use crate::{Dfa, dfa::Input, http2::action::*};
 use std::collections::HashMap;
 
-/// Builds the transitions of every field representation of RFC 7541 into
-/// `dfa`, which has to have been created with [`S_RESERVED`] states reserved
-/// for them.
+/// Builds the states and edges of every field representation of
+/// [RFC 7541](https://datatracker.ietf.org/doc/html/rfc754) into `dfa`.
 pub fn dfa() -> Dfa<Action> {
     let mut dfa = Dfa::with_reserved_states(S_RESERVED);
     insert_field_row(&mut dfa);
@@ -12,8 +11,8 @@ pub fn dfa() -> Dfa<Action> {
     dfa
 }
 
-/// Inserts the transitions of the first byte of a representation, see section 6
-/// of RFC 7541.
+/// Inserts the edges of the first byte of a representation (see
+/// [Section 6 of RFC 7541](https://datatracker.ietf.org/doc/html/rfc7541#section-6)).
 fn insert_field_row(dfa: &mut Dfa<Action>) {
     let mut edge =
         |input: u8, to, action| dfa.insert_edge(S_FIELD, Input::from(input), to, Some(action));
@@ -67,9 +66,9 @@ fn insert_field_row(dfa: &mut Dfa<Action>) {
     }
 }
 
-/// Inserts the transitions of the byte announcing the length of a name and of
-/// the one announcing the length of a value, see section 5.2 of RFC 7541. Both
-/// carry the Huffman bit in their top bit and a 7 bit prefix.
+/// Inserts the edges of the byte announcing the length of a name and of
+/// the one announcing the length of a value (see
+/// [Section 5.2 of RFC 7541](https://datatracker.ietf.org/doc/html/rfc7541#section-5.2)).
 fn insert_length_rows(dfa: &mut Dfa<Action>) {
     let rows = [
         (
@@ -101,9 +100,9 @@ fn insert_length_rows(dfa: &mut Dfa<Action>) {
     }
 }
 
-/// Inserts the transitions of the bytes an integer that did not fit into the
-/// prefix of its first byte is spread over, see section 5.1 of RFC 7541. The
-/// top bit of every one of them says whether another follows.
+/// Inserts the edges of the bytes for variable-length integers that did
+/// not fit into the prefix iof its first byte
+/// (see [Section 5.1 of RFC 7541](https://datatracker.ietf.org/doc/html/rfc7541#section-5.1)).
 fn insert_continuation_rows(dfa: &mut Dfa<Action>) {
     let rows = [
         (S_IDX7_CONT, Kind::Indexed, S_FIELD, 0),
@@ -131,8 +130,8 @@ fn insert_continuation_rows(dfa: &mut Dfa<Action>) {
 /// value or not.
 ///
 /// The first map goes from a field name to its index, the second from a field
-/// name to the index of each of the values that are predefined for it. See
-/// appendix A of RFC 7541.
+/// name to the index of each of the values that are predefined for it (see
+/// [appendix A of RFC 7541](https://datatracker.ietf.org/doc/html/rfc7541#appendix-A)).
 pub fn create_header_maps() -> (
     HashMap<String, usize>,
     HashMap<String, HashMap<String, usize>>,
