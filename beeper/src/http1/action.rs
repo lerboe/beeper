@@ -1,37 +1,38 @@
-//! What the HTTP/1.x parser does upon taking a transition.
+//! The DFA actions for [`http1::parser`].
+//!
+//! The actions reside on the edge of the DFA and are executed by the eBPF
+//! runtime when it consumes the input associated with that edge.
 //!
 //! The kinds and flags below must stay in sync with the `HTTP1A_*` and `HTTP1F_*`
 //! constants of http1/parser.bpf.c.
 
 use crate::{MatchId, http1::parser::types::http1_action};
 
-/// The parser does nothing.
+/// No-op action. The default.
 const HTTP1A_NONE: u8 = 0;
 
-/// A capture starts at the byte behind the transition.
+/// Start capturing with the next byte.
 const HTTP1A_START_CAPTURE: u8 = 1;
 
-/// The open capture ends at the byte the transition read.
+/// End capturing with the next byte.
 const HTTP1A_END_CAPTURE: u8 = 2;
 
-/// Parsing is complete, the rest of the message is not a header anymore.
+/// Terminate parsing and skipping the remainder of the message.
 const HTTP1F_DONE: u8 = 1 << 0;
 
-/// The action a transition of the HTTP/1.x parser carries.
-///
-/// A transition either opens or closes a capture, and may on top of that end
-/// the parse.
+/// The DFA actions for [`http1::parser`], wrapped for convenience
+/// in an enum for usage in [`Dfa`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Action {
-    /// Starts capturing a range, which begins at the byte behind the
-    /// transition and is identified by the capture id.
+    /// Starts capturing a range starting from the next byte. The
+    /// resulting range is identified by the [`MatchId`].
     StartCapture(MatchId),
 
-    /// Ends the capture the first id names at the byte the transition read, and
-    /// reports the range it covers under the match id the second one names.
+    /// Ends capturing a range ending with the next byte. The
+    /// resulting range is identified by the [`MatchId`].
     EndCapture(MatchId),
 
-    /// Terminates parsing.
+    /// Terminates parsing and skips the remainder of the message.
     Done,
 
     /// Ends capturing a range and terminates parsing.

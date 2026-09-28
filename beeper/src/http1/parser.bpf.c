@@ -3,75 +3,58 @@
 #include "xbpf.h"
 #include <bpf/bpf_helpers.h>
 
-// The parser for HTTP/1.x messages. It walks a message byte by byte, following
-// the transitions user space injected into `s2ts`, and runs the action every
-// one of them carries.
-
-// The state a message is parsed from.
+// The source state the DFA initiates parsing with.
 const u16 s_init = 0;
 
-// The state input that matches no pattern leads back to.
+// The fallback state, to which all edges lead to if no input matched.
 const u16 s_any = 1;
 
-// What the parser does upon taking a transition. Must stay in sync with the
-// action kinds of http1/action.rs.
-
-// Nothing.
+// No-op action.
 #define HTTP1A_NONE 0
 
-// A capture starts at the byte behind the transition: `cid` names the one whose
-// start index is to be written down.
+/// Start capturing with the next byte.
 #define HTTP1A_START_CAPTURE 1
 
-// The open capture ends at the byte the transition read: `cid` names the one
-// whose start index is to be read back, `mid` the match its range is reported
-// under.
+/// End capturing with the next byte.
 #define HTTP1A_END_CAPTURE 2
 
-// Parsing is complete, the rest of the message is not a header anymore.
+/// Terminate parsing and skipping the remainder of the message.
 #define HTTP1F_DONE (1 << 0)
 
 // A single action of the DFA.
-//
-// Actions are kept in a table of their own so that a transition only has to
-// name the index of the one it carries, which leaves room for saying more than
-// the 16 bits of a transition would hold.
 struct http1_action {
     u8 kind;
     u8 flags;
     u8 mid;
 };
 
-// these restrictions are needed to make the verifier happy. `MAX_STATES` and
+// Restrictions are needed to make the verifier happy. `MAX_STATES` and
 // `MAX_ACTIONS` are masked onto an index, so both have to be powers of two.
 #define MAX_STATES 512
 #define MAX_ACTIONS 256
-#define MAX_TRANS 257
-#define ANY_TRANS 256
+#define MAX_EDGES 257
+#define ANY_EDGE 256
 
-// The transition table of the DFA, indexed by state and input byte, and the
-// actions its transitions carry. User space fills both in before the program is
-// loaded, after which they are read-only.
-volatile const struct trans s2ts[MAX_STATES][MAX_TRANS];
+// The edges of the DFA, indexed by state and input byte, along with their
+// actions. User space fills both in before the program is loaded, after
+// which they are read-only.
+volatile const struct trans s2ts[MAX_STATES][MAX_EDGES];
 volatile const struct http1_action a2as[MAX_ACTIONS];
 
-// Reads the action a transition carries. Transition 0 is the one a state
-// without a transition for the byte it read falls back to, and carries none.
+// Reads the action an edge carries. Edge 0 leads to the fallback state.
 static __always_inline struct http1_action _action(u16 id) {
     return a2as[id & (MAX_ACTIONS - 1)];
 }
 
-// Follows the transition `input` takes out of `state`. A state that has no
-// transition for `input` falls back to the one matching any byte, and if it has
-// none either, back to `s_any`.
+// Follows the edge `input` takes out of `state`. A state that has no
+// edge for `input` falls back to the one matching any byte, and if it has
+// none either, back to the fallback state.
 static __always_inline void _next(u16 state, u8 input, u16 *next_state, u16 *action) {
     state &= MAX_STATES - 1;
 
-    // `input` is a byte and the row holds a column for every one of them, so it
-    // needs no bound of its own
     struct trans t = s2ts[state][input];
     if (t.state == 0 && t.action == 0) {
-        t = s2ts[state][ANY_TRANS];
+        t = s2ts[state][ANY_EDGE];
         if (t.state == 0 && t.action == 0) {
             *next_state = s_any;
             *action = 0;
@@ -88,7 +71,7 @@ static __always_inline void _next(u16 state, u8 input, u16 *next_state, u16 *act
 // open capture, `s` the state the walk ended in, so that a caller can resume
 // where it stopped.
 //
-// `null_prefix` is the length of the run of NUL bytes at the beginning of the
+// `null_prefix` is the length of the run of NULL bytes at the beginning of the
 // buffer that is to be skipped rather than parsed; it is updated as those bytes
 // are consumed. It may be NULL if the data cannot carry such a prefix.
 //
@@ -196,7 +179,6 @@ int parse_skb(struct __sk_buff *skb, u32 off, struct http_parse_res *pres __arg_
     u16 s = s_init;
     int res = _parse_from(data, data_end, off, pres->ms, cidx, &s, null_prefix);
 
-    // `_parse_from` counts from the start of the sk_buff
     return res > 0 ? res - (int)off : res + (int)off;
 }
 

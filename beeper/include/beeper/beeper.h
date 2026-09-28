@@ -3,12 +3,6 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_endian.h>
 
-// The protocol agnostic core of the interface between a BPF program and the
-// parsers beeper attaches to it: the verifier bounds every parser is built
-// with and the types that carry no protocol of their own. What every HTTP
-// parser shares lives in `beeper/http.h`, what a single version adds in
-// `beeper/http1.h` and `beeper/http2.h`.
-
 #ifndef __BEEPER_H__
 #define __BEEPER_H__
 
