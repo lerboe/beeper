@@ -63,44 +63,54 @@ impl Parser {
     }
 
     /// Specifies the name of the stub function defined with `BEEPER_HTTP1_PARSE_*`
-    /// in the target program. When calling [`attach`], Beeper will insert its logic
+    /// in the target program. When calling [`attach`](Parser::attach), Beeper will insert its logic
     /// into the given template using the
     /// [BPF_PROG_TYPE_EXT](https://docs.ebpf.io/linux/program-type/BPF_PROG_TYPE_EXT/)
     /// program type.
     ///
-    /// # Arguments
+    /// # Examples
     ///
-    /// * `parse_fn` - The name of the function to replace in the target program
-    /// * `msg_buf` - The type of buffer to parse
+    /// ```
+    /// use beeper::{MessageBuffer, http1};
+    ///
+    /// let parser = http1::Parser::new().parse_fn("parse_http1", MessageBuffer::Msg);
+    /// ```
     pub fn parse_fn<S: ToString>(mut self, parse_fn: S, msg_buf: MessageBuffer) -> Parser {
         self.parse_fns.insert(msg_buf, parse_fn.to_string());
         self
     }
 
     /// Specifies the name of the stub function defined with `BEEPER_MATCHED`
-    /// in the target program. When calling [`attach`], Beeper will insert its logic
+    /// in the target program. When calling [`attach`](Parser::attach), Beeper will insert its logic
     /// into the given template using the
     /// [BPF_PROG_TYPE_EXT](https://docs.ebpf.io/linux/program-type/BPF_PROG_TYPE_EXT/)
     /// program type.
     ///
-    /// # Arguments
+    /// # Examples
     ///
-    /// * `matched_fn` - The name of the function to replace in the target program
+    /// ```
+    /// use beeper::http1;
+    ///
+    /// let parser = http1::Parser::new().matched_fn("http1_matched");
+    /// ```
     pub fn matched_fn<S: ToString>(mut self, matched_fn: S) -> Parser {
         self.matched_fn = Some(matched_fn.to_string());
         self
     }
 
     /// Specifies the name of the stub function defined with `BEEPER_EXTRACT_MATCH_*`
-    /// in the target program. When calling [`attach`], Beeper will insert its logic
+    /// in the target program. When calling [`attach`](Parser::attach), Beeper will insert its logic
     /// into the given template using the
     /// [BPF_PROG_TYPE_EXT](https://docs.ebpf.io/linux/program-type/BPF_PROG_TYPE_EXT/)
     /// program type.
     ///
-    /// # Arguments
+    /// # Examples
     ///
-    /// * `parse_fn` - The name of the function to replace in the target program
-    /// * `msg_buf` - The type of buffer to parse
+    /// ```
+    /// use beeper::{MessageBuffer, http1};
+    ///
+    /// let parser = http1::Parser::new().extract_fn("extract_http1_match", MessageBuffer::Msg);
+    /// ```
     pub fn extract_fn<S: ToString>(mut self, extract_fn: S, msg_buf: MessageBuffer) -> Parser {
         self.extract_fns.insert(msg_buf, extract_fn.to_string());
         self
@@ -127,22 +137,25 @@ impl Parser {
     /// The field is matched case insensitively and its value is captured up to
     /// the end of the line, without the optional whitespace that may follow the
     /// colon. This function also accepts pseudo header fields (see
-    /// [`PseudoHeaderName`]).
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - The header name whose value to capture, matched case
-    ///   insensitively. A [`PseudoHeader`] names a field of the request or
-    ///   status line.
+    /// [`PseudoHeaderName`](crate::PseudoHeaderName)).
     ///
     /// # Errors
     ///
     /// Returns an error if the parser already captures the maximum number of
     /// fields.
     ///
-    /// # Returns
+    /// # Examples
     ///
-    /// The match ID that can be used in eBPF to extract the captured value.
+    /// ```
+    /// # fn main() -> Result<(), beeper::Error> {
+    /// use beeper::{http1, pseudo_header::PATH};
+    /// use http::header::USER_AGENT;
+    ///
+    /// let mut parser = http1::Parser::new();
+    /// let path = parser.capture_hdr(&PATH)?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn capture_hdr<H: AsRef<str>>(&mut self, name: H) -> Result<MatchId, Error> {
         let name = name.as_ref().to_lowercase();
         if let Some(&mid) = self.captures.get(&name) {
@@ -203,9 +216,17 @@ impl Parser {
     /// Returns an error if the parser already captures the maximum number of
     /// fields.
     ///
-    /// # Returns
+    /// # Examples
     ///
-    /// The match ID that can be used in eBPF to extract the captured value.
+    /// ```
+    /// # fn main() -> Result<(), beeper::Error> {
+    /// use beeper::http1;
+    ///
+    /// let mut parser = http1::Parser::new();
+    /// let preface = parser.match_http2_preface()?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn match_http2_preface(&mut self) -> Result<MatchId, Error> {
         let mid = self.new_match()?;
         self.dfa
@@ -231,10 +252,6 @@ impl Parser {
     ///
     /// Returns an error if the parser already captures the maximum number of
     /// fields.
-    ///
-    /// # Returns
-    ///
-    /// The match ID that can be used in eBPF to extract the captured value.
     fn capture_status_line(&mut self, name: &str) -> Result<MatchId, Error> {
         let methods = [
             "POST", "GET", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE",
@@ -280,10 +297,6 @@ impl Parser {
     ///
     /// Returns an error if the parser already captures the maximum number of
     /// fields.
-    ///
-    /// # Returns
-    ///
-    /// The match ID that can be used in eBPF to extract the captured value.
     fn capture_status_code(&mut self) -> Result<MatchId, Error> {
         let mid = self.new_match()?;
         self.dfa
@@ -320,15 +333,29 @@ impl Parser {
     /// target program, the remaining parser programs are left
     /// unloaded.
     ///
-    /// # Arguments
-    ///
-    /// * `target` - The file descriptor of the target program to attach to
-    ///
     /// # Errors
     ///
     /// Returns an error if the parser cannot be loaded, or if one of the
     /// functions it should replace does not exist in the target program with a
     /// matching signature.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), beeper::Error> {
+    /// # let prog_fd = 0;
+    /// use beeper::{MessageBuffer, http1, pseudo_header::PATH};
+    ///
+    /// let mut parser = http1::Parser::new();
+    /// let path = parser.capture_hdr(&PATH)?;
+    ///
+    /// let parser = parser
+    ///     .parse_fn("parse_http1", MessageBuffer::Msg)
+    ///     .extract_fn("extract_http1_match", MessageBuffer::Msg)
+    ///     .attach(prog_fd)?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn attach(self, target: i32) -> Result<AttachedParser, Error> {
         let parser = self.done_on_hdr_end();
 

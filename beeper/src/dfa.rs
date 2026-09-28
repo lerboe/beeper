@@ -206,7 +206,7 @@ impl<A: Copy + Debug + PartialEq + Eq> DfaBuilder<'_, A> {
         self.push_inner(input.as_bytes(), false)
     }
 
-    pub fn push_inner(&mut self, input: &[u8], case_sensitive: bool) -> &mut Self {
+    fn push_inner(&mut self, input: &[u8], case_sensitive: bool) -> &mut Self {
         for b in input {
             self.push_edge(Input::from(*b), None, case_sensitive);
         }
@@ -266,7 +266,7 @@ impl<A: Copy + Debug + PartialEq + Eq> DfaBuilder<'_, A> {
         self.push_options_inner(inputs, false)
     }
 
-    pub fn push_options_inner(&mut self, inputs: &[&str], case_sensitive: bool) -> &mut Self {
+    fn push_options_inner(&mut self, inputs: &[&str], case_sensitive: bool) -> &mut Self {
         let Some(longest) = inputs.iter().copied().max_by_key(|input| input.len()) else {
             return self;
         };

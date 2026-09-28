@@ -67,11 +67,6 @@ impl Parser {
 
     /// Specifies the function template in the target program to be replaced with an HTTP/1.1
     /// parser. The function will not be replaced until `attach` is called.
-    ///
-    /// # Arguments
-    ///
-    /// * `parse_fn` - The name of the function to replace in the target program
-    /// * `msg_buf` - The type of buffer to parse
     pub fn parse_fn<S: ToString>(mut self, parse_fn: S, msg_buf: MessageBuffer) -> Parser {
         self.parse_fns.insert(msg_buf, parse_fn.to_string());
         self
@@ -79,10 +74,6 @@ impl Parser {
 
     /// Specifies the function template in the target program to be called when a pattern match
     /// is completed. The function will not be replaced until `attach` is called.
-    ///
-    /// # Arguments
-    ///
-    /// * `matched_fn` - The name of the matched callback function in the target program
     pub fn matched_fn<S: ToString>(mut self, matched_fn: S) -> Parser {
         self.matched_fn = Some(matched_fn.to_string());
         self
@@ -90,11 +81,6 @@ impl Parser {
 
     /// Specifies the function template in the target program to be called when extracting
     /// matched content. The function will not be replaced until `attach` is called.
-    ///
-    /// # Arguments
-    ///
-    /// * `extract_fn` - The name of the extract callback function in the target program
-    /// * `msg_buf` - The type of buffer to extract the match from
     pub fn extract_fn<S: ToString>(mut self, extract_fn: S, msg_buf: MessageBuffer) -> Parser {
         self.extract_fns.insert(msg_buf, extract_fn.to_string());
         self
@@ -124,22 +110,10 @@ impl Parser {
     /// colon. [`METHOD`], [`PATH`] and [`STATUS`] are not header fields in
     /// HTTP/1.x and are captured from the request or status line instead.
     ///
-    /// # Arguments
-    ///
-    /// * `name` - The header name whose value to capture, matched case
-    ///   insensitively. A [`PseudoHeader`] names a field of the request or
-    ///   status line.
-    ///
     /// # Errors
     ///
     /// Returns an error if the parser already captures as many fields as the
     /// parser program has room for.
-    ///
-    /// # Returns
-    ///
-    /// The match ID that can be used in eBPF to extract the captured value. A
-    /// header that is already captured keeps the ID it was given the first
-    /// time, rather than being captured a second time under a new one.
     pub fn capture_hdr<H: AsRef<str>>(&mut self, name: H) -> Result<MatchId, Error> {
         let name = name.as_ref().to_lowercase();
         if let Some(&mid) = self.captures.get(&name) {
@@ -212,10 +186,6 @@ impl Parser {
     /// target program, the remaining parser programs are left
     /// unloaded. The parser always stops at the end of the header block, no
     /// matter which patterns were configured.
-    ///
-    /// # Arguments
-    ///
-    /// * `target` - The file descriptor of the target program to attach to
     ///
     /// # Errors
     ///

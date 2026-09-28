@@ -10,6 +10,22 @@ use std::{ffi::OsString, path::Path};
 ///
 /// Pass them to the skeleton builder that compiles the BPF programs of the
 /// calling crate.
+///
+/// # Examples
+///
+/// ```no_run
+/// // build.rs
+/// use beeper::build::clang_args;
+/// use xbpf::build::Builder;
+///
+/// fn main() {
+///     Builder::new()
+///         .clang_arg(clang_args().iter())
+///         .tracing_ring_buf_size(16384)
+///         .export_headers()
+///         .build();
+/// }
+/// ```
 pub fn clang_args() -> Vec<OsString> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("include");
     println!("cargo:rerun-if-changed={}", path.display());
