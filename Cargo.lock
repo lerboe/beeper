@@ -177,7 +177,7 @@ checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "beeper"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "as-bytes",
  "bytes",
@@ -2315,9 +2315,9 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xbpf"
-version = "0.0.5"
+version = "0.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd930496123a14c5a525a25c50d55603cbf6bec0ac7269d078711d8f0e3dab48"
+checksum = "d5adc088d36be1ab4b8ecef5dd6caa25449d7429f0f9582c4dca06f31de9be0d"
 dependencies = [
  "glob",
  "libbpf-cargo",
