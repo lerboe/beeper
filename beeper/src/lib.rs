@@ -167,7 +167,7 @@ pub mod pseudo_header {
     pub const STATUS: PseudoHeaderName = PseudoHeaderName(":status");
     /// The authority of a request, e.g. `example.com`.
     pub const AUTHORITY: PseudoHeaderName = PseudoHeaderName(":authority");
-    /// The scheme of a request, e.g. `example.com`.
+    /// The scheme of a request, e.g. `https`.
     pub const SCHEME: PseudoHeaderName = PseudoHeaderName(":scheme");
 }
 
