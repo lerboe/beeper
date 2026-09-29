@@ -13,8 +13,8 @@ use std::net::SocketAddr;
 use tracing::{Level, debug, warn};
 pub(super) use types::ip4_addr;
 use types::*;
-use xbpf::libbpf::{
-    self as libbpf_rs, ErrorKind, Link, MapCore, MapFlags, MapHandle, OpenObject,
+use xbpf::libbpf_rs::{
+    ErrorKind, Link, MapCore, MapFlags, MapHandle, OpenObject,
     skel::{OpenSkel, Skel, SkelBuilder},
 };
 

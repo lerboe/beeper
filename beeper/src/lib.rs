@@ -32,7 +32,7 @@
 pub(crate) use dfa::Dfa;
 use httlib_huffman::EncoderError;
 use std::fmt::Display;
-use xbpf::libbpf;
+use xbpf::libbpf_rs;
 
 mod dfa;
 
@@ -68,7 +68,7 @@ pub enum Error {
 
     /// The parser program could not be loaded into the kernel, or not attached
     /// to the program it should replace a function of.
-    Bpf(libbpf::Error),
+    Bpf(libbpf_rs::Error),
 
     /// An entry read back from one of the parser's maps is not laid out the
     /// way the parser program writes it.
@@ -93,8 +93,8 @@ impl From<EncoderError> for Error {
     }
 }
 
-impl From<libbpf::Error> for Error {
-    fn from(err: libbpf::Error) -> Error {
+impl From<libbpf_rs::Error> for Error {
+    fn from(err: libbpf_rs::Error) -> Error {
         Error::Bpf(err)
     }
 }

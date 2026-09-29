@@ -9,8 +9,8 @@ use http::HeaderName;
 use std::{collections::HashMap, mem::MaybeUninit};
 use tracing::{Level, debug, trace, warn};
 use types::*;
-use xbpf::libbpf::{
-    self as libbpf_rs, Link, MapCore, OpenObject,
+use xbpf::libbpf_rs::{
+    Link, MapCore, OpenObject,
     skel::{OpenSkel, Skel, SkelBuilder},
 };
 
