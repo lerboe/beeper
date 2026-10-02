@@ -2,8 +2,9 @@
 //! server, and of the responses the server sends back. See `ci/h2spec.sh`,
 //! which drives it.
 //!
-//! It launches the server on the address it is given, `127.0.0.1:8080` by
-//! default, prints `listening on <addr>` and then reads commands from stdin:
+//! It launches a server on the address it is given, `127.0.0.1:8080` by
+//! default, that answers a request with its own regular fields and a body, as
+//! h2spec expects one. It then prints `listening on <addr>` and then reads commands from stdin:
 //!
 //! * `case <id>` configures the parser for the h2spec case `<id>`, i.e. to
 //!   capture every field the case sends, and prints `ready <id>` once it is
@@ -19,6 +20,7 @@
 //! timing.
 
 use anyhow::{Context, Result, anyhow, bail};
+use axum::{Router, http::HeaderMap, routing::get};
 use beeper::{MessageBuffer, http1, http2};
 use cases::{Case, DUMMY_LEN, Value};
 use httlib_huffman as huffman;
@@ -30,13 +32,24 @@ use std::{
     sync::mpsc::{Receiver, RecvTimeoutError},
     time::{Duration, Instant},
 };
-use utils::{
-    server,
-    test::{Capture, Direction, Frame, ParseResult, RESULT_VAL_LEN, TestProgram},
-};
+use utils::test::{Capture, Direction, Frame, ParseResult, RESULT_VAL_LEN, TestProgram};
 use xbpf::OpenObject;
 
 mod cases;
+
+/// The body the server answers with.
+const BODY: &str = "h2spec";
+
+/// Launches the server h2spec is run against on `addr`, and returns the address
+/// it is bound to.
+async fn launch(addr: SocketAddr) -> Result<SocketAddr> {
+    let app = Router::new().route("/", get(|headers: HeaderMap| async { (headers, BODY) }));
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move { axum::serve(listener, app).await });
+
+    Ok(addr)
+}
 
 /// How long `check` waits for the connections of a case to be closed.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -239,7 +252,7 @@ fn expected_fields(block: &[(&'static str, Value)], authority: &str) -> Fields {
 }
 
 /// The fields the server answers the request `block` with, or `None` if it does
-/// not answer it, see `utils::server`.
+/// not answer it, see [`launch`].
 fn response_fields(block: &[(&'static str, Value)], authority: &str) -> Option<Fields> {
     let method = block
         .iter()
@@ -254,6 +267,7 @@ fn response_fields(block: &[(&'static str, Value)], authority: &str) -> Option<F
     if method == "GET" || method == "HEAD" {
         fields.insert(":status", value("200"));
         fields.insert("content-type", value("text/plain; charset=utf-8"));
+        fields.insert("content-length", value(&BODY.len().to_string()));
 
         // the server echoes the regular fields of the request
         for (name, val) in block.iter().filter(|(name, _)| !name.starts_with(':')) {
@@ -262,8 +276,8 @@ fn response_fields(block: &[(&'static str, Value)], authority: &str) -> Option<F
     } else {
         fields.insert(":status", value("405"));
         fields.insert("allow", value("GET,HEAD"));
+        fields.insert("content-length", value("0"));
     }
-    fields.insert("content-length", value("0"));
 
     Some(fields)
 }
@@ -337,6 +351,9 @@ struct Results {
 
     /// The header frames parsed since the last call to `take_frames`.
     frames: Vec<Frame>,
+
+    /// Whether the mark `sync` waits for has been handled.
+    marked: bool,
 }
 
 impl Results {
@@ -355,7 +372,35 @@ impl Results {
                 self.open.remove(&(client_port, server));
             }
             ParseResult::Frame(frame) => self.frames.push(frame),
+            ParseResult::Mark => self.marked = true,
         }
+    }
+
+    /// Waits until everything the program reported before this call has been
+    /// handled.
+    fn sync(&mut self, prog: &TestProgram, deadline: Instant) -> Result<()> {
+        self.marked = false;
+        prog.mark_results()?;
+        while !self.marked {
+            self.recv(deadline)?;
+        }
+
+        Ok(())
+    }
+
+    /// Handles the next report, waiting for it until `deadline`.
+    fn recv(&mut self, deadline: Instant) -> Result<()> {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match self.rx.recv_timeout(left) {
+            Ok(res) => self.handle(res),
+            Err(RecvTimeoutError::Timeout) => bail!(
+                "connections still open after {CLOSE_TIMEOUT:?}: {:?}",
+                self.open
+            ),
+            Err(e) => bail!("results: {e}"),
+        }
+
+        Ok(())
     }
 
     /// Handles what has been reported so far.
@@ -371,19 +416,14 @@ impl Results {
 
     /// Waits until every connection that was opened has been closed again, i.e.
     /// until all of their frames have been reported.
-    fn wait_closed(&mut self) -> Result<()> {
+    ///
+    /// The reports of a connection that has been opened may still be on their
+    /// way, so it first waits for everything reported so far.
+    fn wait_closed(&mut self, prog: &TestProgram) -> Result<()> {
         let deadline = Instant::now() + CLOSE_TIMEOUT;
-        self.drain()?;
+        self.sync(prog, deadline)?;
         while !self.open.is_empty() {
-            let left = deadline.saturating_duration_since(Instant::now());
-            match self.rx.recv_timeout(left) {
-                Ok(res) => self.handle(res),
-                Err(RecvTimeoutError::Timeout) => bail!(
-                    "connections still open after {CLOSE_TIMEOUT:?}: {:?}",
-                    self.open
-                ),
-                Err(e) => bail!("results: {e}"),
-            }
+            self.recv(deadline)?;
         }
 
         self.drain()
@@ -476,7 +516,7 @@ fn main() -> Result<()> {
         .context("parse address")?;
 
     let rt = tokio::runtime::Runtime::new()?;
-    let addr = rt.block_on(server::launch_on(addr))?;
+    let addr = rt.block_on(launch(addr))?;
     let authority = addr.to_string();
 
     let mut open_obj = OpenObject::new();
@@ -485,6 +525,7 @@ fn main() -> Result<()> {
         rx: prog.results()?,
         open: BTreeSet::new(),
         frames: Vec::new(),
+        marked: false,
     };
 
     // the HTTP/1.1 parser only tells the connections that start with the
@@ -522,7 +563,8 @@ fn main() -> Result<()> {
                 drop(current.take());
                 let parser = CaseParser::attach(&prog, case)?;
 
-                results.drain()?;
+                // what is left of the case before does not count
+                results.sync(&prog, Instant::now() + CLOSE_TIMEOUT)?;
                 results.take_frames();
                 current = Some((case, parser));
 
@@ -533,7 +575,7 @@ fn main() -> Result<()> {
                     .as_ref()
                     .ok_or_else(|| anyhow!("check before case: {id}"))?;
 
-                let (problems, summary) = match results.wait_closed() {
+                let (problems, summary) = match results.wait_closed(&prog) {
                     Ok(()) => check(parser, case, &results.take_frames(), &authority),
                     Err(e) => (vec![e.to_string()], String::new()),
                 };

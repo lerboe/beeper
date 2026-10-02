@@ -98,6 +98,8 @@ enum result_kind {
     RESULT_CLOSE = 1,
     // an HTTP/2 HEADERS or CONTINUATION frame was parsed, or a frame failed to
     RESULT_FRAME = 2,
+    // user space asked for a mark, see `mark_results`
+    RESULT_MARK = 3,
 };
 
 // An entry of `results`.
@@ -537,6 +539,15 @@ int monitor_sockets(struct bpf_sock_ops *ops) {
     }
 
     return SK_PASS;
+}
+
+// Writes a mark to `results`, which a reader that receives it knows to have
+// received everything written before it.
+SEC("syscall")
+int mark_results() {
+    struct ip4_conn none = { 0 };
+    emit_conn(RESULT_MARK, &none, false);
+    return 0;
 }
 
 // Returns the number of connections that were upgraded to HTTP/2.

@@ -29,17 +29,12 @@ async fn echo(headers: HeaderMap, body: Bytes) -> Result<impl IntoResponse, Stat
 
 /// Launches an echo server on localhost and returns the address it is bound to.
 pub async fn launch() -> Result<SocketAddr> {
-    launch_on("127.0.0.1:0".parse()?).await
-}
-
-/// Launches an echo server on `addr` and returns the address it is bound to,
-/// which differs from `addr` only if its port is 0.
-pub async fn launch_on(addr: SocketAddr) -> Result<SocketAddr> {
     let echo = get(move |hdrs: HeaderMap, body: Bytes| echo(hdrs, body));
     let app = Router::new()
         .route("/", echo.clone())
         .route("/{*path}", echo.clone());
 
+    let addr: SocketAddr = "127.0.0.1:0".parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;
     tokio::spawn(async move {

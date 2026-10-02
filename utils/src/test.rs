@@ -254,6 +254,20 @@ impl<'obj> TestProgram<'obj> {
         Ok(rx)
     }
 
+    /// Makes [`TestProgram::results`] report a [`ParseResult::Mark`], after
+    /// everything that was reported before this call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the program that writes it cannot be run.
+    pub fn mark_results(&self) -> Result<()> {
+        self.skel
+            .progs
+            .mark_results
+            .test_run(ProgramInput::default())?;
+        Ok(())
+    }
+
     /// Returns the file descriptor of the program a parser attaches to.
     pub fn prog_fd(&self) -> i32 {
         match self.hook {
@@ -328,6 +342,9 @@ pub enum ParseResult {
 
     /// A header frame was parsed.
     Frame(Frame),
+
+    /// What [`TestProgram::mark_results`] asked for.
+    Mark,
 }
 
 impl ParseResult {
@@ -351,6 +368,7 @@ impl ParseResult {
                 client_port,
                 server,
             }),
+            3 => Some(ParseResult::Mark),
             2 => {
                 // only the values `captured` names were written
                 let captures = (0..MAX_MATCHES)
