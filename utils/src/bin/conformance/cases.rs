@@ -6,7 +6,11 @@
 //! same blocks share an entry, and with it a configuration.
 
 /// The value of a header field as h2spec sends it.
+///
+/// The value a [`Value::Split`] or a [`Value::Stray`] holds is not checked, it
+/// only says what was sent.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub enum Value {
     Str(&'static str),
 
@@ -20,6 +24,16 @@ pub enum Value {
     /// Bytes that are not a valid Huffman code, which the parser is expected
     /// to capture as they are.
     Raw(&'static [u8]),
+
+    /// A value that is split across a HEADERS and a CONTINUATION frame. The
+    /// parser points into the frame it parses, so it cannot point at a value
+    /// that is in two of them, and is expected to capture nothing.
+    Split(Box<Value>),
+
+    /// A value in a CONTINUATION frame that does not carry on the header
+    /// block of its stream, e.g. one that follows a block that has ended. The
+    /// peer is expected to reject it, and the parser to capture nothing of it.
+    Stray(Box<Value>),
 }
 
 use Value::*;
@@ -67,6 +81,17 @@ fn post(fields: Vec<Field>) -> Block {
 /// A block that carries nothing but `fields`.
 fn fields(fields: Vec<Field>) -> Block {
     Some(fields)
+}
+
+/// `block`, sent in a CONTINUATION frame that does not carry on a block, see
+/// [`Value::Stray`].
+fn stray(block: Block) -> Block {
+    block.map(|fields| {
+        fields
+            .into_iter()
+            .map(|(name, value)| (name, Stray(Box::new(value))))
+            .collect()
+    })
 }
 
 /// Returns every case h2spec runs.
@@ -134,12 +159,9 @@ pub fn cases() -> Vec<Case> {
                 "generic/3.3/5",
                 "generic/3.4/1",
                 "generic/3.9/2",
-                "generic/3.10/1",
-                "generic/3.10/2",
                 "generic/4/1",
                 "generic/5/14",
                 "generic/5/15",
-                "http2/5.1/4",
                 "http2/5.1/5",
                 "http2/5.1/8",
                 "http2/5.1/11",
@@ -226,14 +248,15 @@ pub fn cases() -> Vec<Case> {
             ids: &["http2/4.3/2", "http2/6.2/1"],
             blocks: vec![get(vec![("x-dummy0", Dummy)])],
         },
+        // the HEADERS frame of another stream comes between the HEADERS and
+        // the CONTINUATION frame of the first
         Case {
             ids: &["http2/4.3/3", "http2/6.2/2"],
-            blocks: vec![get(vec![("x-dummy0", Dummy)]), get(vec![])],
+            blocks: vec![get(vec![("x-dummy0", Stray(Box::new(Dummy)))]), get(vec![])],
         },
         Case {
             ids: &[
                 "http2/5.1/6",
-                "http2/5.1/7",
                 "http2/5.1/9",
                 "http2/5.1/12",
                 "http2/5.1.1/2",
@@ -247,12 +270,7 @@ pub fn cases() -> Vec<Case> {
             blocks: vec![get(vec![]), get(vec![])],
         },
         Case {
-            ids: &[
-                "http2/5.1/10",
-                "http2/5.1/13",
-                "http2/6.10/3",
-                "http2/6.10/4",
-            ],
+            ids: &["http2/6.10/3"],
             blocks: vec![get(vec![]), fields(vec![("x-dummy0", Dummy)])],
         },
         Case {
@@ -279,15 +297,40 @@ pub fn cases() -> Vec<Case> {
             ids: &["http2/6.10/5"],
             blocks: vec![
                 get(vec![("x-dummy0", Dummy)]),
-                fields(vec![("x-dummy0", Dummy)]),
+                stray(fields(vec![("x-dummy0", Dummy)])),
             ],
         },
         Case {
             ids: &["http2/6.10/6"],
             blocks: vec![
                 post(vec![("x-dummy0", Dummy)]),
-                fields(vec![("x-dummy0", Dummy)]),
+                stray(fields(vec![("x-dummy0", Dummy)])),
             ],
+        },
+        // the HEADERS frame is split after its 5th byte, in the middle of the
+        // value of :authority
+        Case {
+            ids: &["generic/3.10/1", "generic/3.10/2"],
+            blocks: vec![fields(vec![
+                (":method", Str("GET")),
+                (":scheme", Str("http")),
+                (":path", Str("/")),
+                (":authority", Split(Box::new(Authority))),
+            ])],
+        },
+        // a CONTINUATION frame on a stream that is idle
+        Case {
+            ids: &["http2/5.1/4"],
+            blocks: vec![stray(get(vec![]))],
+        },
+        // a CONTINUATION frame on a stream whose block has ended
+        Case {
+            ids: &["http2/5.1/7"],
+            blocks: vec![get(vec![]), stray(get(vec![]))],
+        },
+        Case {
+            ids: &["http2/5.1/10", "http2/5.1/13", "http2/6.10/4"],
+            blocks: vec![get(vec![]), stray(fields(vec![("x-dummy0", Dummy)]))],
         },
         Case {
             ids: &["http2/8.1/1"],

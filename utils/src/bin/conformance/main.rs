@@ -145,7 +145,7 @@ fn blocks(frames: &[Frame]) -> (Vec<ParsedBlock>, Vec<ParsedBlock>, Vec<String>)
 /// What a captured value is expected to be.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Expected {
-    /// Nothing, the parser reports no value for a field that is empty.
+    /// Nothing.
     Absent,
 
     /// This value, which may have been sent Huffman coded or not.
@@ -162,13 +162,10 @@ impl Expected {
             Value::Authority => authority.as_bytes().to_vec(),
             Value::Dummy => vec![b'x'; DUMMY_LEN],
             Value::Raw(raw) => return Expected::Raw(raw.to_vec()),
+            Value::Split(_) | Value::Stray(_) => return Expected::Absent,
         };
 
-        if value.is_empty() {
-            Expected::Absent
-        } else {
-            Expected::Value(value)
-        }
+        Expected::Value(value)
     }
 
     /// Whether `capture` is what is expected.
@@ -636,10 +633,21 @@ mod tests {
     }
 
     #[test]
-    fn expect_nothing_for_an_empty_value() {
+    fn expect_an_empty_value_to_be_captured() {
         let expected = Expected::new(&Value::Str(""), "");
-        assert!(expected.matches(None));
+        assert!(expected.matches(Some(&capture(b""))));
+        assert!(!expected.matches(None));
         assert!(!expected.matches(Some(&capture(b"x"))));
+    }
+
+    #[test]
+    fn expect_nothing_of_what_the_parser_cannot_point_at() {
+        for value in [
+            Value::Split(Box::new(Value::Authority)),
+            Value::Stray(Box::new(Value::Dummy)),
+        ] {
+            assert_eq!(Expected::new(&value, ""), Expected::Absent);
+        }
     }
 
     #[test]
