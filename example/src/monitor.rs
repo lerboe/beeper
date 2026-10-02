@@ -16,8 +16,8 @@ use std::{
         unix::fs::OpenOptionsExt,
     },
 };
-use xbpf::libbpf::{
-    self as libbpf_rs, Link, MapCore,
+use xbpf::libbpf_rs::{
+    Link, MapCore,
     skel::{OpenSkel, Skel, SkelBuilder},
 };
 

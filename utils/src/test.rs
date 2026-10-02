@@ -21,8 +21,8 @@ use std::{
 };
 use tracing::{Level, debug, info, warn};
 use types::*;
-use xbpf::libbpf::{
-    self as libbpf_rs, Link, MapCore, MapFlags, MapHandle, MapType, ProgramInput,
+use xbpf::libbpf_rs::{
+    Link, MapCore, MapFlags, MapHandle, MapType, ProgramInput,
     skel::{OpenSkel, Skel, SkelBuilder},
 };
 

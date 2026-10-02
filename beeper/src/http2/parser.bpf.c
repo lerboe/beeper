@@ -3,25 +3,14 @@
 #include "xbpf.h"
 #include <bpf/bpf_helpers.h>
 
-// The parser for HTTP/2 messages. It decodes the HPACK representation of a
-// header block far enough to find the field names and values, matches the names
-// against the DFA user space injected into `s2ts`, and mirrors the peer's
-// dynamic table so that fields which are only referenced by index can be
-// resolved as well.
-
 // The number of bytes of a name or a value that are kept in a table entry.
-// Longer fields are truncated, which bounds the copies for the verifier.
-// `http2_hdr_field`, which both tables are made of, is declared in beeper/http2.h so
-// that a target program reading dynamic table entries with
-// `BEEPER_HTTP2_GET_DT_ENTRY` agrees on its layout.
 #define HEADER_FIELD_MAXLEN BEEPER_HTTP2_FIELD_MAXLEN
 #define HEADER_FIELD_MASK (HEADER_FIELD_MAXLEN - 1)
 
-// The number of entries of the HPACK static table, see appendix A of RFC 7541.
+// The number of entries of the HPACK static table.
 #define STATIC_TABLE_SIZE 61
 
-// The index the entries of a dynamic table are stored under starts above the
-// last static one, so that a stored index names the table it belongs to.
+/// The index the first entry of a dynamic table is stored under.
 #define DYNAMIC_TABLE_BASE (STATIC_TABLE_SIZE + 1)
 
 // The identifier of the SETTINGS parameter announcing the size of the dynamic
@@ -36,9 +25,7 @@
 #define HTTP2_SETTINGS_FRAME 0x04
 #define HTTP2_CONTINUATION_FRAME 0x09
 
-// The flags of a HEADERS frame that move the header block within it, and the
-// one saying that the block ends with the frame rather than carrying on into a
-// CONTINUATION frame. See sections 6.2 and 6.10 of RFC 9113.
+// The flags of a HEADERS frame that move the header block within it.
 #define HTTP2_END_HEADERS_FLAG 0x04
 #define HTTP2_PADDED_FLAG 0x08
 #define HTTP2_PRIORITY_FLAG 0x20
@@ -64,7 +51,7 @@ struct dynamic_table_key {
 };
 
 // An entry of the dynamic table, along with the size it accounts for in the
-// table, which is computed from the decoded lengths of its name and value.
+// table.
 struct dynamic_table_entry {
     struct http2_hdr_field field;
     u32 size;
@@ -95,12 +82,6 @@ struct dynamic_table_info {
     u32 size;
     u32 max_size;
     u32 deleted;
-
-    // Whether the table has drifted from the peer's, which happens when a
-    // header block is split over frames in the middle of a field: the parser
-    // cannot address the half that is already gone, so the entry the peer adds
-    // is one it cannot mirror. A table that has drifted is neither added to nor
-    // resolved from, as its indices no longer mean what the peer means by them.
     u32 dirty;
 };
 
@@ -110,15 +91,6 @@ struct {
     __type(key, struct ip4_conn);
 	__type(value, struct dynamic_table_info);
 } dynamic_table_info SEC(".maps");
-
-// The states the shape of a header field representation is walked with. HPACK
-// spells a field out as a sequence of integers and strings, and which one comes
-// next is decided by the bytes read so far, so it is the DFA that keeps track
-// of it rather than the parser.
-//
-// User space fills the rows of `s2ts` these index, and hands out the ids from
-// `S_RESERVED` on to the states of the field name trie. They must stay in sync
-// with the state ids of http2/hpack.rs.
 
 // A field name that matched no pattern. It carries no transition of its own, so
 // the parser stays in it until the name it is reading ends.
@@ -134,10 +106,7 @@ struct {
 // The root of the trie of the field names to capture.
 #define S_NAME 6
 
-// The continuation of an integer that did not fit into the prefix of its first
-// byte. There is one state per representation, as what the integer means
-// differs, and one per Huffman bit for the lengths, as that bit is announced by
-// the first byte but is only recorded once the last one has been read.
+// The continuation of a variable-length integer that did not fit.
 #define S_IDX7_CONT 7
 #define S_IDX6_CONT 8
 #define S_IDX4_CONT 9
@@ -149,9 +118,6 @@ struct {
 
 // The number of state ids the ones above reserve.
 #define S_RESERVED 15
-
-// What the parser does upon taking a transition. Must stay in sync with the
-// action kinds of http2/hpack.rs.
 
 // Nothing.
 #define HTTP2A_NONE 0
@@ -202,12 +168,6 @@ struct {
 
 // A single action of the DFA. `val` is an index, a length or a table size,
 // depending on `kind`.
-//
-// Actions are kept in a table of their own because they do not fit into the 16
-// bits `struct trans` carries; the action of a transition is the index of its
-// entry. Keeping them on the transition rather than on the state it leads to is
-// what keeps the automaton small: every index a representation can carry is a
-// transition of its own, but all of them lead to the same handful of states.
 struct http2_action {
     u16 val;
     u8 kind;
@@ -217,17 +177,16 @@ struct http2_action {
 // these restrictions are needed to make the verifier happy. All three are
 // masked onto an index, so all three have to be powers of two.
 #define MAX_STATES 1024
-#define MAX_TRANS 256
+#define MAX_EDGES 256
 #define MAX_ACTIONS 1024
 
-// The transition table of the DFA, indexed by state and input byte, and the
-// actions its transitions carry. User space fills both in before the program is
-// loaded, after which they are read-only.
-volatile const struct trans s2ts[MAX_STATES][MAX_TRANS];
+// The edges of the DFA, indexed by state and input byte, along with their
+// actions. User space fills both in before the program is loaded, after
+// which they are read-only.
+volatile const struct trans s2ts[MAX_STATES][MAX_EDGES];
 volatile const struct http2_action a2as[MAX_ACTIONS];
 
-// Reads the action a transition carries. Transition 0 is the one a state
-// without a transition for the byte it read falls back to, and carries none.
+// Reads the action an edge carries. Edge 0 leads to the fallback state.
 static __always_inline struct http2_action _action(u16 id) {
     return a2as[id & (MAX_ACTIONS - 1)];
 }
@@ -236,8 +195,7 @@ static __always_inline struct http2_action _action(u16 id) {
 #define HPACK_HUFF_MAXLEN 30
 
 // The HPACK Huffman code of appendix B of RFC 7541, flattened into the number
-// of symbols per code length and the first code of each length. That is enough
-// to tell where a code ends, which is all the parser needs.
+// of symbols per code length and the first code of each length.
 static const u8 huff_count[HPACK_HUFF_MAXLEN + 2] = {
     0, 0, 0, 0, 0, 10, 26, 32, 6, 0, 5, 3, 2, 6, 2, 3,
     0, 0, 0, 3, 8, 13, 26, 29, 12, 4, 15, 19, 29, 0, 4, 0
@@ -255,23 +213,21 @@ static const u32 huff_first_code[HPACK_HUFF_MAXLEN + 2] = {
 #define HPACK_HUFF_STEP(c, b) do {                              \
     code = (code << 1) | (((c) >> (b)) & 1u);                   \
     len++;                                                      \
-    if (len > HPACK_HUFF_MAXLEN) {                                \
-        code = 0;                                                \
-        len = 0;                                                 \
-    }                                                             \
-    else {                                                        \
-        u32 rel = code - huff_first_code[len];                    \
-        if (rel < huff_count[len]) {                              \
-            n++;                                                 \
-            code = 0;                                             \
-            len = 0;                                             \
-        }                                                         \
-    }                                                              \
+    if (len > HPACK_HUFF_MAXLEN) {                              \
+        code = 0;                                               \
+        len = 0;                                                \
+    }                                                           \
+    else {                                                      \
+        u32 rel = code - huff_first_code[len];                  \
+        if (rel < huff_count[len]) {                            \
+            n++;                                                \
+            code = 0;                                           \
+            len = 0;                                            \
+        }                                                       \
+    }                                                           \
 } while (0)
 
-// Returns the number of characters the Huffman encoded `src` decodes to. HPACK
-// sizes a table entry by the decoded length of its name and value, so the
-// mirrored table can only be evicted in step with the peer's if this is known.
+// Returns the number of characters the Huffman encoded `src` decodes to.
 static __always_inline u32 hpack_huffman_decoded_len(const u8 *src, u16 src__sz) {
     u32 code = 0, len = 0, n = 0;
     u32 i = 0;
@@ -292,9 +248,7 @@ static __always_inline u32 hpack_huffman_decoded_len(const u8 *src, u16 src__sz)
 }
 
 // The offsets of the header block of the frame at `data`, whose payload is
-// `len` bytes long. A HEADERS frame may put a pad length and a priority in
-// front of its block and pad it at the end, see section 6.2 of RFC 9113. Every
-// other frame is nothing but its payload.
+// `len` bytes long.
 //
 // Returns 0, or -1 if the frame is too short to hold what its flags announce.
 static __always_inline int _http2_block(const u8 *data, const u8 *data_end, u32 len, u8 type, u8 flags, u16 *start, u16 *end) {
@@ -319,9 +273,7 @@ static __always_inline int _http2_block(const u8 *data, const u8 *data_end, u32 
     return 0;
 }
 
-// Everything the parser needs of the message it walks, no matter whether that
-// message came in as an sk_msg, an sk_buff or a dynptr: the bytes to parse and
-// the connection they belong to, which is what keys the dynamic table.
+// A hook-agnostic context struct.
 struct msg_ctx {
     u8 *data;
     u8 *data_end;
@@ -333,7 +285,6 @@ struct msg_ctx {
 static __always_inline struct http2_frame _new_http2_frame(const u8 *data, u32 len, u8 type, u8 flags) {
     return (struct http2_frame) {
         .len = len,
-        // the top bit of the stream id is reserved
         .sid = ((u32)data[5] << 24 | (u32)data[6] << 16 | (u32)data[7] << 8 | (u32)data[8]) & 0x7FFFFFFF,
         .type = type,
         .flags = flags,
@@ -391,10 +342,7 @@ static __always_inline u32 _get_dynamic_table_index(const struct dynamic_table_i
     return (end_idx - idx) + DYNAMIC_TABLE_BASE;
 }
 
-// Whether `idx` names an entry either table holds. HPACK numbers the static
-// table from 1 and carries on into the dynamic one, so everything above the
-// entry added last is out of range, and section 2.3.3 of RFC 7541 has a peer
-// answer such an index with a decoding error rather than with an entry.
+// Whether `idx` names an entry either table holds.
 static __always_inline bool _is_valid_hpack_index(const struct dynamic_table_info *dt_info __arg_nonnull, u32 idx) {
     return idx > 0 && idx <= STATIC_TABLE_SIZE + dt_info->count;
 }
@@ -442,14 +390,12 @@ static __always_inline void _extract_match(const struct msg_ctx *ctx, const stru
     }
 }
 
-// Follows the transition `input` takes out of `state`. A state that has no
-// transition for `input` falls back to `S_DEAD`, which has none either: the
-// rows the shape of a representation is walked with carry a transition per
-// byte, so this only happens while a field name is being read, and a name that
-// took a byte no pattern has cannot match one anymore.
+// Follows the edge `input` takes out of `state`. A state that has no
+// edge for `input` falls back to the one matching any byte, and if it has
+// none either, back to the fallback state.
 static __always_inline void _next(u16 state, u8 input, u16 *next_state, u16 *action) {
     state &= MAX_STATES - 1;
-    input &= MAX_TRANS - 1;
+    input &= MAX_EDGES - 1;
 
     struct trans t = s2ts[state][input];
     if (t.state == 0 && t.action == 0) {
@@ -494,13 +440,6 @@ static __always_inline void _get_table_entry(const struct ip4_conn *conn __arg_n
 // Walks the name trie over `key`, the name of a field the peer only referenced
 // by index, and returns the id of the capture it matched, or -1 if the name
 // matches no pattern.
-//
-// A pattern only matches the name it spells out, never a name that merely
-// starts with it: the walk carries on to the last byte of the name and only
-// the capture the last one leads into counts.
-//
-// It is only reached through `_run_action`, so the walk is verified once rather
-// than as part of every byte of the block the parser reads.
 static __always_inline int _match_header_key(const u8 *key __arg_nonnull, u16 key__sz) {
     u16 s = S_NAME;
     u16 j = 0;
@@ -535,11 +474,7 @@ static __always_inline struct dynamic_table_info* _get_dynamic_table(const struc
 }
 
 // Evicts the oldest entries of the dynamic table until an entry of
-// `new_entry_size` fits into it, which is what section 4.4 of RFC 7541 has the
-// peer do before adding one. Returns the number of bytes freed.
-//
-// An entry that does not fit into the empty table frees all of them, and is
-// then dropped by the caller, which is what the peer does with it as well.
+// `new_entry_size` fits into it.
 static __always_inline u32 _try_evict_dynamic_table_entries(const struct msg_ctx *ctx __arg_nonnull, struct dynamic_table_info *dt_info __arg_nonnull, u32 new_entry_size) {
     bpf_trace("dt: try evicting %dB (%d actual entries)", new_entry_size, dt_info->count);
 
@@ -575,12 +510,7 @@ static __always_inline u32 _try_evict_dynamic_table_entries(const struct msg_ctx
 }
 
 // Adds the field made up of `key` and `val` to the dynamic table, evicting as
-// many of the oldest entries as it takes to make room for it. Both matches are
-// resolved first, as either of them may refer to an entry of a table rather
-// than to the message itself.
-//
-// Returns 0 if the entry was added, -1 if it could not be resolved or does not
-// fit into the table even when emptied, in which case the peer drops it too.
+// many of the oldest entries as it takes to make room for it.
 static __always_inline int _add_dynamic_table_entry(const struct msg_ctx *ctx __arg_nonnull, struct dynamic_table_info *dt_info __arg_nonnull, const struct http_match *key __arg_nonnull, const struct http_match *val __arg_nonnull) {
     if (dt_info->dirty) return -1;
 
@@ -654,10 +584,7 @@ static __always_inline int _add_dynamic_table_entry(const struct msg_ctx *ctx __
     return 0;
 }
 
-// Reads the settings of a SETTINGS frame, which are 6 bytes each, and applies
-// the ones that resize the dynamic table. Returns the offset it stopped at.
-//
-// See `_parse_hdr_from` for `start`, `end` and `null_prefix`.
+// Reads the SETTINGS frame.
 static __always_inline int _parse_stg_from(const struct msg_ctx *ctx, u16 start, u16 end, u16 *s, struct http_parse_res *pres, struct null_prefix *null_prefix) {
     const u8 *data = ctx->data;
     const u8 *data_end = ctx->data_end;
@@ -712,11 +639,7 @@ static __always_inline int _parse_stg_from(const struct msg_ctx *ctx, u16 start,
     return i;
 }
 
-// Everything the parser carries from one byte of a header block to the next,
-// along with the transition it is about to run. The DFA holds the shape of a
-// representation, so what is left is the integer a multi byte length or index
-// accumulates into, how many bytes of the string that was announced are still
-// to come, and the field being assembled out of the two.
+// The current parser state.
 struct http2_parse_state {
     // the state of the DFA
     u16 s;
@@ -725,9 +648,7 @@ struct http2_parse_state {
     u32 k;
     u32 m;
 
-    // the bytes of the string that was announced that are still to be read, and
-    // whether they are a name, which is walked so that it can match a pattern,
-    // rather than a value, which is only counted
+    // the bytes of the string that was announced that are still to be read
     u32 skip;
     bool is_key;
 
@@ -748,8 +669,7 @@ struct http2_parse_state {
     u8 flags;
 };
 
-// The state of a header block that carries on into a CONTINUATION frame, see
-// section 6.10 of RFC 9113.
+// The state of a header block that carries on into a CONTINUATION frame.
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 16384);
@@ -780,12 +700,7 @@ static __always_inline struct http2_parse_state _new_http2_parse_state(void) {
     };
 }
 
-// Runs the action of the transition `ps` holds, which is what turns the parts
-// of a field the DFA picked out into a capture, into an entry of the mirrored
-// dynamic table, or into both.
-//
-// It is a program of its own so that it is verified once rather than as part of
-// every byte of the block the parser reads.
+// Runs the action of the edges `ps` holds.
 //
 // Returns 0, or -1 if the block cannot be read any further.
 __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struct dynamic_table_info *dt_info __arg_nonnull, struct http_parse_res *pres __arg_nonnull, struct http2_parse_state *ps __arg_nonnull) {
@@ -912,14 +827,7 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
 }
 
 // Decodes the header block between the offsets `start` and `end` and records
-// the values of the fields whose name matches a pattern in `pres`. Fields the
-// peer adds to its dynamic table are added to the mirrored one, so that later
-// blocks can resolve the indices referring to them. `ps` is where the walk
-// picks up, which for the beginning of a block is `_new_http2_parse_state`.
-//
-// `null_prefix` is the length of the run of NUL bytes at the beginning of the
-// buffer that is to be skipped rather than parsed; it is updated as those bytes
-// are consumed. It may be NULL if the data cannot carry such a prefix.
+// the values of the fields whose name matches a pattern in `pres`.
 //
 // Returns the offset it stopped at, which is `end` if the whole block was read.
 static __always_inline int _parse_hdr_from(const struct msg_ctx *ctx, u16 start, u16 end, struct dynamic_table_info *dt_info, struct http2_parse_state *ps, struct http_parse_res *pres, struct null_prefix *null_prefix) {
@@ -994,13 +902,7 @@ static __always_inline int _parse_hdr_from(const struct msg_ctx *ctx, u16 start,
     return i;
 }
 
-// Reads the header block of a HEADERS or a CONTINUATION frame, picking up where
-// the frame before it left off if the block is split over several of them.
-//
-// A field whose bytes straddle two frames has half of itself in a frame the
-// parser cannot address anymore. The block itself stays readable, as the parser
-// only has to count those bytes, but the field can neither be captured nor
-// mirrored, so the dynamic table is marked as drifted.
+// Reads the header block of a HEADERS or a CONTINUATION frame.
 //
 // Returns the offset it stopped at, see `_parse_hdr_from`.
 static __always_inline int _parse_hdr_frame(const struct msg_ctx *ctx, u16 start, u16 end, u8 type, u8 flags, struct http_parse_res *pres, struct null_prefix *null_prefix) {
@@ -1040,8 +942,7 @@ static __always_inline int _parse_hdr_frame(const struct msg_ctx *ctx, u16 start
     return res;
 }
 
-// Whether a frame carries anything the parser reads: a header block, or the
-// settings of a SETTINGS frame that is not an acknowledgement.
+// Whether a frame carries anything the parser needs to read.
 static __always_inline bool _is_parsed_frame(u8 type, u8 flags) {
     bool is_hdr = (type == HTTP2_HEADERS_FRAME || type == HTTP2_CONTINUATION_FRAME);
     bool is_stg = (type == HTTP2_SETTINGS_FRAME && flags == 0);
@@ -1059,10 +960,7 @@ static __always_inline void _skip_frame(const struct ip4_conn *conn, struct http
     frame->dt_count = count;
 }
 
-// Parses the frame that starts `off` bytes into `ctx`, whose payload is `len`
-// bytes long and which has already been made readable in full. HEADERS and
-// CONTINUATION frames are decoded into `pres`, SETTINGS frames are applied to
-// the mirrored dynamic table. The captured ranges are offsets into `ctx`.
+// Parses the frame that starts `off` bytes into `ctx`.
 //
 // Returns 0, or -1 if the frame could not be read to its end.
 static __always_inline int _parse_frame(const struct msg_ctx *ctx, u32 off, u32 len, u8 type, u8 flags, struct http_parse_res *pres, struct http2_frame *frame, struct null_prefix *null_prefix) {
@@ -1072,14 +970,10 @@ static __always_inline int _parse_frame(const struct msg_ctx *ctx, u32 off, u32 
     u16 start = 0, end = 0;
     if (_http2_block(ctx->data + off, ctx->data_end, len, type, flags, &start, &end) < 0) return -1;
 
-    // the parser walks at most `MAX_BYTES` into the data, so a frame reaching
-    // past them could not be read to its end anyway
     if (off + end > MAX_BYTES) return -1;
     start += off;
     end += off;
 
-    // the entry is only ever updated below, never deleted, so the pointer
-    // stays good across the parse
     struct dynamic_table_info *dt_info = _get_dynamic_table(&ctx->conn);
     frame->dt_count_before = dt_info ? dt_info->count : 0;
 
@@ -1143,10 +1037,7 @@ int parse_msg(struct sk_msg_md *msg, struct http_parse_res *pres __arg_nonnull, 
     return frame_len;
 }
 
-// Parses the frame that starts `off` bytes into the packet, pulling it into the
-// linear part of the sk_buff first. The captured ranges are offsets into the
-// sk_buff. See `parse_msg` for what is parsed and for the return value, which
-// is counted from the start of the frame.
+// Parses the frame that starts `off` bytes into the packet.
 SEC("freplace")
 int parse_skb(struct __sk_buff *skb, u32 off, struct http_parse_res *pres __arg_nonnull, struct http2_frame *frame __arg_nonnull, struct null_prefix *null_prefix) {
     if (off > MAX_BYTES) return -1;
@@ -1235,9 +1126,7 @@ bool matched(const struct http_parse_res *pres __arg_nonnull, u8 idx) {
 }
 
 // Points `str` at the value captured for the match `idx`, still Huffman encoded
-// if that is how it was sent. The value points either into `msg` or into one of
-// the HPACK tables, so it is only valid until the program invalidates the data
-// pointers of the message.
+// if that is how it was sent.
 //
 // Returns 0 on success, -1 if nothing was captured for `idx` or if the value
 // can no longer be resolved.
@@ -1252,9 +1141,7 @@ int extract_match_msg(const struct sk_msg_md *msg, const struct http_parse_res *
     return _extract_str(&ctx, &m, str);
 }
 
-// Same as `extract_match`, for a match taken out of an sk_buff. A value that
-// points into `skb` is only valid until the program invalidates its data
-// pointers.
+// Same as `extract_match`, for a match taken out of an sk_buff.
 SEC("freplace")
 int extract_match_skb(const struct __sk_buff *skb, const struct http_parse_res *pres __arg_nonnull, u8 idx, struct bytes *str __arg_nonnull) {
     if (idx >= MAX_MATCHES) return -1;

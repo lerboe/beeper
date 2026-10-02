@@ -11,10 +11,10 @@ use std::collections::HashMap;
 use std::mem::MaybeUninit;
 use std::net::SocketAddr;
 use tracing::{Level, debug, warn};
+pub(super) use types::ip4_addr;
 use types::*;
-pub use types::{ip4_addr, ip4_conn};
-use xbpf::libbpf::{
-    self as libbpf_rs, ErrorKind, Link, MapCore, MapFlags, MapHandle, OpenObject,
+use xbpf::libbpf_rs::{
+    ErrorKind, Link, MapCore, MapFlags, MapHandle, OpenObject,
     skel::{OpenSkel, Skel, SkelBuilder},
 };
 
@@ -63,7 +63,7 @@ xbpf::include_bpf!("http2/parser");
 impl Parser {
     /// Creates a new HTTP/2 parser.
     ///
-    /// Additional configuration must be done through the builder methods before calling `attach`.
+    /// Additional configuration must be done through the builder methods before calling [`Parser::attach`].
     pub fn new() -> Parser {
         let dfa = hpack::dfa();
 
@@ -78,48 +78,73 @@ impl Parser {
         }
     }
 
-    /// Specifies the function template in the target program to be replaced with an HTTP/1.1
-    /// parser. The function will not be replaced until `attach` is called.
+    /// Specifies the name of the stub function defined with `BEEPER_HTTP2_PARSE_*`
+    /// in the target program. When calling [`], Beeper will insert its logic
+    /// into the given template using the
+    /// [BPF_PROG_TYPE_EXT](https://docs.ebpf.io/linux/program-type/BPF_PROG_TYPE_EXT/)
+    /// program type.
     ///
-    /// # Arguments
+    /// # Examples
     ///
-    /// * `parse_fn` - The name of the function to replace in the target program
-    /// * `msg_buf` - The type of buffer to parse
+    /// ```
+    /// use beeper::{MessageBuffer, http2};
+    ///
+    /// let parser = http2::Parser::new().parse_fn("parse_http2", MessageBuffer::Msg);
+    /// ```
     pub fn parse_fn<S: ToString>(mut self, parse_fn: S, msg_buf: MessageBuffer) -> Parser {
         self.parse_fns.insert(msg_buf, parse_fn.to_string());
         self
     }
 
-    /// Specifies the function template in the target program to be called when a pattern match
-    /// is completed. The function will not be replaced until `attach` is called.
+    /// Specifies the name of the stub function defined with `BEEPER_MATCHED`
+    /// in the target program. When calling [`], Beeper will insert its logic
+    /// into the given template using the
+    /// [BPF_PROG_TYPE_EXT](https://docs.ebpf.io/linux/program-type/BPF_PROG_TYPE_EXT/)
+    /// program type.
     ///
-    /// # Arguments
+    /// # Examples
     ///
-    /// * `matched_fn` - The name of the matched callback function in the target program
+    /// ```
+    /// use beeper::http2;
+    ///
+    /// let parser = http2::Parser::new().matched_fn("http2_matched");
+    /// ```
     pub fn matched_fn<S: ToString>(mut self, matched_fn: S) -> Parser {
         self.matched_fn = Some(matched_fn.to_string());
         self
     }
 
-    /// Specifies the function template in the target program to be called when extracting
-    /// matched content. The function will not be replaced until `attach` is called.
+    /// Specifies the name of the stub function defined with `BEEPER_EXTRACT_MATCH_*`
+    /// in the target program. When calling [`], Beeper will insert its logic
+    /// into the given template using the
+    /// [BPF_PROG_TYPE_EXT](https://docs.ebpf.io/linux/program-type/BPF_PROG_TYPE_EXT/)
+    /// program type.
     ///
-    /// # Arguments
+    /// # Examples
     ///
-    /// * `extract_fn` - The name of the extract callback function in the target program
-    /// * `msg_buf` - The type of buffer to extract the match from
+    /// ```
+    /// use beeper::{MessageBuffer, http2};
+    ///
+    /// let parser = http2::Parser::new().extract_fn("extract_http2_match", MessageBuffer::Msg);
+    /// ```
     pub fn extract_fn<S: ToString>(mut self, extract_fn: S, msg_buf: MessageBuffer) -> Parser {
         self.extract_fns.insert(msg_buf, extract_fn.to_string());
         self
     }
 
-    /// Specifies the function template in the target program to be replaced with a reader of the
-    /// connection's dynamic table (`BEEPER_HTTP2_GET_DT_ENTRY`). The function will not be replaced
-    /// until `attach` is called.
+    /// Specifies the name of the stub function defined with `BEEPER_HTTP2_GET_DT_ENTRY`
+    /// in the target program. When calling [`Parser::attach`], Beeper will insert its logic
+    /// into the given template using the
+    /// [BPF_PROG_TYPE_EXT](https://docs.ebpf.io/linux/program-type/BPF_PROG_TYPE_EXT/)
+    /// program type.
     ///
-    /// # Arguments
+    /// # Examples
     ///
-    /// * `get_dynamic_table_entry_fn` - The name of the dynamic table entry reader function in the target program
+    /// ```
+    /// use beeper::http2;
+    ///
+    /// let parser = http2::Parser::new().get_dynamic_table_entry("get_dt_entry");
+    /// ```
     pub fn get_dynamic_table_entry<S: ToString>(mut self, get_dynamic_table_entry_fn: S) -> Parser {
         self.get_dynamic_table_entry_fn = Some(get_dynamic_table_entry_fn.to_string());
         self
@@ -127,27 +152,28 @@ impl Parser {
 
     /// Configures the parser to capture the value of a header field.
     ///
-    /// The field name is matched in its Huffman encoded form, which is how
-    /// HPACK puts it on the wire. Fields the peer replaced with an index into
-    /// the static or the dynamic table are matched against the entry the index
-    /// resolves to. A [`PseudoHeader`] carries the leading colon HTTP/2 spells
-    /// it with, see [`crate::PseudoHeader`].
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - The header name whose value to capture, as it travels the
-    ///   wire
+    /// The matched field values are possibly Huffman-encoded. If the eBPF must
+    /// check for a specific header, it must therefore compare against the
+    /// encoded and decoded case. This function also accepts pseudo header fields
+    /// (see [`crate::PseudoHeaderName`]).
     ///
     /// # Errors
     ///
     /// Returns an error if `name` cannot be Huffman encoded, or if the parser
-    /// already captures as many fields as the parser program has room for.
+    /// already captures the maximum number of fields.
     ///
-    /// # Returns
+    /// # Examples
     ///
-    /// The match ID that can be used in eBPF to extract the captured value. A
-    /// header that is already captured keeps the ID it was given the first
-    /// time, rather than being captured a second time under a new one.
+    /// ```
+    /// # fn main() -> Result<(), beeper::Error> {
+    /// use beeper::{http2, pseudo_header::PATH};
+    /// use http::header::USER_AGENT;
+    ///
+    /// let mut parser = http2::Parser::new();
+    /// let path = parser.capture_hdr(&PATH)?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn capture_hdr<H: AsRef<[u8]>>(&mut self, name: H) -> Result<MatchId, Error> {
         let name = name.as_ref();
         if let Some(&mid) = self.captures.get(name) {
@@ -242,21 +268,36 @@ impl Parser {
     }
 
     /// Loads the configured parser and attaches it to the target program.
+    ///
     /// Every function configured with [`Parser::parse_fn`],
-    /// [`Parser::matched_fn`], [`Parser::extract_fn`] or
-    /// [`Parser::get_dynamic_table_entry`] is replaced in the target program,
-    /// the remaining parser programs are left unloaded. Loading the parser also
-    /// populates the HPACK static table.
-    ///
-    /// # Arguments
-    ///
-    /// * `target` - The file descriptor of the target program to attach to
+    /// [`Parser::matched_fn`] or [`Parser::extract_fn`] is replaced in the
+    /// target program, the remaining parser programs are left
+    /// unloaded.
     ///
     /// # Errors
     ///
     /// Returns an error if the parser cannot be loaded, or if one of the
     /// functions it should replace does not exist in the target program with a
     /// matching signature.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), beeper::Error> {
+    /// # let prog_fd = 0;
+    /// use beeper::{MessageBuffer, http2, pseudo_header::PATH};
+    ///
+    /// let mut parser = http2::Parser::new();
+    /// let path = parser.capture_hdr(&PATH)?;
+    ///
+    /// let parser = parser
+    ///     .parse_fn("parse_http2", MessageBuffer::Msg)
+    ///     .extract_fn("extract_http2_match", MessageBuffer::Msg)
+    ///     .get_dynamic_table_entry("get_dt_entry")
+    ///     .attach(prog_fd)?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn attach(self, target: i32) -> Result<AttachedParser, Error> {
         let skel_builder = ParserSkelBuilder::default();
         let mut open_obj: MaybeUninit<OpenObject> = MaybeUninit::uninit();
@@ -347,15 +388,12 @@ impl Parser {
         })
     }
 
-    /// Writes the transition table of the DFA and the actions its transitions
-    /// carry into the read-only data of the parser program. This has to happen
-    /// before the program is loaded, as the kernel freezes the section
-    /// afterwards.
+    /// Writes the DFA into the read-only data of the parser program.
     ///
     /// # Errors
     ///
-    /// Returns an error if the patterns do not fit into the tables the parser
-    /// program reserves for them.
+    /// Returns an error if the DFA exceeds the eBPF limits on the number
+    /// of states, edges, or actions.
     fn inject(&self, skel: &mut OpenParserSkel) -> Result<(), Error> {
         let Some(data) = skel.maps.rodata_data.as_mut() else {
             panic!("the parser program has no read-only data to inject into");
@@ -426,10 +464,7 @@ pub struct AttachedParser {
     links: Vec<Link>,
 }
 
-/// The state of the dynamic table the parser mirrors for a connection.
-///
-/// This is mostly useful to assert that the kernel side stayed in sync with the
-/// peer's own table.
+/// The state of the dynamic table the parser mirrors for a single connection.
 #[repr(C)]
 #[derive(Default, Clone)]
 pub struct DynamicTableInfo {
@@ -451,10 +486,8 @@ pub struct DynamicTableInfo {
     /// trusted.
     ///
     /// It drifts when a header block is split over a HEADERS frame and the
-    /// CONTINUATION frames following it in the middle of a field, see section
-    /// 6.10 of RFC 9113: the parser cannot address the half of the field that
-    /// is in the frame before, so the entry the peer adds is one it cannot
-    /// mirror. A table that has drifted is neither added to nor resolved from.
+    /// CONTINUATION frames following it in the middle of a field (see [Section
+    /// 6.10 of RFC 9113](https://datatracker.ietf.org/doc/html/rfc7541#section-6.10).
     pub dirty: u32,
 }
 
@@ -472,6 +505,28 @@ impl AttachedParser {
     /// # Panics
     ///
     /// Panics if either address is an IPv6 address.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let prog_fd = 0;
+    /// use beeper::{MessageBuffer, http2};
+    /// use std::net::SocketAddr;
+    ///
+    /// let parser = http2::Parser::new()
+    ///     .parse_fn("parse_http2", MessageBuffer::Msg)
+    ///     .get_dynamic_table_entry("get_dt_entry")
+    ///     .attach(prog_fd)?;
+    ///
+    /// let local: SocketAddr = "127.0.0.1:8080".parse()?;
+    /// let remote: SocketAddr = "127.0.0.1:54321".parse()?;
+    /// if let Some(info) = parser.dynamic_table_info(local, remote) {
+    ///     println!("{} entries in the dynamic table", info?.count);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn dynamic_table_info(
         &self,
         local: SocketAddr,
@@ -494,6 +549,36 @@ impl AttachedParser {
             Err(err) => Some(Err(err.into())),
         }
     }
+
+    /// Removes the dynamic table for a specific connection.
+    ///
+    /// This function should be called once a connection has closed, in order to
+    /// free up space in the eBPF map.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the dynamic table cannot be modified.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let prog_fd = 0;
+    /// use beeper::{MessageBuffer, http2};
+    /// use std::net::SocketAddr;
+    ///
+    /// let parser = http2::Parser::new()
+    ///     .parse_fn("parse_http2", MessageBuffer::Msg)
+    ///     .get_dynamic_table_entry("get_dt_entry")
+    ///     .attach(prog_fd)?;
+    ///
+    /// // once the connection between local and remote has closed
+    /// let local: SocketAddr = "127.0.0.1:8080".parse()?;
+    /// let remote: SocketAddr = "127.0.0.1:54321".parse()?;
+    /// parser.forget_conn(local, remote)?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn forget_conn(&self, local: SocketAddr, remote: SocketAddr) -> Result<(), Error> {
         let conn = ip4_conn {
             local: local.into(),
