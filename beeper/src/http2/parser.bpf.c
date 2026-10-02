@@ -103,8 +103,10 @@ struct {
 #define S_KEY_LEN 4
 #define S_VAL_LEN 5
 
-// The root of the trie of the field names to capture.
+// The roots of the tries of the field names to capture, as they read Huffman
+// coded and as they read when they are not.
 #define S_NAME 6
+#define S_NAME_PLAIN 15
 
 // The continuation of a variable-length integer that did not fit.
 #define S_IDX7_CONT 7
@@ -117,7 +119,7 @@ struct {
 #define S_VAL_LEN_CONT_HUFF 14
 
 // The number of state ids the ones above reserve.
-#define S_RESERVED 15
+#define S_RESERVED 16
 
 // Nothing.
 #define HTTP2A_NONE 0
@@ -439,9 +441,9 @@ static __always_inline void _get_table_entry(const struct ip4_conn *conn __arg_n
 
 // Walks the name trie over `key`, the name of a field the peer only referenced
 // by index, and returns the id of the capture it matched, or -1 if the name
-// matches no pattern.
-static __always_inline int _match_header_key(const u8 *key __arg_nonnull, u16 key__sz) {
-    u16 s = S_NAME;
+// matches no pattern. `huff` says whether `key` is Huffman coded.
+static __always_inline int _match_header_key(const u8 *key __arg_nonnull, u16 key__sz, bool huff) {
+    u16 s = huff ? S_NAME : S_NAME_PLAIN;
     u16 j = 0;
     int mid = -1;
     bpf_for(j, 0, key__sz) {
@@ -742,7 +744,7 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
         u32 key_len = hf->key_len;
         bpf_clamp_uminmax(key_len, 0, HEADER_FIELD_MAXLEN);
 
-        int mid = _match_header_key(hf->key, key_len);
+        int mid = _match_header_key(hf->key, key_len, hf->key_huff != 0);
         if (mid < 0) return 0;
 
         if (ps->kind == HTTP2A_IDX_NAME) {
@@ -1116,13 +1118,21 @@ static __always_inline int _extract_str(const struct msg_ctx *ctx, const struct 
     return 0;
 }
 
-// Returns whether the parser captured a value for the match `idx`.
+// Whether `m` holds a capture. A match nothing was captured for is all zeros,
+// while a value that was captured empty still points behind the length that
+// announced it, so its `idx` is never 0.
+static __always_inline bool _is_captured(const struct http_match *m) {
+    return m->len > 0 || m->idx > 0;
+}
+
+// Returns whether the parser captured a value for the match `idx`, which may
+// be empty.
 SEC("freplace")
 bool matched(const struct http_parse_res *pres __arg_nonnull, u8 idx) {
     if (idx >= MAX_MATCHES) return false;
 
     struct http_match m = pres->ms[idx & MAX_MATCH_MASK];
-    return (m.len > 0);
+    return _is_captured(&m);
 }
 
 // Points `str` at the value captured for the match `idx`, still Huffman encoded
@@ -1135,7 +1145,7 @@ int extract_match_msg(const struct sk_msg_md *msg, const struct http_parse_res *
     if (idx >= MAX_MATCHES) return -1;
 
     struct http_match m = pres->ms[idx & MAX_MATCH_MASK];
-    if (m.len == 0) return -1;
+    if (!_is_captured(&m)) return -1;
 
     struct msg_ctx ctx = _new_msg_ctx(msg);
     return _extract_str(&ctx, &m, str);
@@ -1147,7 +1157,7 @@ int extract_match_skb(const struct __sk_buff *skb, const struct http_parse_res *
     if (idx >= MAX_MATCHES) return -1;
 
     struct http_match m = pres->ms[idx & MAX_MATCH_MASK];
-    if (m.len == 0) return -1;
+    if (!_is_captured(&m)) return -1;
 
     struct msg_ctx ctx = _new_skb_ctx(skb);
     return _extract_str(&ctx, &m, str);

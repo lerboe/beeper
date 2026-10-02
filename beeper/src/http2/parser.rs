@@ -183,10 +183,16 @@ impl Parser {
         let mut name_encoded = Vec::new();
         huffman::encode(name, &mut name_encoded)?;
 
+        // a peer may send the name Huffman coded or not, and the parser matches
+        // it in the form it was sent in
         let mid = self.new_match()?;
         self.dfa
             .start_pattern(S_NAME)
             .push_bytes(&name_encoded)
+            .with(Action::capture(mid));
+        self.dfa
+            .start_pattern(S_NAME_PLAIN)
+            .push_bytes(name)
             .with(Action::capture(mid));
 
         self.captures.insert(name.to_vec(), mid);
@@ -617,6 +623,7 @@ fn delete_if_present(map: &MapHandle, key: &[u8]) -> Result<(), Error> {
 mod tests {
     use super::*;
     use crate::pseudo_header::{METHOD, PATH, STATUS};
+    use crate::{StateId, dfa::Input};
 
     fn hdr(i: u8) -> HeaderName {
         HeaderName::from_bytes(format!("x-{i}").as_bytes()).unwrap()
@@ -634,6 +641,38 @@ mod tests {
             parser.capture_hdr(&hdr(MAX_MATCHES)),
             Err(Error::MatchLimitExceeded(limit)) if limit == MAX_MATCHES as usize
         ));
+    }
+
+    /// Follows `name` from `root`, and returns the match the last byte of it
+    /// captures, if any.
+    fn walk(parser: &Parser, root: StateId, name: &[u8]) -> Option<u8> {
+        let transitions: Vec<_> = parser.dfa.iter_transitions().collect();
+        let mut state = root;
+        let mut captured = None;
+        for &byte in name {
+            let (_, _, to, action) = transitions
+                .iter()
+                .find(|(from, input, ..)| *from == state && *input == Input::from(byte))?;
+            state = *to;
+            captured = action
+                .filter(|action| action.kind == Kind::Capture)
+                .map(|action| action.val as u8);
+        }
+
+        captured
+    }
+
+    #[test]
+    fn a_name_is_matched_whether_it_is_huffman_coded_or_not() {
+        let mut parser = Parser::new();
+        let mid = parser.capture_hdr("te").expect("capture header");
+
+        let mut coded = Vec::new();
+        huffman::encode(b"te", &mut coded).unwrap();
+
+        assert_eq!(walk(&parser, S_NAME, &coded), Some(u8::from(mid)));
+        assert_eq!(walk(&parser, S_NAME_PLAIN, b"te"), Some(u8::from(mid)));
+        assert_eq!(walk(&parser, S_NAME_PLAIN, &coded), None);
     }
 
     #[test]
