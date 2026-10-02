@@ -2013,6 +2013,7 @@ dependencies = [
  "axum",
  "beeper",
  "bytes",
+ "httlib-huffman",
  "libc",
  "tokio",
  "tracing",
