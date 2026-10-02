@@ -6,11 +6,7 @@
 //! same blocks share an entry, and with it a configuration.
 
 /// The value of a header field as h2spec sends it.
-///
-/// The value a [`Value::Split`] or a [`Value::Stray`] holds is not checked, it
-/// only says what was sent.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub enum Value {
     Str(&'static str),
 
@@ -25,14 +21,14 @@ pub enum Value {
     /// to capture as they are.
     Raw(&'static [u8]),
 
-    /// A value that is split across a HEADERS and a CONTINUATION frame. The
-    /// parser points into the frame it parses, so it cannot point at a value
-    /// that is in two of them, and is expected to capture nothing.
+    /// Known limitation: a value that is split across a HEADERS and a
+    /// CONTINUATION frame. The parser points into the frame it parses, so it
+    /// cannot point at a value that is in two of them, and captures nothing.
     Split(Box<Value>),
 
-    /// A value in a CONTINUATION frame that does not carry on the header
-    /// block of its stream, e.g. one that follows a block that has ended. The
-    /// peer is expected to reject it, and the parser to capture nothing of it.
+    /// Known limitation: a value in a CONTINUATION frame that does not carry
+    /// on the header block of its stream, e.g. one that follows a block that
+    /// has ended. The parser captures nothing of it.
     Stray(Box<Value>),
 }
 

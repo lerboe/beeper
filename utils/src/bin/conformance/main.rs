@@ -153,6 +153,10 @@ enum Expected {
 
     /// These bytes, as they were sent.
     Raw(Vec<u8>),
+
+    /// What the inner one expects, which the parser is known to get wrong for
+    /// the reason given.
+    Limited(Box<Expected>, &'static str),
 }
 
 impl Expected {
@@ -162,7 +166,14 @@ impl Expected {
             Value::Authority => authority.as_bytes().to_vec(),
             Value::Dummy => vec![b'x'; DUMMY_LEN],
             Value::Raw(raw) => return Expected::Raw(raw.to_vec()),
-            Value::Split(_) | Value::Stray(_) => return Expected::Absent,
+            Value::Split(value) => {
+                let inner = Expected::new(value, authority);
+                return Expected::Limited(Box::new(inner), "a value split across frames");
+            }
+            Value::Stray(value) => {
+                let inner = Expected::new(value, authority);
+                return Expected::Limited(Box::new(inner), "a stray CONTINUATION frame");
+            }
         };
 
         Expected::Value(value)
@@ -175,6 +186,7 @@ impl Expected {
     /// to that length, as the parser only keeps that much of an entry.
     fn matches(&self, capture: Option<&Capture>) -> bool {
         let sent = match (self, capture) {
+            (Expected::Limited(inner, _), _) => return inner.matches(capture),
             (Expected::Absent, None) => return true,
             (Expected::Absent, Some(_)) | (_, None) => return false,
             (Expected::Raw(raw), Some(capture)) => {
@@ -202,6 +214,7 @@ impl std::fmt::Display for Expected {
             Expected::Absent => write!(f, "nothing"),
             Expected::Value(value) => write!(f, "{:?}", abbreviate(value)),
             Expected::Raw(raw) => write!(f, "{raw:x?}"),
+            Expected::Limited(inner, why) => write!(f, "{inner} (known limitation: {why})"),
         }
     }
 }
@@ -641,12 +654,16 @@ mod tests {
     }
 
     #[test]
-    fn expect_nothing_of_what_the_parser_cannot_point_at() {
+    fn expect_what_was_sent_despite_a_known_limitation() {
         for value in [
-            Value::Split(Box::new(Value::Authority)),
-            Value::Stray(Box::new(Value::Dummy)),
+            Value::Split(Box::new(Value::Str("ok"))),
+            Value::Stray(Box::new(Value::Str("ok"))),
         ] {
-            assert_eq!(Expected::new(&value, ""), Expected::Absent);
+            let expected = Expected::new(&value, "");
+            assert!(matches!(expected, Expected::Limited(..)));
+            assert!(expected.matches(Some(&capture(b"ok"))));
+            assert!(!expected.matches(None));
+            assert!(expected.to_string().contains("known limitation"));
         }
     }
 
