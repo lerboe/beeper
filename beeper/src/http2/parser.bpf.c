@@ -103,8 +103,10 @@ struct {
 #define S_KEY_LEN 4
 #define S_VAL_LEN 5
 
-// The root of the trie of the field names to capture.
+// The roots of the tries of the field names to capture, as they read Huffman
+// coded and as they read when they are not.
 #define S_NAME 6
+#define S_NAME_PLAIN 15
 
 // The continuation of a variable-length integer that did not fit.
 #define S_IDX7_CONT 7
@@ -117,7 +119,7 @@ struct {
 #define S_VAL_LEN_CONT_HUFF 14
 
 // The number of state ids the ones above reserve.
-#define S_RESERVED 15
+#define S_RESERVED 16
 
 // Nothing.
 #define HTTP2A_NONE 0
@@ -282,8 +284,9 @@ struct msg_ctx {
 
 // Reads the stream id out of the frame header `data` points at. `data` must be
 // known to hold at least the 9 bytes of a frame header.
-static __always_inline struct http2_frame _new_http2_frame(const u8 *data, u8 type, u8 flags) {
+static __always_inline struct http2_frame _new_http2_frame(const u8 *data, u32 len, u8 type, u8 flags) {
     return (struct http2_frame) {
+        .len = len,
         .sid = ((u32)data[5] << 24 | (u32)data[6] << 16 | (u32)data[7] << 8 | (u32)data[8]) & 0x7FFFFFFF,
         .type = type,
         .flags = flags,
@@ -438,9 +441,9 @@ static __always_inline void _get_table_entry(const struct ip4_conn *conn __arg_n
 
 // Walks the name trie over `key`, the name of a field the peer only referenced
 // by index, and returns the id of the capture it matched, or -1 if the name
-// matches no pattern.
-static __always_inline int _match_header_key(const u8 *key __arg_nonnull, u16 key__sz) {
-    u16 s = S_NAME;
+// matches no pattern. `huff` says whether `key` is Huffman coded.
+static __always_inline int _match_header_key(const u8 *key __arg_nonnull, u16 key__sz, bool huff) {
+    u16 s = huff ? S_NAME : S_NAME_PLAIN;
     u16 j = 0;
     int mid = -1;
     bpf_for(j, 0, key__sz) {
@@ -605,6 +608,8 @@ static __always_inline int _parse_stg_from(const struct msg_ctx *ctx, u16 start,
     u32 val = 0;
 
     bpf_for(i, start, len+1) {
+        // the byte past the frame belongs to the next one
+        if (i >= len) break;
         if (data + i + 1 > data_end) break;
         u8 c = data[i];
 
@@ -739,7 +744,7 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
         u32 key_len = hf->key_len;
         bpf_clamp_uminmax(key_len, 0, HEADER_FIELD_MAXLEN);
 
-        int mid = _match_header_key(hf->key, key_len);
+        int mid = _match_header_key(hf->key, key_len, hf->key_huff != 0);
         if (mid < 0) return 0;
 
         if (ps->kind == HTTP2A_IDX_NAME) {
@@ -806,6 +811,12 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
     if (ps->kind == HTTP2A_TABLE_SIZE) {
         bpf_debug("hdr: table size update: %u", ps->v);
         dt_info->max_size = ps->v;
+
+        // a table that shrinks evicts its oldest entries right away, see
+        // section 4.3 of RFC 7541. Evicting them only once the next entry is
+        // added would miss an update to 0 that clears the table, followed by
+        // one that grows it back
+        _try_evict_dynamic_table_entries(ctx, dt_info, 0);
         return 0;
     }
 
@@ -986,8 +997,15 @@ static __always_inline int _parse_frame(const struct msg_ctx *ctx, u32 off, u32 
 // frames are decoded into `pres`, SETTINGS frames are applied to the mirrored
 // dynamic table and every other frame is skipped.
 //
-// Returns the number of bytes the frame occupies, or a negative value if the
-// message ends before the frame does.
+// The whole frame is pulled into the linear part of the message before it is
+// parsed. A message may carry several frames, so a caller has to keep calling
+// this until the message is consumed.
+//
+// Returns the number of bytes the frame occupies, 0 if the message is too short
+// to hold a frame header, or a negative value if the frame cannot be parsed.
+// That includes a frame that is longer than the message, which happens when the
+// peer writes a frame in pieces: `frame->len` then says how long it is, so that
+// the caller can cork the message until the rest has arrived.
 SEC("freplace")
 int parse_msg(struct sk_msg_md *msg, struct http_parse_res *pres __arg_nonnull, struct http2_frame *frame __arg_nonnull) {
     u8 *data = (u8 *)(long)msg->data;
@@ -1000,7 +1018,7 @@ int parse_msg(struct sk_msg_md *msg, struct http_parse_res *pres __arg_nonnull, 
     u8 flags = data[4];
     u32 frame_len = HTTP2_FRAME_HDR_LEN + len;
 
-    *frame = _new_http2_frame(data, type, flags);
+    *frame = _new_http2_frame(data, len, type, flags);
 
     bpf_debug("Parsing HTTP/2 message with length %d, type %d, flags %d", len, type, flags);
 
@@ -1047,7 +1065,7 @@ int parse_skb(struct __sk_buff *skb, u32 off, struct http_parse_res *pres __arg_
     u8 flags = hdr[4];
     u32 frame_len = HTTP2_FRAME_HDR_LEN + len;
 
-    *frame = _new_http2_frame(hdr, type, flags);
+    *frame = _new_http2_frame(hdr, len, type, flags);
 
     bpf_debug("Parsing HTTP/2 sk_buff with length %d, type %d, flags %d", len, type, flags);
 
@@ -1100,13 +1118,21 @@ static __always_inline int _extract_str(const struct msg_ctx *ctx, const struct 
     return 0;
 }
 
-// Returns whether the parser captured a value for the match `idx`.
+// Whether `m` holds a capture. A match nothing was captured for is all zeros,
+// while a value that was captured empty still points behind the length that
+// announced it, so its `idx` is never 0.
+static __always_inline bool _is_captured(const struct http_match *m) {
+    return m->len > 0 || m->idx > 0;
+}
+
+// Returns whether the parser captured a value for the match `idx`, which may
+// be empty.
 SEC("freplace")
 bool matched(const struct http_parse_res *pres __arg_nonnull, u8 idx) {
     if (idx >= MAX_MATCHES) return false;
 
     struct http_match m = pres->ms[idx & MAX_MATCH_MASK];
-    return (m.len > 0);
+    return _is_captured(&m);
 }
 
 // Points `str` at the value captured for the match `idx`, still Huffman encoded
@@ -1119,7 +1145,7 @@ int extract_match_msg(const struct sk_msg_md *msg, const struct http_parse_res *
     if (idx >= MAX_MATCHES) return -1;
 
     struct http_match m = pres->ms[idx & MAX_MATCH_MASK];
-    if (m.len == 0) return -1;
+    if (!_is_captured(&m)) return -1;
 
     struct msg_ctx ctx = _new_msg_ctx(msg);
     return _extract_str(&ctx, &m, str);
@@ -1131,7 +1157,7 @@ int extract_match_skb(const struct __sk_buff *skb, const struct http_parse_res *
     if (idx >= MAX_MATCHES) return -1;
 
     struct http_match m = pres->ms[idx & MAX_MATCH_MASK];
-    if (m.len == 0) return -1;
+    if (!_is_captured(&m)) return -1;
 
     struct msg_ctx ctx = _new_skb_ctx(skb);
     return _extract_str(&ctx, &m, str);

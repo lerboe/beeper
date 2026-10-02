@@ -858,6 +858,42 @@ async fn update_dynamic_table_size() {
 }
 
 #[tokio::test]
+async fn clear_dynamic_table_with_a_size_update_to_zero() {
+    let addr = server::launch().await.expect("launch server");
+
+    let mut open_obj = OpenObject::new();
+    let (_prog, _h1, h2, _mids) = attach_at(addr, &mut open_obj, Hook::Msg, &[]);
+
+    let mut client = RawClient::connect(addr).await;
+    client
+        .request(raw_request_block(
+            &addr.to_string(),
+            &[(Some(19), "accept", "*/*")],
+        ))
+        .await;
+
+    let info = h2
+        .dynamic_table_info(client.local_addr, client.remote_addr)
+        .expect("connection is known")
+        .expect("dynamic_table_info");
+    assert_eq!(info.count, 1);
+
+    // a size update to 0 clears the table, and the one to 4096 right after it
+    // grows it back without bringing anything back (h2spec generic/5/15)
+    let mut block = vec![0x20, 0x3F, 0xE1, 0x1F];
+    block.extend_from_slice(&raw_request_block(&addr.to_string(), &[]));
+    client.request(block).await;
+
+    let info = h2
+        .dynamic_table_info(client.local_addr, client.remote_addr)
+        .expect("connection is known")
+        .expect("dynamic_table_info");
+    assert_eq!(info.max_size, 4096);
+    assert_eq!(info.count, 0);
+    assert_eq!(info.size, 0);
+}
+
+#[tokio::test]
 async fn evict_header_field_from_dynamic_table() {
     let addr = server::launch().await.expect("launch server");
 

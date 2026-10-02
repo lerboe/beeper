@@ -65,3 +65,6 @@ jobs:
               run: cargo build --profile=${{ matrix.profile }} --locked --verbose --workspace
             - name: Test
               run: cargo test --profile=${{ matrix.profile }} --locked --verbose -p beeper --all-features
+            - name: Run HTTP/2 conformance tests (h2spec)
+              run: ./ci/h2spec.sh
+              if: matrix.rust == 'stable'
