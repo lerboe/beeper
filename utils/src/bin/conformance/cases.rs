@@ -41,9 +41,16 @@ pub enum Block {
     /// A block the parser is expected to fail on, as it is malformed, e.g. one
     /// that refers to an index no table has.
     Malformed,
+
+    /// A block that is broken by a frame that violates the rules for the frames
+    /// a header block is sent in, e.g. a CONTINUATION frame that does not carry
+    /// on the block of its stream, see `EPROTO` in beeper/http2.h. Such a frame
+    /// is a connection error, and the parser is expected to fail on it with
+    /// `-EPROTO`.
+    Broken,
 }
 
-pub use Block::Malformed;
+pub use Block::{Broken, Malformed};
 
 impl Block {
     /// The fields the block carries, if it is not one the parser is expected
@@ -51,7 +58,7 @@ impl Block {
     pub fn sent(&self) -> Option<&[Field]> {
         match self {
             Block::Fields(fields) => Some(fields),
-            Block::Malformed => None,
+            Block::Malformed | Block::Broken => None,
         }
     }
 }
@@ -67,26 +74,23 @@ pub enum Expect {
     /// These header blocks, in order.
     Blocks(Vec<Block>),
 
-    /// Frames that violate the rules for the frames a header block is sent in,
-    /// e.g. a CONTINUATION frame that does not carry on the block of its
-    /// stream, see `EPROTO` in beeper/http2.h. Such a frame is a connection
-    /// error, and the parser is expected to fail on at least one of them with
-    /// `-EPROTO`.
+    /// These header blocks, in order, the last of which is [`Broken`] by a
+    /// violation of the rules for the frames a header block is sent in.
     ///
-    /// The peer may close the connection as soon as it sees the first one, so
-    /// what else h2spec gets to send, and the parser to see, hinges on timing.
-    /// None of it is checked.
-    Violation,
+    /// The peer may close the connection as soon as it sees the violation, so
+    /// what h2spec gets to send after it, and the parser to see, hinges on
+    /// timing. Any block the parser sees after the listed ones is expected to
+    /// be broken, too.
+    Violation(Vec<Block>),
 }
 
 pub use Expect::{Blocks, Violation};
 
 impl Case {
-    /// The header blocks the case sends, none for a violation.
+    /// The header blocks the case sends.
     pub fn blocks(&self) -> &[Block] {
         match &self.expect {
-            Blocks(blocks) => blocks,
-            Violation => &[],
+            Blocks(blocks) | Violation(blocks) => blocks,
         }
     }
 }
@@ -132,18 +136,8 @@ pub fn cases() -> Vec<Case> {
                 // CONTINUATION frame of a block
                 "http2/4.3/2",
                 "http2/6.2/1",
-                // the HEADERS frame of another stream comes between the HEADERS
-                // and the CONTINUATION frame of a block
-                "http2/4.3/3",
-                "http2/6.2/2",
                 // a CONTINUATION frame on a stream that is idle
                 "http2/5.1/4",
-                // a CONTINUATION frame on a stream whose block has ended
-                "http2/5.1/7",
-                "http2/5.1/10",
-                "http2/5.1/13",
-                "http2/6.10/4",
-                "http2/6.10/5",
                 // an unknown extension frame follows the HEADERS frame of a
                 // block that has not ended
                 "http2/5.5/2",
@@ -152,14 +146,36 @@ pub fn cases() -> Vec<Case> {
                 // a DATA frame follows a CONTINUATION frame of a block that
                 // has not ended
                 "http2/6.10/2",
-                // a CONTINUATION frame on stream 0 comes between the HEADERS
-                // and the CONTINUATION frame of a block
-                "http2/6.10/3",
                 // a DATA frame comes between the HEADERS and the CONTINUATION
                 // frame of a block
                 "http2/6.10/6",
             ],
-            expect: Violation,
+            expect: Violation(vec![Broken]),
+        },
+        Case {
+            ids: &[
+                // the HEADERS frame of another stream comes between the HEADERS
+                // and the CONTINUATION frame of a block, which breaks both
+                "http2/4.3/3",
+                "http2/6.2/2",
+                // a CONTINUATION frame on stream 0 does, too
+                "http2/6.10/3",
+            ],
+            expect: Violation(vec![Broken, Broken]),
+        },
+        // a CONTINUATION frame on a stream whose block has ended
+        Case {
+            ids: &[
+                "http2/5.1/7",
+                "http2/5.1/10",
+                "http2/5.1/13",
+                "http2/6.10/4",
+            ],
+            expect: Violation(vec![get(vec![]), Broken]),
+        },
+        Case {
+            ids: &["http2/6.10/5"],
+            expect: Violation(vec![get(vec![("x-dummy0", Dummy)]), Broken]),
         },
         Case {
             ids: &[

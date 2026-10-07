@@ -469,24 +469,46 @@ fn describe_error(error: Option<i32>) -> String {
 
 /// Checks the request blocks the parser saw, `parsed`, against the ones that
 /// were sent, and describes what it got wrong in `problems`.
+///
+/// For a `violation`, the blocks the parser saw after the ones that were sent
+/// are expected to be broken, see [`Expect::Violation`].
 fn check_requests(
     parser: &CaseParser,
     sent: &[Block],
+    violation: bool,
     parsed: &[ParsedBlock],
     authority: &str,
     problems: &mut Vec<String>,
 ) {
-    if parsed.len() != sent.len() {
+    let (expected, extra) = parsed.split_at(parsed.len().min(sent.len()));
+    if parsed.len() < sent.len() || (!violation && !extra.is_empty()) {
         problems.push(format!(
             "parsed {} request blocks, h2spec sends {}",
             parsed.len(),
             sent.len()
         ));
+    } else if violation {
+        for (i, parsed) in extra.iter().enumerate() {
+            if parsed.error != Some(-libc::EPROTO) {
+                problems.push(format!(
+                    "request block {} (stream {}): {}, expected -EPROTO as it follows a \
+                     violation",
+                    sent.len() + i,
+                    parsed.sid,
+                    describe_error(parsed.error)
+                ));
+            }
+        }
     }
 
-    for (i, (parsed, sent)) in parsed.iter().zip(sent).enumerate() {
+    for (i, (parsed, sent)) in expected.iter().zip(sent).enumerate() {
         let what = format!("request block {i} (stream {})", parsed.sid);
         match (sent, parsed.error) {
+            (Block::Broken, Some(err)) if err == -libc::EPROTO => {}
+            (Block::Broken, _) => problems.push(format!(
+                "{what}: {}, expected -EPROTO as it is broken",
+                describe_error(parsed.error)
+            )),
             (Block::Malformed, Some(err)) if err != -libc::EPROTO => {}
             (Block::Malformed, _) => problems.push(format!(
                 "{what}: {}, expected the parser to fail on it",
@@ -518,21 +540,15 @@ fn check(
 ) -> (Vec<String>, String) {
     let (requests, responses, mut problems) = blocks(frames);
 
-    match &case.expect {
-        Expect::Violation => {
-            let rejected = frames
-                .iter()
-                .any(|frame| !frame.upstream && frame.ret == -libc::EPROTO);
-            if !rejected {
-                problems.push(
-                    "h2spec breaks the rules for header blocks, expected the parser to fail on \
-                     one of its frames with -EPROTO"
-                        .to_string(),
-                );
-            }
-        }
-        Expect::Blocks(sent) => check_requests(parser, sent, &requests, authority, &mut problems),
-    }
+    let violation = matches!(case.expect, Expect::Violation(_));
+    check_requests(
+        parser,
+        case.blocks(),
+        violation,
+        &requests,
+        authority,
+        &mut problems,
+    );
 
     let answers: Vec<Fields> = case
         .blocks()
@@ -545,11 +561,6 @@ fn check(
         let what = format!("response block {i} (stream {})", parsed.sid);
         if let Some(err) = parsed.error {
             problems.push(format!("{what}: the parser failed on it ({err})"));
-            continue;
-        }
-
-        // the requests of a violation are not known, and with them the answers
-        if matches!(case.expect, Expect::Violation) {
             continue;
         }
 
@@ -807,6 +818,26 @@ mod tests {
         );
 
         assert!(response_fields(&[("x-test", Value::Str("ok"))], "").is_none());
+    }
+
+    #[test]
+    fn break_a_block_in_violations_only() {
+        for case in cases::cases() {
+            let broken = case.blocks().iter().filter(|b| matches!(b, Block::Broken));
+            match &case.expect {
+                Expect::Violation(blocks) => assert!(
+                    matches!(blocks.last(), Some(Block::Broken)),
+                    "{:?} violate the rules, but end in no broken block",
+                    case.ids
+                ),
+                Expect::Blocks(_) => assert_eq!(
+                    broken.count(),
+                    0,
+                    "{:?} break a block, but are no violation",
+                    case.ids
+                ),
+            }
+        }
     }
 
     #[test]
