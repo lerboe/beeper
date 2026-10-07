@@ -170,10 +170,6 @@ impl Expected {
                 let inner = Expected::new(value, authority);
                 return Expected::Limited(Box::new(inner), "a value split across frames");
             }
-            Value::Stray(value) => {
-                let inner = Expected::new(value, authority);
-                return Expected::Limited(Box::new(inner), "a stray CONTINUATION frame");
-            }
         };
 
         Expected::Value(value)
@@ -655,16 +651,11 @@ mod tests {
 
     #[test]
     fn expect_what_was_sent_despite_a_known_limitation() {
-        for value in [
-            Value::Split(Box::new(Value::Str("ok"))),
-            Value::Stray(Box::new(Value::Str("ok"))),
-        ] {
-            let expected = Expected::new(&value, "");
-            assert!(matches!(expected, Expected::Limited(..)));
-            assert!(expected.matches(Some(&capture(b"ok"))));
-            assert!(!expected.matches(None));
-            assert!(expected.to_string().contains("known limitation"));
-        }
+        let expected = Expected::new(&Value::Split(Box::new(Value::Str("ok"))), "");
+        assert!(matches!(expected, Expected::Limited(..)));
+        assert!(expected.matches(Some(&capture(b"ok"))));
+        assert!(!expected.matches(None));
+        assert!(expected.to_string().contains("known limitation"));
     }
 
     #[test]

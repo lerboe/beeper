@@ -671,12 +671,20 @@ struct http2_parse_state {
     u8 flags;
 };
 
-// The state of a header block that carries on into a CONTINUATION frame.
+// A header block that carries on into a CONTINUATION frame: the stream it is
+// sent on, and the state it is read on with.
+struct continued_block {
+    u32 sid;
+    struct http2_parse_state ps;
+};
+
+// The header block of each connection that has not ended yet. A connection has
+// at most one, see section 4.3 of RFC 9113.
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 16384);
     __type(key, struct ip4_conn);
-    __type(value, struct http2_parse_state);
+    __type(value, struct continued_block);
 } continued_blocks SEC(".maps");
 
 // Returns the state a header block is read from its first byte with.
@@ -904,23 +912,36 @@ static __always_inline int _parse_hdr_from(const struct msg_ctx *ctx, u16 start,
     return i;
 }
 
-// Reads the header block of a HEADERS or a CONTINUATION frame.
+// Reads the header block of a HEADERS or a CONTINUATION frame sent on the
+// stream `sid`.
+//
+// A header block has to be sent as one run of frames, a HEADERS frame followed
+// by CONTINUATION frames of the same stream, see sections 4.3 and 6.10 of RFC
+// 9113. A frame that breaks the run is a connection error, which the parser
+// reports as a frame it cannot parse, without capturing anything of it: a
+// CONTINUATION frame that carries on no block, or one of another stream, and a
+// HEADERS frame that starts a block while another one has not ended. The block
+// that was broken is abandoned.
 //
 // Returns the offset it stopped at, see `_parse_hdr_from`.
-static __always_inline int _parse_hdr_frame(const struct msg_ctx *ctx, u16 start, u16 end, u8 type, u8 flags, struct http_parse_res *pres, struct null_prefix *null_prefix) {
+static __always_inline int _parse_hdr_frame(const struct msg_ctx *ctx, u16 start, u16 end, u8 type, u8 flags, u32 sid, struct http_parse_res *pres, struct null_prefix *null_prefix) {
     struct dynamic_table_info *dt_info = _get_dynamic_table(&ctx->conn);
     if (!dt_info) return start;
 
-    struct http2_parse_state ps = _new_http2_parse_state();
-    if (type == HTTP2_CONTINUATION_FRAME) {
-        struct http2_parse_state *resumed = bpf_map_lookup_elem(&continued_blocks, &ctx->conn);
-        if (resumed == NULL) {
-            bpf_debug("hdr: a continuation of a block that was not followed");
-            return end;
-        }
-
-        ps = *resumed;
+    struct continued_block *open = bpf_map_lookup_elem(&continued_blocks, &ctx->conn);
+    bool carries_on = (type == HTTP2_CONTINUATION_FRAME && open != NULL && open->sid == sid);
+    if (open != NULL && !carries_on) {
+        bpf_debug("hdr: a frame of stream %u breaks the block of stream %u", sid, open->sid);
+        bpf_map_delete_elem(&continued_blocks, &ctx->conn);
+        return start;
     }
+    if (type == HTTP2_CONTINUATION_FRAME && !carries_on) {
+        bpf_debug("hdr: a continuation of stream %u carries on no block", sid);
+        return start;
+    }
+
+    struct http2_parse_state ps = _new_http2_parse_state();
+    if (carries_on) ps = open->ps;
 
     int res = _parse_hdr_from(ctx, start, end, dt_info, &ps, pres, null_prefix);
 
@@ -939,7 +960,8 @@ static __always_inline int _parse_hdr_frame(const struct msg_ctx *ctx, u16 start
     ps.cid = -1;
     ps.add_to_dt = 0;
 
-    bpf_map_update_elem(&continued_blocks, &ctx->conn, &ps, BPF_ANY);
+    struct continued_block block = { .sid = sid, .ps = ps };
+    bpf_map_update_elem(&continued_blocks, &ctx->conn, &block, BPF_ANY);
 
     return res;
 }
@@ -984,7 +1006,7 @@ static __always_inline int _parse_frame(const struct msg_ctx *ctx, u32 off, u32 
         u16 s = S_FIELD;
         res = _parse_stg_from(ctx, start, end, &s, pres, null_prefix);
     } else {
-        res = _parse_hdr_frame(ctx, start, end, type, flags, pres, null_prefix);
+        res = _parse_hdr_frame(ctx, start, end, type, flags, frame->sid, pres, null_prefix);
     }
 
     frame->dt_count = dt_info ? dt_info->count : 0;

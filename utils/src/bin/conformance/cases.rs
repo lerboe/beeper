@@ -25,11 +25,6 @@ pub enum Value {
     /// CONTINUATION frame. The parser points into the frame it parses, so it
     /// cannot point at a value that is in two of them, and captures nothing.
     Split(Box<Value>),
-
-    /// Known limitation: a value in a CONTINUATION frame that does not carry
-    /// on the header block of its stream, e.g. one that follows a block that
-    /// has ended. The parser captures nothing of it.
-    Stray(Box<Value>),
 }
 
 use Value::*;
@@ -39,6 +34,11 @@ pub type Field = (&'static str, Value);
 
 /// The fields of a header block, or `None` for one the parser is expected to
 /// reject.
+///
+/// A block is rejected if its frames do not follow the rules of sections 4.3
+/// and 6.10 of RFC 9113, e.g. a CONTINUATION frame that does not carry on the
+/// block of its stream. Such a frame is a connection error, and none of the
+/// fields it carries belong to a request.
 pub type Block = Option<Vec<Field>>;
 
 /// The header blocks the cases `ids` send.
@@ -77,17 +77,6 @@ fn post(fields: Vec<Field>) -> Block {
 /// A block that carries nothing but `fields`.
 fn fields(fields: Vec<Field>) -> Block {
     Some(fields)
-}
-
-/// `block`, sent in a CONTINUATION frame that does not carry on a block, see
-/// [`Value::Stray`].
-fn stray(block: Block) -> Block {
-    block.map(|fields| {
-        fields
-            .into_iter()
-            .map(|(name, value)| (name, Stray(Box::new(value))))
-            .collect()
-    })
 }
 
 /// Returns every case h2spec runs.
@@ -245,10 +234,10 @@ pub fn cases() -> Vec<Case> {
             blocks: vec![get(vec![("x-dummy0", Dummy)])],
         },
         // the HEADERS frame of another stream comes between the HEADERS and
-        // the CONTINUATION frame of the first
+        // the CONTINUATION frame of the first, which breaks both blocks
         Case {
             ids: &["http2/4.3/3", "http2/6.2/2"],
-            blocks: vec![get(vec![("x-dummy0", Stray(Box::new(Dummy)))]), get(vec![])],
+            blocks: vec![None, None],
         },
         Case {
             ids: &[
@@ -265,9 +254,10 @@ pub fn cases() -> Vec<Case> {
             ],
             blocks: vec![get(vec![]), get(vec![])],
         },
+        // a CONTINUATION frame on stream 0, which carries on no block
         Case {
             ids: &["http2/6.10/3"],
-            blocks: vec![get(vec![]), fields(vec![("x-dummy0", Dummy)])],
+            blocks: vec![get(vec![]), None],
         },
         Case {
             ids: &["http2/5.1.2/1"],
@@ -289,19 +279,15 @@ pub fn cases() -> Vec<Case> {
             ids: &["http2/6.10/2"],
             blocks: vec![post(vec![("x-dummy0", Dummy)])],
         },
+        // a CONTINUATION frame after the block has ended
         Case {
             ids: &["http2/6.10/5"],
-            blocks: vec![
-                get(vec![("x-dummy0", Dummy)]),
-                stray(fields(vec![("x-dummy0", Dummy)])),
-            ],
+            blocks: vec![get(vec![("x-dummy0", Dummy)]), None],
         },
+        // a CONTINUATION frame on stream 0 at the end of the block
         Case {
             ids: &["http2/6.10/6"],
-            blocks: vec![
-                post(vec![("x-dummy0", Dummy)]),
-                stray(fields(vec![("x-dummy0", Dummy)])),
-            ],
+            blocks: vec![post(vec![("x-dummy0", Dummy)]), None],
         },
         // the HEADERS frame is split after its 5th byte, in the middle of the
         // value of :authority
@@ -317,16 +303,17 @@ pub fn cases() -> Vec<Case> {
         // a CONTINUATION frame on a stream that is idle
         Case {
             ids: &["http2/5.1/4"],
-            blocks: vec![stray(get(vec![]))],
+            blocks: vec![None],
         },
         // a CONTINUATION frame on a stream whose block has ended
         Case {
-            ids: &["http2/5.1/7"],
-            blocks: vec![get(vec![]), stray(get(vec![]))],
-        },
-        Case {
-            ids: &["http2/5.1/10", "http2/5.1/13", "http2/6.10/4"],
-            blocks: vec![get(vec![]), stray(fields(vec![("x-dummy0", Dummy)]))],
+            ids: &[
+                "http2/5.1/7",
+                "http2/5.1/10",
+                "http2/5.1/13",
+                "http2/6.10/4",
+            ],
+            blocks: vec![get(vec![]), None],
         },
         Case {
             ids: &["http2/8.1/1"],
