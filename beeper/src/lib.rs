@@ -8,7 +8,7 @@
 //!
 //! The target program declares the functions it wants Beeper to provide with
 //! the `BEEPER_*` macros of `beeper/http1.h`, `beeper/http2.h` or
-//! `beeper/dns.h` and then names them in the [`http1`], [`http2`] or [`dns`]
+//! `beeper/dns.h` and then names them in the [`http1`], [`http2`] or `dns`
 //! builder:
 //!
 //! ```no_run

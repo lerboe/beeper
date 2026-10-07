@@ -24,7 +24,7 @@ Protocol      | Status  | Minimal Kernel Version
 ------------- | ------- | ----------------------
 HTTP/1.1      | ✅      | 6.8
 HTTP/2        | ✅      | 6.8
-DNS           | ✅      | 6.8
+DNS           | WIP     | 
 RESP2         | WIP     | 
 
 ## Use Cases
