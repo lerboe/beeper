@@ -287,11 +287,19 @@ int msg_verdict(struct sk_msg_md *msg) {
         }
 
         if (msg_len < 0) {
-            bpf_error("Failed to parse h2 message: %s", msg->data);
-
             struct parse_result *r = new_frame_result(&ikey, !is_downstream, msg_len, &frame);
             if (r) bpf_ringbuf_submit(r, 0);
 
+            // a frame that breaks the rules for header blocks leaves the
+            // parser as it was, so the frames after it are parsed on. Telling
+            // the connection broken is up to the reader of `results`
+            if (msg_len == -EPROTO) {
+                bpf_debug("Skipping a frame that breaks the rules for header blocks");
+                bpf_msg_apply_bytes(msg, frame_len);
+                return SK_PASS;
+            }
+
+            bpf_error("Failed to parse h2 message: %s", msg->data);
             return SK_PASS;
         }
 

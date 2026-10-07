@@ -171,6 +171,15 @@ int msg_verdict(struct sk_msg_md *msg) {
             return SK_PASS;
         }
 
+        // a frame that breaks the rules for header blocks is a connection
+        // error, which the peer is to answer by closing the connection. The
+        // parser skips it, so the frames after it are still logged
+        if (msg_len == -EPROTO) {
+            bpf_warn("%s [h2 stream %u] protocol error", is_downstream ? "-->" : "<--", frame.sid);
+            bpf_msg_apply_bytes(msg, frame_len);
+            return SK_PASS;
+        }
+
         if (msg_len < 0) {
             bpf_error("Failed to parse h2 message");
             return SK_PASS;

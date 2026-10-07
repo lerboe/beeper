@@ -30,9 +30,12 @@ struct http2_frame {
 // of RFC 9113: a HEADERS or CONTINUATION frame on stream 0, any frame but a
 // CONTINUATION frame of the same stream while a block has not ended, and a
 // CONTINUATION frame while no block is open. The peer is to treat it as a
-// connection error. Nothing of the frame is captured, and the block it broke,
-// if any, is abandoned. Every other frame that cannot be parsed is reported as
-// -1.
+// connection error, and it is up to the caller to remember that the connection
+// is broken: the parser does not parse the frame, captures nothing of it, and
+// changes none of its state, so that it reads the frames after it as if it had
+// not been sent. A block that was open stays open, e.g. a CONTINUATION frame of
+// its stream still carries it on. Every other frame that cannot be parsed is
+// reported as -1.
 #ifndef EPROTO
 #define EPROTO 71
 #endif
