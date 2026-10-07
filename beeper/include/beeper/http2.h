@@ -25,6 +25,17 @@ struct http2_frame {
     u32 len;
 };
 
+// What an HTTP/2 parser returns, negated, for a HEADERS or CONTINUATION frame
+// that breaks the run of frames a header block has to be sent in, see sections
+// 4.3 and 6.10 of RFC 9113: a CONTINUATION frame that carries on no header
+// block or the block of another stream, or a HEADERS frame that starts a block
+// while another one has not ended. The peer is to treat it as a connection
+// error. Nothing of the frame is captured, and the block it broke is
+// abandoned. Every other frame that cannot be parsed is reported as -1.
+#ifndef EPROTO
+#define EPROTO 71
+#endif
+
 // The number of bytes of a name or a value that are kept in a dynamic table
 // entry. Longer fields are truncated, which bounds the copies for the
 // verifier. Must stay in sync with `HEADER_FIELD_MAXLEN` of http2/parser.bpf.c.

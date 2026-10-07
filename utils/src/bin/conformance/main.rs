@@ -22,7 +22,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use axum::{Router, http::HeaderMap, routing::get};
 use beeper::{MessageBuffer, http1, http2};
-use cases::{Case, DUMMY_LEN, Value};
+use cases::{Block, Case, DUMMY_LEN, Value};
 use httlib_huffman as huffman;
 use std::{
     collections::{BTreeSet, HashMap},
@@ -73,8 +73,8 @@ struct ParsedBlock {
     client_port: u16,
     sid: u32,
 
-    /// Whether the parser failed on one of its frames.
-    error: bool,
+    /// What the parser returned for the first of its frames it failed on.
+    error: Option<i32>,
 
     /// What the parser captured, indexed by match id.
     captures: Vec<Option<Capture>>,
@@ -82,7 +82,9 @@ struct ParsedBlock {
 
 impl ParsedBlock {
     fn add(&mut self, frame: &Frame) {
-        self.error |= frame.ret < 0;
+        if frame.ret < 0 && self.error.is_none() {
+            self.error = Some(frame.ret);
+        }
         self.captures.resize(frame.captures.len(), None);
         for (i, capture) in frame.captures.iter().enumerate() {
             if capture.is_some() {
@@ -301,7 +303,7 @@ impl CaseParser {
         let names: BTreeSet<&'static str> = case
             .blocks
             .iter()
-            .flatten()
+            .filter_map(Block::sent)
             .flatten()
             .map(|(name, _)| *name)
             .chain(RESPONSE_FIELDS.iter().copied())
@@ -440,6 +442,16 @@ impl Results {
     }
 }
 
+/// Describes what the parser made of a block, by what it returned for the first
+/// of its frames it failed on.
+fn describe_error(error: Option<i32>) -> String {
+    match error {
+        None => "parsed".to_string(),
+        Some(err) if err == -libc::EPROTO => "the parser failed on it with -EPROTO".to_string(),
+        Some(err) => format!("the parser failed on it ({err})"),
+    }
+}
+
 /// Checks what the parser made of the case `case`, and describes what it got
 /// wrong.
 fn check(
@@ -460,11 +472,21 @@ fn check(
 
     for (i, (parsed, sent)) in requests.iter().zip(&case.blocks).enumerate() {
         let what = format!("request block {i} (stream {})", parsed.sid);
-        match sent {
-            None if parsed.error => {}
-            None => problems.push(format!("{what}: parsed, expected the parser to reject it")),
-            Some(_) if parsed.error => problems.push(format!("{what}: the parser failed on it")),
-            Some(sent) => {
+        match (sent, parsed.error) {
+            (Block::Broken, Some(err)) if err == -libc::EPROTO => {}
+            (Block::Malformed, Some(err)) if err != -libc::EPROTO => {}
+            (Block::Broken, _) => problems.push(format!(
+                "{what}: {}, expected -EPROTO as it breaks a header block",
+                describe_error(parsed.error)
+            )),
+            (Block::Malformed, _) => problems.push(format!(
+                "{what}: {}, expected the parser to fail on it",
+                describe_error(parsed.error)
+            )),
+            (Block::Fields(_), Some(err)) => {
+                problems.push(format!("{what}: the parser failed on it ({err})"))
+            }
+            (Block::Fields(sent), None) => {
                 let fields = expected_fields(sent, authority);
                 problems.extend(
                     parser
@@ -479,14 +501,14 @@ fn check(
     let answers: Vec<Fields> = case
         .blocks
         .iter()
-        .flatten()
+        .filter_map(Block::sent)
         .filter_map(|block| response_fields(block, authority))
         .collect();
 
     for (i, parsed) in responses.iter().enumerate() {
         let what = format!("response block {i} (stream {})", parsed.sid);
-        if parsed.error {
-            problems.push(format!("{what}: the parser failed on it"));
+        if let Some(err) = parsed.error {
+            problems.push(format!("{what}: the parser failed on it ({err})"));
             continue;
         }
 
@@ -684,18 +706,21 @@ mod tests {
             frame(HEADERS, END_HEADERS, 3, false, 10),
             frame(CONTINUATION, END_HEADERS, 1, false, 10),
             // a CONTINUATION after the block ended starts one of its own
-            frame(CONTINUATION, END_HEADERS, 1, false, 10),
+            frame(CONTINUATION, END_HEADERS, 1, false, -libc::EPROTO),
             frame(HEADERS, END_HEADERS, 1, true, -1),
         ];
 
         let (requests, responses, problems) = blocks(&frames);
         assert!(problems.is_empty());
         assert_eq!(
-            requests.iter().map(|b| b.sid).collect::<Vec<_>>(),
-            vec![1, 3, 1]
+            requests
+                .iter()
+                .map(|b| (b.sid, b.error))
+                .collect::<Vec<_>>(),
+            vec![(1, None), (3, None), (1, Some(-libc::EPROTO))]
         );
         assert_eq!(responses.len(), 1);
-        assert!(responses[0].error);
+        assert_eq!(responses[0].error, Some(-1));
     }
 
     #[test]

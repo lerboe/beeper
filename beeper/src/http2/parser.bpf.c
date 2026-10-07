@@ -918,12 +918,12 @@ static __always_inline int _parse_hdr_from(const struct msg_ctx *ctx, u16 start,
 // A header block has to be sent as one run of frames, a HEADERS frame followed
 // by CONTINUATION frames of the same stream, see sections 4.3 and 6.10 of RFC
 // 9113. A frame that breaks the run is a connection error, which the parser
-// reports as a frame it cannot parse, without capturing anything of it: a
-// CONTINUATION frame that carries on no block, or one of another stream, and a
-// HEADERS frame that starts a block while another one has not ended. The block
-// that was broken is abandoned.
+// reports as `-EPROTO`, without capturing anything of it: a CONTINUATION frame
+// that carries on no block, or one of another stream, and a HEADERS frame that
+// starts a block while another one has not ended. The block that was broken is
+// abandoned.
 //
-// Returns the offset it stopped at, see `_parse_hdr_from`.
+// Returns the offset it stopped at, see `_parse_hdr_from`, or `-EPROTO`.
 static __always_inline int _parse_hdr_frame(const struct msg_ctx *ctx, u16 start, u16 end, u8 type, u8 flags, u32 sid, struct http_parse_res *pres, struct null_prefix *null_prefix) {
     struct dynamic_table_info *dt_info = _get_dynamic_table(&ctx->conn);
     if (!dt_info) return start;
@@ -933,11 +933,11 @@ static __always_inline int _parse_hdr_frame(const struct msg_ctx *ctx, u16 start
     if (open != NULL && !carries_on) {
         bpf_debug("hdr: a frame of stream %u breaks the block of stream %u", sid, open->sid);
         bpf_map_delete_elem(&continued_blocks, &ctx->conn);
-        return start;
+        return -EPROTO;
     }
     if (type == HTTP2_CONTINUATION_FRAME && !carries_on) {
         bpf_debug("hdr: a continuation of stream %u carries on no block", sid);
-        return start;
+        return -EPROTO;
     }
 
     struct http2_parse_state ps = _new_http2_parse_state();
@@ -986,7 +986,8 @@ static __always_inline void _skip_frame(const struct ip4_conn *conn, struct http
 
 // Parses the frame that starts `off` bytes into `ctx`.
 //
-// Returns 0, or -1 if the frame could not be read to its end.
+// Returns 0, `-EPROTO` if the frame breaks a header block (see
+// `_parse_hdr_frame`), or -1 if the frame could not be read to its end.
 static __always_inline int _parse_frame(const struct msg_ctx *ctx, u32 off, u32 len, u8 type, u8 flags, struct http_parse_res *pres, struct http2_frame *frame, struct null_prefix *null_prefix) {
     if (off > MAX_BYTES) return -1;
     bpf_clamp_uminmax(off, 0, MAX_BYTES);
@@ -1011,6 +1012,7 @@ static __always_inline int _parse_frame(const struct msg_ctx *ctx, u32 off, u32 
 
     frame->dt_count = dt_info ? dt_info->count : 0;
 
+    if (res == -EPROTO) return -EPROTO;
     return (res < end) ? -1 : 0;
 }
 
@@ -1024,7 +1026,8 @@ static __always_inline int _parse_frame(const struct msg_ctx *ctx, u32 off, u32 
 // this until the message is consumed.
 //
 // Returns the number of bytes the frame occupies, 0 if the message is too short
-// to hold a frame header, or a negative value if the frame cannot be parsed.
+// to hold a frame header, `-EPROTO` if the frame breaks a header block (see
+// `EPROTO` in beeper/http2.h), or -1 if the frame cannot be parsed otherwise.
 // That includes a frame that is longer than the message, which happens when the
 // peer writes a frame in pieces: `frame->len` then says how long it is, so that
 // the caller can cork the message until the rest has arrived.
@@ -1051,17 +1054,17 @@ int parse_msg(struct sk_msg_md *msg, struct http_parse_res *pres __arg_nonnull, 
         return frame_len;
     }
 
-    if (bpf_msg_pull_data(msg, 0, frame_len, 0) < 0) {
-        return -(data_end - data);
-    }
+    if (bpf_msg_pull_data(msg, 0, frame_len, 0) < 0) return -1;
 
     struct msg_ctx ctx = _new_msg_ctx(msg);
-    if (_parse_frame(&ctx, 0, len, type, flags, pres, frame, NULL) < 0) return -1;
+    int err = _parse_frame(&ctx, 0, len, type, flags, pres, frame, NULL);
+    if (err < 0) return err;
 
     return frame_len;
 }
 
-// Parses the frame that starts `off` bytes into the packet.
+// Parses the frame that starts `off` bytes into the packet. Returns what
+// `parse_msg` returns.
 SEC("freplace")
 int parse_skb(struct __sk_buff *skb, u32 off, struct http_parse_res *pres __arg_nonnull, struct http2_frame *frame __arg_nonnull, struct null_prefix *null_prefix) {
     if (off > MAX_BYTES) return -1;
@@ -1098,12 +1101,11 @@ int parse_skb(struct __sk_buff *skb, u32 off, struct http_parse_res *pres __arg_
         return frame_len;
     }
 
-    if (bpf_skb_pull_data(skb, off + frame_len) < 0) {
-        return -(int)(skb->len - off);
-    }
+    if (bpf_skb_pull_data(skb, off + frame_len) < 0) return -1;
 
     struct msg_ctx ctx = _new_skb_ctx(skb);
-    if (_parse_frame(&ctx, off, len, type, flags, pres, frame, null_prefix) < 0) return -1;
+    int err = _parse_frame(&ctx, off, len, type, flags, pres, frame, null_prefix);
+    if (err < 0) return err;
 
     return frame_len;
 }
