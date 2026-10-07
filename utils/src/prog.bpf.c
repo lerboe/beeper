@@ -1,5 +1,6 @@
 #include "beeper/http1.h"
 #include "beeper/http2.h"
+#include "beeper/dns.h"
 #include "xbpf.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
@@ -39,6 +40,9 @@ volatile const bool http_parse_resp;
 // the parsers run at the `sk_skb` hook rather than at `sk_msg`
 volatile const bool hook_skb;
 
+// the connection carries DNS over TCP rather than HTTP
+volatile const bool dns;
+
 // What the parser captured in the message parsed last, keyed by match id. An id
 // with nothing captured for it is absent from the map.
 struct {
@@ -62,6 +66,14 @@ BEEPER_HTTP1_PARSE_SKB(parse_http1_skb)
 
 BEEPER_EXTRACT_MATCH_SKB(extract_http2_match_skb)
 BEEPER_HTTP2_PARSE_SKB(parse_http2_skb)
+
+BEEPER_DNS_PARSE_MSG(parse_dns_msg)
+BEEPER_DNS_NEXT_RR_MSG(next_dns_rr_msg)
+BEEPER_DNS_EXTRACT_NAME_MSG(extract_dns_name_msg)
+
+BEEPER_DNS_PARSE_SKB(parse_dns_skb)
+BEEPER_DNS_NEXT_RR_SKB(next_dns_rr_skb)
+BEEPER_DNS_EXTRACT_NAME_SKB(extract_dns_name_skb)
 
 extern void *bpf_cast_to_kern_ctx(void *obj) __ksym;
 
@@ -113,6 +125,63 @@ static __always_inline void store_match(u32 i, int res, const struct bytes *str)
     bpf_map_update_elem(&matches, &i, tmp, BPF_ANY);
 }
 
+#define DNS_MAX_RRS 8
+#define DNS_MAX_MSGS 8
+
+// What the DNS parser made of the last message it parsed: what it returned,
+// the parse result, the question name, and the records along with their
+// owners. The names are extracted in the dotted, lowercased form.
+int dns_ret = 0;
+u32 dns_num_msgs = 0;
+struct dns_parse_res dns_res = { 0 };
+int dns_qname_ret = 0;
+struct dns_name_buf dns_qname = { 0 };
+u32 dns_num_rrs = 0;
+struct dns_rr dns_rrs[DNS_MAX_RRS] = { 0 };
+struct dns_name_buf dns_rr_names[DNS_MAX_RRS] = { 0 };
+
+// The cursor of the record iterator.
+struct dns_rr dns_cur = { 0 };
+
+// Records the question name and the records of the message `dns_res` holds.
+#define STORE_DNS_MSG(ctx, next_rr, extract_name)                                                  \
+    do {                                                                                           \
+        u32 flags = DNS_NAME_DOTTED | DNS_NAME_LOWER;                                              \
+        if (dns_res.hdr.qdcount > 0) {                                                             \
+            dns_qname_ret = extract_name(ctx, &dns_res, dns_res.q.name.off, flags, &dns_qname);   \
+        }                                                                                          \
+                                                                                                   \
+        dns_num_rrs = 0;                                                                           \
+        __builtin_memset(&dns_cur, 0, sizeof(dns_cur));                                            \
+        u32 j = 0;                                                                                 \
+        bpf_for(j, 0, DNS_MAX_RRS) {                                                               \
+            if (next_rr(ctx, &dns_res, &dns_cur) < 0) break;                                       \
+                                                                                                   \
+            dns_rrs[j] = dns_cur;                                                                  \
+            extract_name(ctx, &dns_res, dns_cur.name.off, flags, &dns_rr_names[j]);                \
+            dns_num_rrs = j + 1;                                                                   \
+        }                                                                                          \
+    } while (0)
+
+// Parses the DNS messages of `msg`, one after the other, and records what the
+// parser made of the last one.
+static __always_inline int dns_msg_verdict(struct sk_msg_md *msg) {
+    u32 off = 0;
+    u32 i = 0;
+    bpf_for(i, 0, DNS_MAX_MSGS) {
+        dns_ret = parse_dns_msg(msg, off, &dns_res);
+        if (dns_ret < 0) break;
+
+        dns_num_msgs += 1;
+        STORE_DNS_MSG(msg, next_dns_rr_msg, extract_dns_name_msg);
+
+        off += dns_ret;
+        if (off >= msg->size) break;
+    }
+
+    return SK_PASS;
+}
+
 // Parses the messages of the connection under test and records the captured
 // ranges in `matches`. A message that carries the HTTP/2 preface upgrades its
 // connection, after which its messages are parsed as HTTP/2.
@@ -138,6 +207,8 @@ int msg_verdict(struct sk_msg_md *msg) {
     if (is_downstream == http_parse_resp) {
         return SK_PASS;
     }
+
+    if (dns) return dns_msg_verdict(msg);
 
     bool is_h2 = (bpf_map_lookup_elem(&upgraded_conns, &ikey) != NULL);
     bool store_matches = false;
@@ -223,6 +294,14 @@ int skb_parser(struct __sk_buff *skb) {
 
     u32 avail = skb->len - off;
 
+    // a DNS message at a time, as its length prefix frames it
+    if (dns) {
+        u8 pfx[2];
+        if (bpf_skb_load_bytes(skb, off, pfx, sizeof(pfx)) < 0) return 0;
+
+        return 2 + ((u32)pfx[0] << 8 | pfx[1]);
+    }
+
     if (bpf_map_lookup_elem(&upgraded_conns, &ikey) != NULL) {
         u8 hdr[3];
         if (bpf_skb_load_bytes(skb, off, hdr, sizeof(hdr)) < 0) return 0;
@@ -263,6 +342,16 @@ int skb_verdict(struct __sk_buff *skb) {
     }
 
     u32 off = strp_offset(skb);
+    if (dns) {
+        dns_ret = parse_dns_skb(skb, off, DNS_PARSE_TCP, &dns_res);
+        if (dns_ret >= 0) {
+            dns_num_msgs += 1;
+            STORE_DNS_MSG(skb, next_dns_rr_skb, extract_dns_name_skb);
+        }
+
+        return SK_PASS;
+    }
+
     bool is_h2 = (bpf_map_lookup_elem(&upgraded_conns, &ikey) != NULL);
     bool store_matches = false;
     struct http_parse_res pres = { 0 };

@@ -5,6 +5,10 @@ fn main() {
     let include_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("include");
     println!("cargo:rerun-if-changed={}", include_dir.display());
 
+    // headers private to a parser program, which the build does not track on
+    // its own
+    println!("cargo:rerun-if-changed=src/dns/dns.bpf.h");
+
     let hdrs = Some(vec![include_dir.clone()]);
     export_headers(hdrs, default_header_dir());
 
