@@ -18,9 +18,10 @@ ADDR="127.0.0.1:8080"
 export RUST_LOG="conformance=info,bpf=error"
 export NO_COLOR=1
 
-# axum fails this one without the parser too, as it tells HTTP/1.1 from
-# HTTP/2 by the preface
-KNOWN_FAILURES="http2/3.5/2"
+# axum fails these without the parser too: it tells HTTP/1.1 from HTTP/2 by
+# the preface (3.5/2), and now and then answers a request whose trailers carry
+# a pseudo-header field rather than reset its stream (8.1.2.1/3)
+KNOWN_FAILURES="http2/3.5/2 http2/8.1.2.1/3"
 
 override_h2spec=false
 

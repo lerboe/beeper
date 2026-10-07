@@ -97,6 +97,28 @@ impl Case {
             Blocks(blocks) | Violation(blocks) => blocks,
         }
     }
+
+    /// The fields of each request the case sends, which is what the server
+    /// answers. A violation lists frames rather than blocks, and a frame that
+    /// carries no `:method` there carries on the request before it, as a
+    /// CONTINUATION frame of its block, whatever frames came between them.
+    pub fn requests(&self) -> Vec<Vec<Field>> {
+        let sent = self.blocks().iter().filter_map(Block::sent);
+        let Violation(_) = &self.expect else {
+            return sent.map(<[Field]>::to_vec).collect();
+        };
+
+        let mut requests: Vec<Vec<Field>> = Vec::new();
+        for frame in sent {
+            let starts = frame.iter().any(|(name, _)| *name == ":method");
+            match requests.last_mut() {
+                Some(request) if !starts => request.extend_from_slice(frame),
+                _ => requests.push(frame.to_vec()),
+            }
+        }
+
+        requests
+    }
 }
 
 /// The value h2spec pads its header blocks with, see [`Value::Dummy`].

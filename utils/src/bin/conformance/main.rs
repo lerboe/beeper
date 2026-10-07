@@ -600,9 +600,8 @@ fn check(
     }
 
     let answers: Vec<Fields> = case
-        .blocks()
+        .requests()
         .iter()
-        .filter_map(Block::sent)
         .filter_map(|block| response_fields(block, authority))
         .collect();
 
@@ -867,6 +866,19 @@ mod tests {
         );
 
         assert!(response_fields(&[("x-test", Value::Str("ok"))], "").is_none());
+    }
+
+    #[test]
+    fn answer_the_request_a_violation_carries_on() {
+        let case = cases::cases()
+            .into_iter()
+            .find(|c| c.ids.contains(&"http2/6.10/5"))
+            .unwrap();
+        let requests = case.requests();
+        assert_eq!(requests.len(), 1);
+
+        let fields = response_fields(&requests[0], "").unwrap();
+        assert_eq!(fields["x-dummy0"], Expected::Value(vec![b'x'; cases::DUMMY_LEN]));
     }
 
     #[test]

@@ -229,13 +229,19 @@ static const u32 huff_first_code[HPACK_HUFF_MAXLEN + 2] = {
     }                                                           \
 } while (0)
 
-// Returns the number of characters the Huffman encoded `src` decodes to.
-static __always_inline u32 hpack_huffman_decoded_len(const u8 *src, u16 src__sz) {
+// Returns the number of characters the first `src_len` bytes of the Huffman
+// encoded name of `hf`, or of its value if `is_val`, decode to.
+//
+// It is a function of its own, so that the verifier checks the loop once,
+// rather than for each field on every path through `_run_action`.
+__noinline __weak u32 hpack_huffman_decoded_len(const struct http2_hdr_field *hf __arg_nonnull, u32 is_val, u32 src_len) {
+    const u8 *src = is_val ? hf->val : hf->key;
     u32 code = 0, len = 0, n = 0;
     u32 i = 0;
 
-    bpf_for (i, 0, src__sz) {
-        u8 c = src[i];
+    bpf_clamp_uminmax(src_len, 0, HEADER_FIELD_MAXLEN);
+    bpf_for (i, 0, src_len) {
+        u8 c = src[i & HEADER_FIELD_MASK];
         HPACK_HUFF_STEP(c, 7);
         HPACK_HUFF_STEP(c, 6);
         HPACK_HUFF_STEP(c, 5);
@@ -564,8 +570,8 @@ static __always_inline int _add_dynamic_table_entry(const struct msg_ctx *ctx __
         return -1;
     }
 
-    u32 key_len_decoded = key_huff ? hpack_huffman_decoded_len(dt_val->field.key, key_len) : key_wire_len;
-    u32 val_len_decoded = val_huff ? hpack_huffman_decoded_len(dt_val->field.val, val_len) : val_wire_len;
+    u32 key_len_decoded = key_huff ? hpack_huffman_decoded_len(&dt_val->field, 0, key_len) : key_wire_len;
+    u32 val_len_decoded = val_huff ? hpack_huffman_decoded_len(&dt_val->field, 1, val_len) : val_wire_len;
     dt_val->size = key_len_decoded + val_len_decoded + 32;
 
     _try_evict_dynamic_table_entries(ctx, dt_info, dt_val->size);
@@ -836,6 +842,64 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
     return 0;
 }
 
+// Feeds the byte `c` at the offset `ps->i` to the header block `ps` reads, and
+// records the values of the fields whose name matches a pattern in `pres`.
+//
+// It is a function of its own, so that the verifier checks a step once, rather
+// than in every iteration of the loop that feeds the block to it.
+//
+// Returns 0, or -1 if the block cannot be read any further.
+__noinline __weak int _parse_hdr_byte(const struct msg_ctx *ctx __arg_nonnull, struct dynamic_table_info *dt_info __arg_nonnull, struct http_parse_res *pres __arg_nonnull, struct http2_parse_state *ps __arg_nonnull, u32 c) {
+    c &= 0xff;
+
+    if (ps->skip > 0) {
+        if (ps->is_key) {
+            u16 a = 0;
+            _next(ps->s, c, &ps->s, &a);
+
+            struct http2_action act = _action(a);
+            ps->cid = (act.kind == HTTP2A_CAPTURE) ? (s8)(act.val & MAX_MATCH_MASK) : -1;
+        }
+
+        ps->skip--;
+        if (ps->skip == 0 && ps->is_key) ps->s = S_VAL_LEN;
+
+        return 0;
+    }
+
+    u16 a = 0;
+    _next(ps->s, c, &ps->s, &a);
+    struct http2_action act = _action(a);
+
+    if (act.kind == HTTP2A_INT_START) {
+        ps->k = act.val;
+        ps->m = 0;
+        return 0;
+    }
+    if (act.kind == HTTP2A_INT_CONT) {
+        // an integer wider than the longest block the parser reads is of no
+        // use, and shifting by more than the width of the accumulator is not
+        // defined. Such an integer is left short, which makes the field it
+        // belongs to unresolvable rather than the block unparsable
+        if (ps->m <= 28) {
+            ps->k += (u32)(c & 0x7F) << ps->m;
+            ps->m += 7;
+        }
+
+        return 0;
+    }
+
+    ps->v = act.val;
+    if ((act.flags & HTTP2F_CONT) != 0) {
+        ps->v = ps->k;
+        if (ps->m <= 28) ps->v += (u32)(c & 0x7F) << ps->m;
+    }
+    ps->kind = act.kind;
+    ps->flags = act.flags;
+
+    return _run_action(ctx, dt_info, pres, ps);
+}
+
 // Decodes the header block between the offsets `start` and `end` and records
 // the values of the fields whose name matches a pattern in `pres`.
 //
@@ -860,53 +924,8 @@ static __always_inline int _parse_hdr_from(const struct msg_ctx *ctx, u16 start,
             continue;
         }
 
-        if (ps->skip > 0) {
-            if (ps->is_key) {
-                u16 a = 0;
-                _next(ps->s, c, &ps->s, &a);
-
-                struct http2_action act = _action(a);
-                ps->cid = (act.kind == HTTP2A_CAPTURE) ? (s8)(act.val & MAX_MATCH_MASK) : -1;
-            }
-
-            ps->skip--;
-            if (ps->skip == 0 && ps->is_key) ps->s = S_VAL_LEN;
-
-            continue;
-        }
-
-        u16 a = 0;
-        _next(ps->s, c, &ps->s, &a);
-        struct http2_action act = _action(a);
-
-        if (act.kind == HTTP2A_INT_START) {
-            ps->k = act.val;
-            ps->m = 0;
-            continue;
-        }
-        if (act.kind == HTTP2A_INT_CONT) {
-            // an integer wider than the longest block the parser reads is of no
-            // use, and shifting by more than the width of the accumulator is
-            // not defined. Such an integer is left short, which makes the field
-            // it belongs to unresolvable rather than the block unparsable
-            if (ps->m <= 28) {
-                ps->k += (u32)(c & 0x7F) << ps->m;
-                ps->m += 7;
-            }
-
-            continue;
-        }
-
         ps->i = i;
-        ps->v = act.val;
-        if ((act.flags & HTTP2F_CONT) != 0) {
-            ps->v = ps->k;
-            if (ps->m <= 28) ps->v += (u32)(c & 0x7F) << ps->m;
-        }
-        ps->kind = act.kind;
-        ps->flags = act.flags;
-
-        if (_run_action(ctx, dt_info, pres, ps) < 0) break;
+        if (_parse_hdr_byte(ctx, dt_info, pres, ps, c) < 0) break;
     }
 
     return i;
