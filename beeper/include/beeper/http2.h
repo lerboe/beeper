@@ -25,13 +25,13 @@ struct http2_frame {
     u32 len;
 };
 
-// What an HTTP/2 parser returns, negated, for a HEADERS or CONTINUATION frame
-// that breaks the run of frames a header block has to be sent in, see sections
-// 4.3 and 6.10 of RFC 9113: a CONTINUATION frame that carries on no header
-// block or the block of another stream, or a HEADERS frame that starts a block
-// while another one has not ended. The peer is to treat it as a connection
-// error. Nothing of the frame is captured, and the block it broke is
-// abandoned. Every other frame that cannot be parsed is reported as -1.
+// What an HTTP/2 parser returns, negated, for a frame that breaks the run of
+// frames a header block has to be sent in, see sections 4.3, 5.5 and 6.10 of
+// RFC 9113: any frame but a CONTINUATION frame of the same stream while a
+// block has not ended, and a CONTINUATION frame while no block is open. The
+// peer is to treat it as a connection error. Nothing of the frame is captured,
+// and the block it broke is abandoned. Every other frame that cannot be parsed
+// is reported as -1.
 #ifndef EPROTO
 #define EPROTO 71
 #endif

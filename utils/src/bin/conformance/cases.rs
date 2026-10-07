@@ -174,7 +174,6 @@ pub fn cases() -> Vec<Case> {
                 "http2/5.1/11",
                 "http2/5.1.1/1",
                 "http2/5.3.1/1",
-                "http2/5.5/2",
                 "http2/6.2/3",
                 "http2/6.3/2",
                 "http2/6.4/3",
@@ -251,9 +250,12 @@ pub fn cases() -> Vec<Case> {
             ids: &["http2/4.3/1"],
             blocks: vec![fields(vec![])],
         },
+        // a PRIORITY frame comes between the HEADERS and the CONTINUATION frame
+        // of a block, and an unknown extension frame follows the HEADERS frame
+        // of one that has not ended
         Case {
-            ids: &["http2/4.3/2", "http2/6.2/1"],
-            blocks: vec![get(vec![("x-dummy0", Dummy)])],
+            ids: &["http2/4.3/2", "http2/5.5/2", "http2/6.2/1"],
+            blocks: vec![Broken],
         },
         // the HEADERS frame of another stream comes between the HEADERS and
         // the CONTINUATION frame of the first, which breaks both blocks
@@ -276,10 +278,11 @@ pub fn cases() -> Vec<Case> {
             ],
             blocks: vec![get(vec![]), get(vec![])],
         },
-        // a CONTINUATION frame on stream 0, which carries on no block
+        // a CONTINUATION frame on stream 0 comes between the HEADERS and the
+        // CONTINUATION frame of the block of stream 1
         Case {
             ids: &["http2/6.10/3"],
-            blocks: vec![get(vec![]), Broken],
+            blocks: vec![Broken, Broken],
         },
         Case {
             ids: &["http2/5.1.2/1"],
@@ -297,19 +300,22 @@ pub fn cases() -> Vec<Case> {
             ids: &["http2/6.10/1"],
             blocks: vec![get(vec![("x-dummy0", Dummy), ("x-dummy0", Dummy)])],
         },
+        // a DATA frame follows a CONTINUATION frame of a block that has not
+        // ended
         Case {
             ids: &["http2/6.10/2"],
-            blocks: vec![post(vec![("x-dummy0", Dummy)])],
+            blocks: vec![Broken],
         },
         // a CONTINUATION frame after the block has ended
         Case {
             ids: &["http2/6.10/5"],
             blocks: vec![get(vec![("x-dummy0", Dummy)]), Broken],
         },
-        // a CONTINUATION frame on stream 0 at the end of the block
+        // a DATA frame comes between the HEADERS and the CONTINUATION frame of
+        // a block, followed by a CONTINUATION frame on stream 0
         Case {
             ids: &["http2/6.10/6"],
-            blocks: vec![post(vec![("x-dummy0", Dummy)]), Broken],
+            blocks: vec![Broken, Broken],
         },
         // the HEADERS frame is split after its 5th byte, in the middle of the
         // value of :authority

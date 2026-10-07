@@ -99,28 +99,43 @@ impl ParsedBlock {
 ///
 /// A CONTINUATION frame carries on the block of its stream if that block has
 /// not ended yet, and starts a block of its own otherwise.
+///
+/// A frame the parser reports with `-EPROTO`, of any type, breaks the blocks
+/// that have not ended yet on its connection, in its direction. A frame of
+/// another type is only reported if the parser failed on it.
 fn blocks(frames: &[Frame]) -> (Vec<ParsedBlock>, Vec<ParsedBlock>, Vec<String>) {
-    let mut requests = Vec::new();
-    let mut responses = Vec::new();
+    let mut requests: Vec<ParsedBlock> = Vec::new();
+    let mut responses: Vec<ParsedBlock> = Vec::new();
     let mut problems = Vec::new();
 
     // the blocks that have not ended yet, by connection, direction and stream
     let mut open: HashMap<(u16, bool, u32), usize> = HashMap::new();
 
     for frame in frames {
-        if frame.frame_type != HEADERS && frame.frame_type != CONTINUATION {
-            problems.push(format!(
-                "the parser failed on a frame of type {} on stream {}",
-                frame.frame_type, frame.sid
-            ));
-            continue;
-        }
-
         let blocks = if frame.upstream {
             &mut responses
         } else {
             &mut requests
         };
+
+        let breaks = frame.ret == -libc::EPROTO;
+        if breaks {
+            for (&(port, upstream, _), &idx) in &open {
+                if port == frame.client_port && upstream == frame.upstream {
+                    blocks[idx].error.get_or_insert(frame.ret);
+                }
+            }
+        }
+
+        if frame.frame_type != HEADERS && frame.frame_type != CONTINUATION {
+            if !breaks {
+                problems.push(format!(
+                    "the parser failed on a frame of type {} on stream {} ({})",
+                    frame.frame_type, frame.sid, frame.ret
+                ));
+            }
+            continue;
+        }
 
         let key = (frame.client_port, frame.upstream, frame.sid);
         let idx = match open.remove(&key) {
@@ -721,6 +736,35 @@ mod tests {
         );
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0].error, Some(-1));
+    }
+
+    #[test]
+    fn a_frame_that_breaks_a_block_breaks_the_open_ones() {
+        const DATA: u8 = 0x0;
+        let eproto = -libc::EPROTO;
+        let frames = [
+            frame(HEADERS, 0, 1, false, 10),
+            // the server's own block is not affected
+            frame(HEADERS, 0, 1, true, 10),
+            frame(DATA, 0, 1, false, eproto),
+            frame(CONTINUATION, END_HEADERS, 1, false, eproto),
+            frame(CONTINUATION, END_HEADERS, 1, true, 10),
+        ];
+
+        let (requests, responses, problems) = blocks(&frames);
+        assert!(problems.is_empty());
+        assert_eq!(
+            requests.iter().map(|b| b.error).collect::<Vec<_>>(),
+            vec![Some(eproto)]
+        );
+        assert_eq!(
+            responses.iter().map(|b| b.error).collect::<Vec<_>>(),
+            vec![None]
+        );
+
+        // any other failure is reported as is
+        let (_, _, problems) = blocks(&[frame(DATA, 0, 1, false, -1)]);
+        assert_eq!(problems.len(), 1);
     }
 
     #[test]
