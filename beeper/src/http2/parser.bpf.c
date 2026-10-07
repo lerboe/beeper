@@ -912,17 +912,25 @@ static __always_inline int _parse_hdr_from(const struct msg_ctx *ctx, u16 start,
     return i;
 }
 
-// Whether a frame of `type` sent on the stream `sid` breaks the run of frames of
-// a header block on `conn`.
-//
-// A header block has to be sent as one run of frames, a HEADERS frame followed
-// by CONTINUATION frames of the same stream, see sections 4.3 and 6.10 of RFC
-// 9113. While a block has not ended, every other frame breaks the run, of any
-// type and on any stream, extension frames included (section 5.5). So does a
-// CONTINUATION frame while no block is open. Either is a connection error,
+// Whether a frame of `type` sent on the stream `sid` of `conn` violates the rules
+// for the frames a header block is sent in. Each of them is a connection error,
 // which the parser reports as `-EPROTO`, without capturing anything of the
-// frame.
-static __always_inline bool _breaks_block(const struct ip4_conn *conn, u8 type, u32 sid) {
+// frame:
+//
+// * A header block is sent on a stream, so a HEADERS or a CONTINUATION frame on
+//   stream 0 is one, see sections 6.2 and 6.10 of RFC 9113.
+// * It has to be sent as one run of frames, a HEADERS frame followed by
+//   CONTINUATION frames of the same stream, see sections 4.3 and 6.10. While a
+//   block has not ended, every other frame breaks the run, of any type and on
+//   any stream, extension frames included (section 5.5). So does a
+//   CONTINUATION frame while no block is open.
+static __always_inline bool _violates_block_rules(const struct ip4_conn *conn, u8 type, u32 sid) {
+    bool is_hdr = (type == HTTP2_HEADERS_FRAME || type == HTTP2_CONTINUATION_FRAME);
+    if (is_hdr && sid == 0) {
+        bpf_debug("hdr: a frame of type %u on stream 0", type);
+        return true;
+    }
+
     struct continued_block *open = bpf_map_lookup_elem(&continued_blocks, conn);
     if (open == NULL) {
         if (type != HTTP2_CONTINUATION_FRAME) return false;
@@ -937,13 +945,13 @@ static __always_inline bool _breaks_block(const struct ip4_conn *conn, u8 type, 
     return true;
 }
 
-// Reports that the frame that starts the message breaks a header block, see
-// `_breaks_block`, and abandons the block it broke.
+// Reports that the frame that starts the message violates the rules for header
+// blocks, see `_violates_block_rules`, and abandons the block it broke, if any.
 //
 // A frame that has not arrived in full yet is reported as one that is longer
 // than the message, so that the caller waits for the rest of it, and the block
 // is only abandoned once it has.
-static __always_inline int _break_block(const struct ip4_conn *conn, u32 frame_len, u32 avail) {
+static __always_inline int _reject_frame(const struct ip4_conn *conn, u32 frame_len, u32 avail) {
     if (frame_len > avail) return -1;
 
     bpf_map_delete_elem(&continued_blocks, conn);
@@ -952,7 +960,7 @@ static __always_inline int _break_block(const struct ip4_conn *conn, u32 frame_l
 
 // Reads the header block of a HEADERS or a CONTINUATION frame sent on the
 // stream `sid`, which the caller has made sure does not break the block that is
-// open, see `_breaks_block`.
+// open, see `_violates_block_rules`.
 //
 // Returns the offset it stopped at, see `_parse_hdr_from`.
 static __always_inline int _parse_hdr_frame(const struct msg_ctx *ctx, u16 start, u16 end, u8 type, u8 flags, u32 sid, struct http_parse_res *pres, struct null_prefix *null_prefix) {
@@ -1070,8 +1078,8 @@ int parse_msg(struct sk_msg_md *msg, struct http_parse_res *pres __arg_nonnull, 
     bpf_debug("Parsing HTTP/2 message with length %d, type %d, flags %d", len, type, flags);
 
     struct msg_ctx ctx = _new_msg_ctx(msg);
-    if (_breaks_block(&ctx.conn, type, frame->sid)) {
-        return _break_block(&ctx.conn, frame_len, msg->size);
+    if (_violates_block_rules(&ctx.conn, type, frame->sid)) {
+        return _reject_frame(&ctx.conn, frame_len, msg->size);
     }
 
     if (!_is_parsed_frame(type, flags)) {
@@ -1121,8 +1129,8 @@ int parse_skb(struct __sk_buff *skb, u32 off, struct http_parse_res *pres __arg_
     bpf_debug("Parsing HTTP/2 sk_buff with length %d, type %d, flags %d", len, type, flags);
 
     struct msg_ctx ctx = _new_skb_ctx(skb);
-    if (_breaks_block(&ctx.conn, type, frame->sid)) {
-        return _break_block(&ctx.conn, frame_len, skb->len - off);
+    if (_violates_block_rules(&ctx.conn, type, frame->sid)) {
+        return _reject_frame(&ctx.conn, frame_len, skb->len - off);
     }
 
     if (!_is_parsed_frame(type, flags)) {

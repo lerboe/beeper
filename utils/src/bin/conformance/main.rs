@@ -22,7 +22,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use axum::{Router, http::HeaderMap, routing::get};
 use beeper::{MessageBuffer, http1, http2};
-use cases::{Block, Case, DUMMY_LEN, Value};
+use cases::{Block, Case, DUMMY_LEN, Expect, Value};
 use httlib_huffman as huffman;
 use std::{
     collections::{BTreeSet, HashMap},
@@ -316,7 +316,7 @@ impl CaseParser {
     /// the ones of the responses.
     fn attach(prog: &TestProgram, case: &Case) -> Result<Self> {
         let names: BTreeSet<&'static str> = case
-            .blocks
+            .blocks()
             .iter()
             .filter_map(Block::sent)
             .flatten()
@@ -467,39 +467,33 @@ fn describe_error(error: Option<i32>) -> String {
     }
 }
 
-/// Checks what the parser made of the case `case`, and describes what it got
-/// wrong.
-fn check(
+/// Checks the request blocks the parser saw, `parsed`, against the ones that
+/// were sent, and describes what it got wrong in `problems`.
+fn check_requests(
     parser: &CaseParser,
-    case: &Case,
-    frames: &[Frame],
+    sent: &[Block],
+    parsed: &[ParsedBlock],
     authority: &str,
-) -> (Vec<String>, String) {
-    let (requests, responses, mut problems) = blocks(frames);
-
-    if requests.len() != case.blocks.len() {
+    problems: &mut Vec<String>,
+) {
+    if parsed.len() != sent.len() {
         problems.push(format!(
             "parsed {} request blocks, h2spec sends {}",
-            requests.len(),
-            case.blocks.len()
+            parsed.len(),
+            sent.len()
         ));
     }
 
-    for (i, (parsed, sent)) in requests.iter().zip(&case.blocks).enumerate() {
+    for (i, (parsed, sent)) in parsed.iter().zip(sent).enumerate() {
         let what = format!("request block {i} (stream {})", parsed.sid);
         match (sent, parsed.error) {
-            (Block::Broken, Some(err)) if err == -libc::EPROTO => {}
             (Block::Malformed, Some(err)) if err != -libc::EPROTO => {}
-            (Block::Broken, _) => problems.push(format!(
-                "{what}: {}, expected -EPROTO as it breaks a header block",
-                describe_error(parsed.error)
-            )),
             (Block::Malformed, _) => problems.push(format!(
                 "{what}: {}, expected the parser to fail on it",
                 describe_error(parsed.error)
             )),
-            (Block::Fields(_), Some(err)) => {
-                problems.push(format!("{what}: the parser failed on it ({err})"))
+            (Block::Fields(_), Some(_)) => {
+                problems.push(format!("{what}: {}", describe_error(parsed.error)))
             }
             (Block::Fields(sent), None) => {
                 let fields = expected_fields(sent, authority);
@@ -512,9 +506,36 @@ fn check(
             }
         }
     }
+}
+
+/// Checks what the parser made of the case `case`, and describes what it got
+/// wrong.
+fn check(
+    parser: &CaseParser,
+    case: &Case,
+    frames: &[Frame],
+    authority: &str,
+) -> (Vec<String>, String) {
+    let (requests, responses, mut problems) = blocks(frames);
+
+    match &case.expect {
+        Expect::Violation => {
+            let rejected = frames
+                .iter()
+                .any(|frame| !frame.upstream && frame.ret == -libc::EPROTO);
+            if !rejected {
+                problems.push(
+                    "h2spec breaks the rules for header blocks, expected the parser to fail on \
+                     one of its frames with -EPROTO"
+                        .to_string(),
+                );
+            }
+        }
+        Expect::Blocks(sent) => check_requests(parser, sent, &requests, authority, &mut problems),
+    }
 
     let answers: Vec<Fields> = case
-        .blocks
+        .blocks()
         .iter()
         .filter_map(Block::sent)
         .filter_map(|block| response_fields(block, authority))
@@ -524,6 +545,11 @@ fn check(
         let what = format!("response block {i} (stream {})", parsed.sid);
         if let Some(err) = parsed.error {
             problems.push(format!("{what}: the parser failed on it ({err})"));
+            continue;
+        }
+
+        // the requests of a violation are not known, and with them the answers
+        if matches!(case.expect, Expect::Violation) {
             continue;
         }
 

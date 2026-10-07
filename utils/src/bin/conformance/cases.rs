@@ -41,16 +41,9 @@ pub enum Block {
     /// A block the parser is expected to fail on, as it is malformed, e.g. one
     /// that refers to an index no table has.
     Malformed,
-
-    /// A block whose frames do not follow the rules of sections 4.3 and 6.10
-    /// of RFC 9113, e.g. a CONTINUATION frame that does not carry on the block
-    /// of its stream. Such a frame is a connection error, none of the fields it
-    /// carries belong to a request, and the parser is expected to fail on it
-    /// with `-EPROTO`.
-    Broken,
 }
 
-pub use Block::{Broken, Malformed};
+pub use Block::Malformed;
 
 impl Block {
     /// The fields the block carries, if it is not one the parser is expected
@@ -58,15 +51,44 @@ impl Block {
     pub fn sent(&self) -> Option<&[Field]> {
         match self {
             Block::Fields(fields) => Some(fields),
-            Block::Malformed | Block::Broken => None,
+            Block::Malformed => None,
         }
     }
 }
 
-/// The header blocks the cases `ids` send.
+/// What the cases `ids` send.
 pub struct Case {
     pub ids: &'static [&'static str],
-    pub blocks: Vec<Block>,
+    pub expect: Expect,
+}
+
+/// What a case sends, and with it what the parser is expected to make of it.
+pub enum Expect {
+    /// These header blocks, in order.
+    Blocks(Vec<Block>),
+
+    /// Frames that violate the rules for the frames a header block is sent in,
+    /// e.g. a CONTINUATION frame that does not carry on the block of its
+    /// stream, see `EPROTO` in beeper/http2.h. Such a frame is a connection
+    /// error, and the parser is expected to fail on at least one of them with
+    /// `-EPROTO`.
+    ///
+    /// The peer may close the connection as soon as it sees the first one, so
+    /// what else h2spec gets to send, and the parser to see, hinges on timing.
+    /// None of it is checked.
+    Violation,
+}
+
+pub use Expect::{Blocks, Violation};
+
+impl Case {
+    /// The header blocks the case sends, none for a violation.
+    pub fn blocks(&self) -> &[Block] {
+        match &self.expect {
+            Blocks(blocks) => blocks,
+            Violation => &[],
+        }
+    }
 }
 
 /// The value h2spec pads its header blocks with, see [`Value::Dummy`].
@@ -104,6 +126,41 @@ fn fields(fields: Vec<Field>) -> Block {
 /// Returns every case h2spec runs.
 pub fn cases() -> Vec<Case> {
     vec![
+        Case {
+            ids: &[
+                // a PRIORITY frame comes between the HEADERS and the
+                // CONTINUATION frame of a block
+                "http2/4.3/2",
+                "http2/6.2/1",
+                // the HEADERS frame of another stream comes between the HEADERS
+                // and the CONTINUATION frame of a block
+                "http2/4.3/3",
+                "http2/6.2/2",
+                // a CONTINUATION frame on a stream that is idle
+                "http2/5.1/4",
+                // a CONTINUATION frame on a stream whose block has ended
+                "http2/5.1/7",
+                "http2/5.1/10",
+                "http2/5.1/13",
+                "http2/6.10/4",
+                "http2/6.10/5",
+                // an unknown extension frame follows the HEADERS frame of a
+                // block that has not ended
+                "http2/5.5/2",
+                // a HEADERS frame on stream 0
+                "http2/6.2/3",
+                // a DATA frame follows a CONTINUATION frame of a block that
+                // has not ended
+                "http2/6.10/2",
+                // a CONTINUATION frame on stream 0 comes between the HEADERS
+                // and the CONTINUATION frame of a block
+                "http2/6.10/3",
+                // a DATA frame comes between the HEADERS and the CONTINUATION
+                // frame of a block
+                "http2/6.10/6",
+            ],
+            expect: Violation,
+        },
         Case {
             ids: &[
                 "generic/1/1",
@@ -148,7 +205,7 @@ pub fn cases() -> Vec<Case> {
                 "http2/7/1",
                 "http2/8.2/1",
             ],
-            blocks: vec![],
+            expect: Blocks(vec![]),
         },
         Case {
             ids: &[
@@ -174,7 +231,6 @@ pub fn cases() -> Vec<Case> {
                 "http2/5.1/11",
                 "http2/5.1.1/1",
                 "http2/5.3.1/1",
-                "http2/6.2/3",
                 "http2/6.3/2",
                 "http2/6.4/3",
                 "http2/6.9/2",
@@ -184,7 +240,7 @@ pub fn cases() -> Vec<Case> {
                 "hpack/4.2/1",
                 "hpack/6.3/1",
             ],
-            blocks: vec![get(vec![])],
+            expect: Blocks(vec![get(vec![])]),
         },
         Case {
             ids: &[
@@ -197,22 +253,22 @@ pub fn cases() -> Vec<Case> {
                 "http2/6.1/2",
                 "http2/7/2",
             ],
-            blocks: vec![post(vec![])],
+            expect: Blocks(vec![post(vec![])]),
         },
         Case {
             ids: &["generic/4/2"],
-            blocks: vec![head(vec![])],
+            expect: Blocks(vec![head(vec![])]),
         },
         Case {
             ids: &["generic/4/4"],
-            blocks: vec![
+            expect: Blocks(vec![
                 post(vec![("trailer", Str("x-test"))]),
                 fields(vec![("x-test", Str("ok"))]),
-            ],
+            ]),
         },
         Case {
             ids: &["generic/5/1"],
-            blocks: vec![get(vec![("user-agent", Str(""))])],
+            expect: Blocks(vec![get(vec![("user-agent", Str(""))])]),
         },
         Case {
             ids: &[
@@ -223,7 +279,7 @@ pub fn cases() -> Vec<Case> {
                 "generic/5/10",
                 "generic/5/11",
             ],
-            blocks: vec![get(vec![("user-agent", Str("h2spec"))])],
+            expect: Blocks(vec![get(vec![("user-agent", Str("h2spec"))])]),
         },
         Case {
             ids: &[
@@ -234,34 +290,21 @@ pub fn cases() -> Vec<Case> {
                 "generic/5/12",
                 "generic/5/13",
             ],
-            blocks: vec![get(vec![("x-test", Str("h2spec"))])],
+            expect: Blocks(vec![get(vec![("x-test", Str("h2spec"))])]),
         },
         Case {
             ids: &["http2/4.2/3"],
-            blocks: vec![get(vec![
+            expect: Blocks(vec![get(vec![
                 ("x-dummy0", Dummy),
                 ("x-dummy1", Dummy),
                 ("x-dummy2", Dummy),
                 ("x-dummy3", Dummy),
                 ("x-dummy4", Dummy),
-            ])],
+            ])]),
         },
         Case {
             ids: &["http2/4.3/1"],
-            blocks: vec![fields(vec![])],
-        },
-        // a PRIORITY frame comes between the HEADERS and the CONTINUATION frame
-        // of a block, and an unknown extension frame follows the HEADERS frame
-        // of one that has not ended
-        Case {
-            ids: &["http2/4.3/2", "http2/5.5/2", "http2/6.2/1"],
-            blocks: vec![Broken],
-        },
-        // the HEADERS frame of another stream comes between the HEADERS and
-        // the CONTINUATION frame of the first, which breaks both blocks
-        Case {
-            ids: &["http2/4.3/3", "http2/6.2/2"],
-            blocks: vec![Broken, Broken],
+            expect: Blocks(vec![fields(vec![])]),
         },
         Case {
             ids: &[
@@ -276,170 +319,138 @@ pub fn cases() -> Vec<Case> {
                 "http2/6.9.2/1",
                 "http2/6.9.2/2",
             ],
-            blocks: vec![get(vec![]), get(vec![])],
-        },
-        // a CONTINUATION frame on stream 0 comes between the HEADERS and the
-        // CONTINUATION frame of the block of stream 1
-        Case {
-            ids: &["http2/6.10/3"],
-            blocks: vec![Broken, Broken],
+            expect: Blocks(vec![get(vec![]), get(vec![])]),
         },
         Case {
             ids: &["http2/5.1.2/1"],
-            blocks: vec![get(vec![]); 201],
+            expect: Blocks(vec![get(vec![]); 201]),
         },
         Case {
             ids: &["http2/6.1/3"],
-            blocks: vec![post(vec![("content-length", Str("4"))])],
+            expect: Blocks(vec![post(vec![("content-length", Str("4"))])]),
         },
         Case {
             ids: &["http2/6.2/4", "hpack/6.1/1"],
-            blocks: vec![Malformed],
+            expect: Blocks(vec![Malformed]),
         },
         Case {
             ids: &["http2/6.10/1"],
-            blocks: vec![get(vec![("x-dummy0", Dummy), ("x-dummy0", Dummy)])],
-        },
-        // a DATA frame follows a CONTINUATION frame of a block that has not
-        // ended
-        Case {
-            ids: &["http2/6.10/2"],
-            blocks: vec![Broken],
-        },
-        // a CONTINUATION frame after the block has ended
-        Case {
-            ids: &["http2/6.10/5"],
-            blocks: vec![get(vec![("x-dummy0", Dummy)]), Broken],
-        },
-        // a DATA frame comes between the HEADERS and the CONTINUATION frame of
-        // a block, followed by a CONTINUATION frame on stream 0
-        Case {
-            ids: &["http2/6.10/6"],
-            blocks: vec![Broken, Broken],
+            expect: Blocks(vec![get(vec![("x-dummy0", Dummy), ("x-dummy0", Dummy)])]),
         },
         // the HEADERS frame is split after its 5th byte, in the middle of the
         // value of :authority
         Case {
             ids: &["generic/3.10/1", "generic/3.10/2"],
-            blocks: vec![fields(vec![
+            expect: Blocks(vec![fields(vec![
                 (":method", Str("GET")),
                 (":scheme", Str("http")),
                 (":path", Str("/")),
                 (":authority", Split(Box::new(Authority))),
-            ])],
-        },
-        // a CONTINUATION frame on a stream that is idle
-        Case {
-            ids: &["http2/5.1/4"],
-            blocks: vec![Broken],
-        },
-        // a CONTINUATION frame on a stream whose block has ended
-        Case {
-            ids: &[
-                "http2/5.1/7",
-                "http2/5.1/10",
-                "http2/5.1/13",
-                "http2/6.10/4",
-            ],
-            blocks: vec![get(vec![]), Broken],
+            ])]),
         },
         Case {
             ids: &["http2/8.1/1"],
-            blocks: vec![post(vec![]), fields(vec![("x-test", Str("ok"))])],
+            expect: Blocks(vec![post(vec![]), fields(vec![("x-test", Str("ok"))])]),
         },
         Case {
             ids: &["http2/8.1.2/1"],
-            blocks: vec![get(vec![("X-TEST", Str("ok"))])],
+            expect: Blocks(vec![get(vec![("X-TEST", Str("ok"))])]),
         },
         Case {
             ids: &["http2/8.1.2.1/1"],
-            blocks: vec![get(vec![(":test", Str("ok"))])],
+            expect: Blocks(vec![get(vec![(":test", Str("ok"))])]),
         },
         Case {
             ids: &["http2/8.1.2.1/2"],
-            blocks: vec![get(vec![(":status", Str("200"))])],
+            expect: Blocks(vec![get(vec![(":status", Str("200"))])]),
         },
         Case {
             ids: &["http2/8.1.2.1/3"],
-            blocks: vec![post(vec![]), fields(vec![(":method", Str("POST"))])],
+            expect: Blocks(vec![post(vec![]), fields(vec![(":method", Str("POST"))])]),
         },
         Case {
             ids: &["http2/8.1.2.1/4"],
-            blocks: vec![fields(vec![
+            expect: Blocks(vec![fields(vec![
                 ("x-test", Str("ok")),
                 (":method", Str("GET")),
                 (":scheme", Str("http")),
                 (":path", Str("/")),
                 (":authority", Authority),
-            ])],
+            ])]),
         },
         Case {
             ids: &["http2/8.1.2.2/1"],
-            blocks: vec![get(vec![("connection", Str("keep-alive"))])],
+            expect: Blocks(vec![get(vec![("connection", Str("keep-alive"))])]),
         },
         Case {
             ids: &["http2/8.1.2.2/2"],
-            blocks: vec![get(vec![
+            expect: Blocks(vec![get(vec![
                 ("trailers", Str("test")),
                 ("te", Str("trailers, deflate")),
-            ])],
+            ])]),
         },
         Case {
             ids: &["http2/8.1.2.3/1"],
-            blocks: vec![fields(vec![
+            expect: Blocks(vec![fields(vec![
                 (":method", Str("GET")),
                 (":scheme", Str("http")),
                 (":path", Str("")),
                 (":authority", Authority),
-            ])],
+            ])]),
         },
         Case {
             ids: &["http2/8.1.2.3/2"],
-            blocks: vec![fields(vec![(":path", Str("/")), (":authority", Authority)])],
+            expect: Blocks(vec![fields(vec![
+                (":path", Str("/")),
+                (":authority", Authority),
+            ])]),
         },
         Case {
             ids: &["http2/8.1.2.3/3"],
-            blocks: vec![fields(vec![
+            expect: Blocks(vec![fields(vec![
                 (":method", Str("GET")),
                 (":path", Str("/")),
                 (":authority", Authority),
-            ])],
+            ])]),
         },
         Case {
             ids: &["http2/8.1.2.3/4"],
-            blocks: vec![fields(vec![
+            expect: Blocks(vec![fields(vec![
                 (":method", Str("GET")),
                 (":scheme", Str("http")),
                 (":authority", Authority),
-            ])],
+            ])]),
         },
         Case {
             ids: &["http2/8.1.2.3/5"],
-            blocks: vec![get(vec![(":method", Str("GET"))])],
+            expect: Blocks(vec![get(vec![(":method", Str("GET"))])]),
         },
         Case {
             ids: &["http2/8.1.2.3/6"],
-            blocks: vec![get(vec![(":scheme", Str("http"))])],
+            expect: Blocks(vec![get(vec![(":scheme", Str("http"))])]),
         },
         Case {
             ids: &["http2/8.1.2.3/7"],
-            blocks: vec![get(vec![(":path", Str("/"))])],
+            expect: Blocks(vec![get(vec![(":path", Str("/"))])]),
         },
         Case {
             ids: &["http2/8.1.2.6/1", "http2/8.1.2.6/2"],
-            blocks: vec![post(vec![("content-length", Str("1"))])],
+            expect: Blocks(vec![post(vec![("content-length", Str("1"))])]),
         },
         Case {
             ids: &["hpack/5.2/1"],
-            blocks: vec![get(vec![("x-test", Raw(b"\x49\x50\x9f\xff"))])],
+            expect: Blocks(vec![get(vec![("x-test", Raw(b"\x49\x50\x9f\xff"))])]),
         },
         Case {
             ids: &["hpack/5.2/2"],
-            blocks: vec![get(vec![("x-test", Raw(b"\x49\x50\x90"))])],
+            expect: Blocks(vec![get(vec![("x-test", Raw(b"\x49\x50\x90"))])]),
         },
         Case {
             ids: &["hpack/5.2/3"],
-            blocks: vec![get(vec![("x-test", Raw(b"\x49\x51\xff\xff\xff\xfa\x7f"))])],
+            expect: Blocks(vec![get(vec![(
+                "x-test",
+                Raw(b"\x49\x51\xff\xff\xff\xfa\x7f"),
+            )])]),
         },
     ]
 }
