@@ -6,7 +6,7 @@ use tokio::{
 };
 use utils::{
     server,
-    test::{DnsMsg, DnsRr, Hook, TestProgram},
+    test::{DnsMsg, Hook, TestProgram},
 };
 use xbpf::OpenObject;
 
@@ -174,20 +174,26 @@ async fn parse_a_response(hook: Hook) {
     assert_eq!(res.rcode, 16);
     assert_eq!(res.edns_udp_size, 1232);
 
-    let rr = |owner: &str, rtype, class, ttl, rdlen, section| DnsRr {
-        owner: owner.to_string(),
-        rtype,
-        class,
-        ttl,
-        rdlen,
-        section,
-    };
+    let rrs: Vec<_> = res
+        .rrs
+        .iter()
+        .map(|rr| {
+            (
+                rr.owner.as_str(),
+                rr.rtype,
+                rr.class,
+                rr.ttl,
+                rr.rdlen,
+                rr.section,
+            )
+        })
+        .collect();
     assert_eq!(
-        res.rrs,
-        vec![
-            rr("www.example.com", TYPE_CNAME, CLASS_IN, 300, 6, 1),
-            rr("web.example.com", TYPE_A, CLASS_IN, 60, 4, 1),
-            rr(".", TYPE_OPT, 1232, 1 << 24, 0, 3),
+        rrs,
+        [
+            ("www.example.com", TYPE_CNAME, CLASS_IN, 300, 6, 1),
+            ("web.example.com", TYPE_A, CLASS_IN, 60, 4, 1),
+            (".", TYPE_OPT, 1232, 1 << 24, 0, 3),
         ]
     );
 }

@@ -232,14 +232,27 @@ impl<'obj> TestProgram<'obj> {
         DnsMsg {
             ret: bss.dns_ret,
             num_msgs: bss.dns_num_msgs,
+            base: res.base,
             len: res.len,
             id: res.hdr.id,
             flags: res.hdr.flags,
+            counts: [
+                res.hdr.qdcount,
+                res.hdr.ancount,
+                res.hdr.nscount,
+                res.hdr.arcount,
+            ],
             rcode: res.rcode,
             res_flags: res.flags,
             qname: (bss.dns_qname_ret >= 0 && res.hdr.qdcount > 0).then(|| name(&bss.dns_qname)),
             qtype: res.q.qtype,
+            qclass: res.q.qclass,
             edns_udp_size: res.edns.udp_size,
+            edns_version: res.edns.version,
+            edns_ext_rcode: res.edns.ext_rcode,
+            edns_flags: res.edns.flags,
+            edns_rdlen: res.edns.rdlen,
+            tsig_off: res.tsig_off,
             rrs: (0..bss.dns_num_rrs as usize)
                 .map(|i| {
                     let rr = &bss.dns_rrs[i];
@@ -249,6 +262,7 @@ impl<'obj> TestProgram<'obj> {
                         class: rr.class,
                         ttl: rr.ttl,
                         rdlen: rr.rdlen,
+                        rdata_off: rr.rdata_off,
                         section: rr.section,
                     }
                 })
@@ -272,16 +286,27 @@ pub struct DnsMsg {
     pub ret: i32,
     /// The number of messages that were parsed so far.
     pub num_msgs: u32,
+    /// The offset of the header in the buffer the parser parsed.
+    pub base: u16,
     pub len: u16,
     pub id: u16,
     pub flags: u16,
+    /// QDCOUNT, ANCOUNT, NSCOUNT and ARCOUNT.
+    pub counts: [u16; 4],
     pub rcode: u16,
     /// The `DNS_RES_*` flags.
     pub res_flags: u16,
     /// The question name, dotted and lowercased.
     pub qname: Option<String>,
     pub qtype: u16,
+    pub qclass: u16,
     pub edns_udp_size: u16,
+    pub edns_version: u8,
+    pub edns_ext_rcode: u8,
+    pub edns_flags: u16,
+    pub edns_rdlen: u16,
+    /// The offset of the TSIG record in the buffer, if there is one.
+    pub tsig_off: u16,
     /// The first records of the message.
     pub rrs: Vec<DnsRr>,
 }
@@ -295,5 +320,7 @@ pub struct DnsRr {
     pub class: u16,
     pub ttl: u32,
     pub rdlen: u16,
+    /// The offset of the RDATA in the buffer the parser parsed.
+    pub rdata_off: u16,
     pub section: u8,
 }
