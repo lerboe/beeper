@@ -1,47 +1,8 @@
 #include "beeper/beeper.h"
 
-// The DNS specific part of the interface between a BPF program and the parser
-// beeper attaches to it.
-//
-// The parser implements the message format of RFC 1035 along with the updates
-// that change how a message is laid out or which messages are well-formed:
-//
-// - RFC 2181:  labels and names are limited to 63 and 255 octets, labels may
-//              hold any octet value.
-// - RFC 2136:  UPDATE (opcode 5) reuses the four sections as zone,
-//              prerequisite, update and additional, allows the classes NONE
-//              and ANY and empty RDATA, and requires exactly one zone.
-// - RFC 1996:  NOTIFY (opcode 4).
-// - RFC 2535, RFC 4035:  the AD and CD bits of the header.
-// - RFC 2673, RFC 6891:  extended label types (the `01` label prefix) are not
-//              in use, a name carrying one is malformed, as is one carrying
-//              the reserved `10` prefix.
-// - RFC 2845, RFC 8945:  a TSIG record may only appear once, as the last
-//              record of the additional section.
-// - RFC 3425:  IQUERY (opcode 1) is obsolete. Such messages are still parsed,
-//              it is up to the program to answer them with NOTIMP.
-// - RFC 4343:  names compare case-insensitively, for ASCII letters only, see
-//              `DNS_NAME_LOWER`.
-// - RFC 5966, RFC 7766:  over TCP every message is preceded by its two octet
-//              length, and a stream may carry many of them back to back.
-// - RFC 6891:  the OPT pseudo-RR (EDNS(0)), its extended RCODE, version, flags
-//              and options. It may only appear once, in the additional section,
-//              and only with the root as its owner.
-// - RFC 8490:  DSO (opcode 6) messages carry no sections, all four counts are
-//              zero and TLVs follow the header instead.
-// - RFC 8767:  the TTL is an unsigned 32 bit value, a set high-order bit no
-//              longer means zero. `DNS_TTL_CAP` is the recommended cap.
-// - RFC 9619:  a QUERY (opcode 0) holds at most one question.
-//
-// RFC 1101, 1183, 1348, 1876, 2065, 2137, 3658, 4033 and 4034 only add RR
-// types, whose RDATA is passed on as is. RFC 1982, 1995, 2308, 5936, 6604 and
-// 8482 change how messages are interpreted or produced, not how they are laid
-// out.
-
 #ifndef __BEEPER_DNS_H__
 #define __BEEPER_DNS_H__
 
-// The bits of `dns_header.flags`, RFC 1035 4.1.1, RFC 4035 3.2.
 #define DNS_FLAG_QR (1 << 15)
 #define DNS_FLAG_AA (1 << 10)
 #define DNS_FLAG_TC (1 << 9)
@@ -53,30 +14,27 @@
 #define DNS_OPCODE(flags) (((flags) >> 11) & 0xF)
 #define DNS_HDR_RCODE(flags) ((flags) & 0xF)
 
-// Opcodes.
 #define DNS_OPCODE_QUERY 0
 #define DNS_OPCODE_IQUERY 1 // obsolete, RFC 3425
 #define DNS_OPCODE_STATUS 2
-#define DNS_OPCODE_NOTIFY 4 // RFC 1996
-#define DNS_OPCODE_UPDATE 5 // RFC 2136
-#define DNS_OPCODE_DSO 6    // RFC 8490
+#define DNS_OPCODE_NOTIFY 4
+#define DNS_OPCODE_UPDATE 5
+#define DNS_OPCODE_DSO 6
 
-// Response codes. The ones above 15 need EDNS(0) to be expressed.
 #define DNS_RCODE_NOERROR 0
 #define DNS_RCODE_FORMERR 1
 #define DNS_RCODE_SERVFAIL 2
 #define DNS_RCODE_NXDOMAIN 3
 #define DNS_RCODE_NOTIMP 4
 #define DNS_RCODE_REFUSED 5
-#define DNS_RCODE_YXDOMAIN 6 // RFC 2136
-#define DNS_RCODE_YXRRSET 7  // RFC 2136
-#define DNS_RCODE_NXRRSET 8  // RFC 2136
-#define DNS_RCODE_NOTAUTH 9  // RFC 2136
-#define DNS_RCODE_NOTZONE 10 // RFC 2136
-#define DNS_RCODE_DSOTYPENI 11 // RFC 8490
-#define DNS_RCODE_BADVERS 16 // RFC 6891
+#define DNS_RCODE_YXDOMAIN 6
+#define DNS_RCODE_YXRRSET 7
+#define DNS_RCODE_NXRRSET 8
+#define DNS_RCODE_NOTAUTH 9
+#define DNS_RCODE_NOTZONE 10
+#define DNS_RCODE_DSOTYPENI 11
+#define DNS_RCODE_BADVERS 16
 
-// Record types.
 #define DNS_TYPE_A 1
 #define DNS_TYPE_NS 2
 #define DNS_TYPE_MD 3
@@ -94,32 +52,27 @@
 #define DNS_TYPE_MX 15
 #define DNS_TYPE_TXT 16
 #define DNS_TYPE_AAAA 28
-#define DNS_TYPE_OPT 41   // RFC 6891
-#define DNS_TYPE_TSIG 250 // RFC 8945
-#define DNS_TYPE_IXFR 251 // RFC 1995
-#define DNS_TYPE_AXFR 252 // RFC 5936
+#define DNS_TYPE_OPT 41
+#define DNS_TYPE_TSIG 250
+#define DNS_TYPE_IXFR 251
+#define DNS_TYPE_AXFR 252
 #define DNS_TYPE_ANY 255
 
-// Classes.
 #define DNS_CLASS_IN 1
 #define DNS_CLASS_CH 3
 #define DNS_CLASS_HS 4
-#define DNS_CLASS_NONE 254 // RFC 2136
+#define DNS_CLASS_NONE 254
 #define DNS_CLASS_ANY 255
 
-// The sections of a message. UPDATE calls them zone, prerequisite, update and
-// additional.
 #define DNS_SECTION_QUESTION 0
 #define DNS_SECTION_ANSWER 1
 #define DNS_SECTION_AUTHORITY 2
 #define DNS_SECTION_ADDITIONAL 3
 
-// Limits, RFC 1035 2.3.4, RFC 2181 11.
 #define DNS_MAX_LABEL 63
 #define DNS_MAX_NAME 255
 #define DNS_HDR_LEN 12
 
-// The cap RFC 8767 recommends for a TTL, in seconds.
 #define DNS_TTL_CAP 604800
 
 // The smallest UDP payload size EDNS(0) may advertise, RFC 6891 6.2.5. Smaller
