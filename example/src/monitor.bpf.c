@@ -163,13 +163,15 @@ int msg_verdict(struct sk_msg_md *msg) {
         struct http2_frame frame = { 0 };
         msg_len = parse_http2(msg, &pres, &frame);
 
-        // a frame written in pieces is parsed once all of it has arrived, the
-        // 9 bytes being the frame header
-        u32 frame_len = 9 + frame.len;
-        if (msg_len == 0 || (msg_len < 0 && frame_len > msg->size)) {
-            bpf_msg_cork_bytes(msg, msg_len == 0 ? 9 : frame_len);
+        // a frame written in pieces is parsed once all of it has arrived, and
+        // a header block once all of the frames it is sent in have, the 9
+        // bytes being the frame header
+        if (msg_len == 0 || msg_len == -EAGAIN) {
+            bpf_msg_cork_bytes(msg, msg_len == 0 ? 9 : frame.need);
             return SK_PASS;
         }
+
+        u32 frame_len = 9 + frame.len;
 
         // a frame that breaks the rules for header blocks is a connection
         // error, which the peer is to answer by closing the connection. The

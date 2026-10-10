@@ -385,11 +385,9 @@ impl Parser {
 
         let dynamic_table_info = MapHandle::try_from(&skel.maps.dynamic_table_info)?;
         let dynamic_table = MapHandle::try_from(&skel.maps.dynamic_table)?;
-        let continued_blocks = MapHandle::try_from(&skel.maps.continued_blocks)?;
         Ok(AttachedParser {
             dynamic_table_info,
             dynamic_table,
-            continued_blocks,
             links,
         })
     }
@@ -463,9 +461,6 @@ pub struct AttachedParser {
     /// The entries of those dynamic tables.
     dynamic_table: MapHandle,
 
-    /// The header blocks that carry on into a CONTINUATION frame.
-    continued_blocks: MapHandle,
-
     #[allow(dead_code)]
     links: Vec<Link>,
 }
@@ -491,9 +486,9 @@ pub struct DynamicTableInfo {
     /// Whether the table has drifted from the peer's and can no longer be
     /// trusted.
     ///
-    /// It drifts when a header block is split over a HEADERS frame and the
-    /// CONTINUATION frames following it in the middle of a field (see [Section
-    /// 6.10 of RFC 9113](https://datatracker.ietf.org/doc/html/rfc7541#section-6.10).
+    /// It drifts when a Huffman coded field that is added to the table is longer
+    /// than an entry keeps, as its size can then no longer be counted the way
+    /// the peer counts it.
     pub dirty: u32,
 }
 
@@ -605,8 +600,6 @@ impl AttachedParser {
 
             delete_if_present(&self.dynamic_table_info, key)?;
         }
-
-        delete_if_present(&self.continued_blocks, key)?;
 
         Ok(())
     }

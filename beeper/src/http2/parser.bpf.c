@@ -74,6 +74,29 @@ struct {
     __type(value, struct dynamic_table_entry);
 } dynamic_table_entry SEC(".maps");
 
+// The number of bytes of `block_buf` a header block can be put together in.
+// The largest value a per-CPU map holds is 32KiB, and a copy into the buffer
+// may be up to as long as a block to any offset below that length, which is
+// all the verifier knows of it, so a block takes up at most half of it.
+#define BLOCK_BUF_SIZE (32768 - sizeof(u32))
+#define BLOCK_MAXLEN (BLOCK_BUF_SIZE / 2)
+
+// A header block that is sent in more than one frame, put together from the
+// fragments its frames carry, see `_collect_block`.
+struct block_buf {
+    u32 len;
+    u8 data[BLOCK_BUF_SIZE];
+};
+
+// The header block the parser read last on the CPU, which the matches with the
+// source `HTTP_SRC_BUF` it captured point into.
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, struct block_buf);
+} block_bufs SEC(".maps");
+
 // The state of the dynamic table of a connection. `deleted` counts the entries
 // that were evicted, which is what turns an HPACK index, counted from the most
 // recently added entry, into the index an entry is stored under.
@@ -355,14 +378,30 @@ static __always_inline bool _is_valid_hpack_index(const struct dynamic_table_inf
     return idx > 0 && idx <= STATIC_TABLE_SIZE + dt_info->count;
 }
 
-// Resolves the match `m` into the bytes it refers to, either in the message
-// itself or, if the peer only referenced the field by index, in the static or
-// the dynamic table. `is_key` selects the name of a table entry over its value.
-// `*out` is left untouched if the match cannot be resolved.
+// Resolves the match `m` into the bytes it refers to: in the message itself, in
+// the header block the parser put together last, or, if the peer only
+// referenced the field by index, in the static or the dynamic table. `is_key`
+// selects the name of a table entry over its value. `*out` is left untouched
+// if the match cannot be resolved.
 static __always_inline void _extract_match(const struct msg_ctx *ctx, const struct http_match *m, bool is_key, u8 **out, u32 *len, bool *huff) {
-    if (m->in_msg) {
+    if (m->source == HTTP_SRC_MSG) {
         if (ctx->data + m->idx + m->len > ctx->data_end) return;
         *out = ctx->data + m->idx;
+        *len = m->len;
+        if (huff) *huff = m->huff;
+        return;
+    }
+
+    if (m->source == HTTP_SRC_BUF) {
+        u32 zero = 0;
+        struct block_buf *buf = bpf_map_lookup_elem(&block_bufs, &zero);
+        if (buf == NULL) return;
+
+        u32 idx = m->idx;
+        if (idx + m->len > buf->len) return;
+        bpf_clamp_uminmax(idx, 0, BLOCK_MAXLEN);
+
+        *out = buf->data + idx;
         *len = m->len;
         if (huff) *huff = m->huff;
         return;
@@ -586,8 +625,8 @@ static __always_inline int _add_dynamic_table_entry(const struct msg_ctx *ctx __
     dt_info->count += 1;
 
     bpf_debug("dt: add with index %d, key size: %d, val size: %d, new total size %d", dt_key.idx, key_len_decoded, val_len_decoded, dt_info->size);
-    bpf_debug("dt: add key { %d %d %d }", key->idx, key->len, key->in_msg);
-    bpf_debug("dt: add val { %d %d %d }", val->idx, val->len, val->in_msg);
+    bpf_debug("dt: add key { %d %d %d }", key->idx, key->len, key->source);
+    bpf_debug("dt: add val { %d %d %d }", val->idx, val->len, val->source);
 
     return 0;
 }
@@ -675,26 +714,15 @@ struct http2_parse_state {
     u32 v;
     u8 kind;
     u8 flags;
+
+    // where the block is read from, the message or `block_bufs`, as an
+    // `enum http_match_source`
+    u8 src;
 };
 
-// A header block that carries on into a CONTINUATION frame: the stream it is
-// sent on, and the state it is read on with.
-struct continued_block {
-    u32 sid;
-    struct http2_parse_state ps;
-};
-
-// The header block of each connection that has not ended yet. A connection has
-// at most one, see section 4.3 of RFC 9113.
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 16384);
-    __type(key, struct ip4_conn);
-    __type(value, struct continued_block);
-} continued_blocks SEC(".maps");
-
-// Returns the state a header block is read from its first byte with.
-static __always_inline struct http2_parse_state _new_http2_parse_state(void) {
+// Returns the state a header block is read from its first byte with, out of
+// `src`, see `http2_parse_state`.
+static __always_inline struct http2_parse_state _new_http2_parse_state(u8 src) {
     return (struct http2_parse_state) {
         .s = S_FIELD,
         .k = 0,
@@ -706,13 +734,14 @@ static __always_inline struct http2_parse_state _new_http2_parse_state(void) {
         .key = {
             .idx = 0,
             .len = 0,
-            .in_msg = true,
+            .source = src,
             .huff = false,
         },
         .i = 0,
         .v = 0,
         .kind = HTTP2A_NONE,
         .flags = 0,
+        .src = src,
     };
 }
 
@@ -747,7 +776,7 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
         ps->key = (struct http_match) {
             .idx = slot,
             .len = 0,
-            .in_msg = false,
+            .source = HTTP_SRC_TABLE,
             .huff = false,
         };
 
@@ -771,7 +800,7 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
         pres->ms[mid & MAX_MATCH_MASK] = (struct http_match) {
             .idx = slot,
             .len = HEADER_FIELD_MASK,
-            .in_msg = false,
+            .source = HTTP_SRC_TABLE,
             .huff = false,
         };
 
@@ -788,7 +817,7 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
         ps->key = (struct http_match) {
             .idx = ps->i + 1,
             .len = v,
-            .in_msg = true,
+            .source = ps->src,
             .huff = (ps->flags & HTTP2F_HUFF) != 0,
         };
 
@@ -803,7 +832,7 @@ __noinline __weak int _run_action(const struct msg_ctx *ctx __arg_nonnull, struc
         struct http_match val = (struct http_match) {
             .idx = ps->i + 1,
             .len = v,
-            .in_msg = true,
+            .source = ps->src,
             .huff = (ps->flags & HTTP2F_HUFF) != 0,
         };
 
@@ -931,92 +960,206 @@ static __always_inline int _parse_hdr_from(const struct msg_ctx *ctx, u16 start,
     return i;
 }
 
-// Returns 1 if a frame of `type` sent on the stream `sid` of `conn` violates the
-// rules for the frames a header block is sent in, 0 otherwise. Each violation is
-// a connection error, which the parser reports as `-EPROTO`:
+// Returns 1 if a frame of `type` sent on the stream `sid`, at the start of a
+// message, violates the rules for the frames a header block is sent in, 0
+// otherwise. Each violation is a connection error, which the parser reports as
+// `-EPROTO`:
 //
 // * A header block is sent on a stream, so a HEADERS or a CONTINUATION frame on
 //   stream 0 is one, see sections 6.2 and 6.10 of RFC 9113.
 // * It has to be sent as one run of frames, a HEADERS frame followed by
-//   CONTINUATION frames of the same stream, see sections 4.3 and 6.10. While a
-//   block has not ended, every other frame breaks the run, of any type and on
-//   any stream, extension frames included (section 5.5). So does a
-//   CONTINUATION frame while no block is open.
+//   CONTINUATION frames of the same stream, see sections 4.3 and 6.10. The
+//   parser reads a block from its HEADERS frame to the frame that ends it in
+//   one go, see `_collect_block`, so a CONTINUATION frame that starts a message
+//   carries on no block.
 //
-// Nothing is changed for a frame that violates them: it is not parsed, and the
-// block that is open stays open, so that the frames after it are read as if it
-// had not been sent. It is up to the caller to remember that the connection is
-// broken.
-//
-// It is a function of its own, so that the verifier checks it once, rather
-// than on every path through the parser that follows it.
-__noinline __weak int _violates_block_rules(const struct ip4_conn *conn __arg_nonnull, u32 type, u32 sid) {
-    bool is_hdr = (type == HTTP2_HEADERS_FRAME || type == HTTP2_CONTINUATION_FRAME);
-    if (is_hdr && sid == 0) {
-        bpf_debug("hdr: a frame of type %u on stream 0", type);
-        return 1;
-    }
-
-    struct continued_block *open = bpf_map_lookup_elem(&continued_blocks, conn);
-    if (open == NULL) {
-        if (type != HTTP2_CONTINUATION_FRAME) return 0;
-
+// Nothing is changed for a frame that violates them: it is not parsed, so that
+// the frames after it are read as if it had not been sent. It is up to the
+// caller to remember that the connection is broken.
+static __always_inline bool _violates_block_rules(u32 type, u32 sid) {
+    if (type == HTTP2_CONTINUATION_FRAME) {
         bpf_debug("hdr: a continuation of stream %u carries on no block", sid);
-        return 1;
+        return true;
     }
 
-    if (type == HTTP2_CONTINUATION_FRAME && open->sid == sid) return 0;
+    if (type == HTTP2_HEADERS_FRAME && sid == 0) {
+        bpf_debug("hdr: a HEADERS frame on stream 0");
+        return true;
+    }
 
-    bpf_debug("hdr: a frame of type %u of stream %u breaks the block of stream %u", type, sid, open->sid);
-    return 1;
+    return false;
 }
 
-// What the parser returns for a frame that violates the rules for header
-// blocks, see `_violates_block_rules`: `-EPROTO`, or -1 while the frame has not
-// arrived in full yet, so that the caller waits for the rest of it first, as it
-// does for any frame that is longer than the message.
-static __always_inline int _reject_frame(u32 frame_len, u32 avail) {
-    return (frame_len > avail) ? -1 : -EPROTO;
+// What the parser returns for a frame of `frame_len` bytes, `avail` of which
+// have arrived, that violates the rules for header blocks: `-EPROTO`, or
+// `-EAGAIN` while the frame has not arrived in full yet, so that the caller
+// waits for the rest of it before it skips it.
+static __always_inline int _reject_frame(struct http2_frame *frame, u32 frame_len, u32 avail) {
+    if (frame_len <= avail) return -EPROTO;
+
+    frame->need = frame_len;
+    return -EAGAIN;
 }
 
-// Reads the header block of a HEADERS or a CONTINUATION frame sent on the
-// stream `sid`, which the caller has made sure does not break the block that is
-// open, see `_violates_block_rules`.
+// Reads the header block a HEADERS frame carries whole, between the offsets
+// `start` and `end`.
 //
 // Returns the offset it stopped at, see `_parse_hdr_from`.
-static __always_inline int _parse_hdr_frame(const struct msg_ctx *ctx, u16 start, u16 end, u8 type, u8 flags, u32 sid, struct http_parse_res *pres, struct null_prefix *null_prefix) {
+static __always_inline int _parse_hdr_frame(const struct msg_ctx *ctx, u16 start, u16 end, struct http_parse_res *pres, struct null_prefix *null_prefix) {
     struct dynamic_table_info *dt_info = _get_dynamic_table(&ctx->conn);
     if (!dt_info) return start;
 
-    struct http2_parse_state ps = _new_http2_parse_state();
-    if (type == HTTP2_CONTINUATION_FRAME) {
-        struct continued_block *open = bpf_map_lookup_elem(&continued_blocks, &ctx->conn);
-        if (open == NULL) return start;
+    struct http2_parse_state ps = _new_http2_parse_state(HTTP_SRC_MSG);
+    return _parse_hdr_from(ctx, start, end, dt_info, &ps, pres, null_prefix);
+}
 
-        ps = open->ps;
+// Where `_collect_block` put a header block together, and what it is missing.
+struct collected_block {
+    // the length of the block, in `block_bufs`
+    u32 len;
+
+    // see `need` in `http2_frame`
+    u32 need;
+};
+
+// Puts the header block of the HEADERS frame `off` bytes into `ctx` together in
+// `block_bufs`, out of the fragments it and the CONTINUATION frames behind it
+// carry, up to the one that ends the block, see section 6.10 of RFC 9113.
+//
+// It is a function of its own, so that the verifier checks the walk over the
+// frames once, rather than on every path through the parser around it.
+//
+// Returns the number of bytes the frames of the block take up, `-EAGAIN` if
+// they have not all arrived yet, with `blk->need` set, `-EPROTO` if a frame
+// that does not carry on the block breaks into it, or -1 if a frame is
+// malformed or the block is longer than `BLOCK_MAXLEN`.
+__noinline __weak int _collect_block(const struct msg_ctx *ctx __arg_nonnull, u32 off, struct collected_block *blk __arg_nonnull) {
+    u32 zero = 0;
+    struct block_buf *buf = bpf_map_lookup_elem(&block_bufs, &zero);
+    if (buf == NULL) return -1;
+
+    const u8 *data = ctx->data;
+    u32 avail = (u32)(ctx->data_end - ctx->data);
+
+    u32 o = off;
+    u32 pos = 0;
+    u32 sid = 0;
+    u32 k = 0;
+
+    // a frame takes up at least the 9 bytes of its header
+    bpf_for(k, 0, MAX_BYTES / HTTP2_FRAME_HDR_LEN + 1) {
+        if (o > MAX_BYTES) return -1;
+
+        if (o + HTTP2_FRAME_HDR_LEN > avail) {
+            blk->need = o - off + HTTP2_FRAME_HDR_LEN;
+            return -EAGAIN;
+        }
+
+        u8 hdr[HTTP2_FRAME_HDR_LEN];
+        if (bpf_probe_read_kernel(hdr, sizeof(hdr), data + o) < 0) return -1;
+
+        u32 len = (u32)hdr[0] << 16 | (u32)hdr[1] << 8 | (u32)hdr[2];
+        u8 type = hdr[3];
+        u8 flags = hdr[4];
+        u32 fsid = ((u32)hdr[5] << 24 | (u32)hdr[6] << 16 | (u32)hdr[7] << 8 | (u32)hdr[8]) & 0x7FFFFFFF;
+
+        if (k == 0) {
+            sid = fsid;
+        } else if (type != HTTP2_CONTINUATION_FRAME || fsid != sid) {
+            bpf_debug("hdr: a frame of type %u of stream %u breaks the block of stream %u", type, fsid, sid);
+            return -EPROTO;
+        }
+
+        u32 frame_len = HTTP2_FRAME_HDR_LEN + len;
+        if (o + frame_len > avail) {
+            blk->need = o - off + frame_len;
+            return -EAGAIN;
+        }
+
+        // only the HEADERS frame may be padded and carry a priority
+        u32 start = HTTP2_FRAME_HDR_LEN;
+        u32 pad_len = 0;
+        if (k == 0 && (flags & HTTP2_PADDED_FLAG) != 0) {
+            u8 pad = 0;
+            if (start + 1 > frame_len) return -1;
+            if (bpf_probe_read_kernel(&pad, 1, data + o + start) < 0) return -1;
+            pad_len = pad;
+            start += 1;
+        }
+        if (k == 0 && (flags & HTTP2_PRIORITY_FLAG) != 0) start += HTTP2_PRIORITY_LEN;
+        if (start + pad_len > frame_len) return -1;
+
+        u32 n = frame_len - pad_len - start;
+        if (pos + n > BLOCK_MAXLEN) {
+            bpf_debug("hdr: a block longer than %u bytes", BLOCK_MAXLEN);
+            return -1;
+        }
+
+        bpf_clamp_uminmax(pos, 0, BLOCK_MAXLEN);
+        bpf_clamp_uminmax(n, 0, BLOCK_MAXLEN);
+        if (n > 0 && bpf_probe_read_kernel(buf->data + pos, n, data + o + start) < 0) return -1;
+
+        pos += n;
+        o += frame_len;
+
+        if ((flags & HTTP2_END_HEADERS_FLAG) != 0) {
+            buf->len = pos;
+            blk->len = pos;
+            return o - off;
+        }
     }
 
-    int res = _parse_hdr_from(ctx, start, end, dt_info, &ps, pres, null_prefix);
+    return -1;
+}
 
-    if ((flags & HTTP2_END_HEADERS_FLAG) != 0) {
-        bpf_map_delete_elem(&continued_blocks, &ctx->conn);
-        return res;
+// Decodes the header block `_collect_block` put together, `len` bytes long, and
+// records the values of the fields whose name matches a pattern in `pres`.
+//
+// Returns the offset it stopped at, which is `len` if the whole block was read.
+static __always_inline int _parse_hdr_buf(const struct msg_ctx *ctx, u32 len, struct dynamic_table_info *dt_info, struct http2_parse_state *ps, struct http_parse_res *pres) {
+    u32 zero = 0;
+    struct block_buf *buf = bpf_map_lookup_elem(&block_bufs, &zero);
+    if (buf == NULL) return 0;
+
+    bpf_clamp_uminmax(len, 0, BLOCK_MAXLEN);
+
+    u32 i = 0;
+    bpf_for(i, 0, len) {
+        u32 j = i;
+        bpf_clamp_uminmax(j, 0, BLOCK_MAXLEN - 1);
+
+        ps->i = i;
+        if (_parse_hdr_byte(ctx, dt_info, pres, ps, buf->data[j]) < 0) break;
     }
 
-    if (ps.skip > 0 && !dt_info->dirty) {
-        bpf_debug("dt: a field split over two frames, the table has drifted");
-        dt_info->dirty = 1;
+    return i;
+}
+
+// Reads the header block of the HEADERS frame `off` bytes into `ctx`, which
+// does not end it, along with the CONTINUATION frames that carry it on, and
+// describes it in `frame`.
+//
+// Returns the number of bytes the frames of the block take up, or what
+// `_collect_block` fails with, or -1 if the block could not be read to its end.
+static __always_inline int _parse_block(const struct msg_ctx *ctx, u32 off, struct http_parse_res *pres, struct http2_frame *frame) {
+    struct collected_block blk = { 0 };
+    int total = _collect_block(ctx, off, &blk);
+    if (total < 0) {
+        if (total == -EAGAIN) frame->need = blk.need;
+        return total;
     }
 
-    // the pending field belongs to the frame that is ending, so nothing of it
-    // survives into the next one
-    ps.cid = -1;
-    ps.add_to_dt = 0;
+    struct dynamic_table_info *dt_info = _get_dynamic_table(&ctx->conn);
+    if (!dt_info) return -1;
 
-    struct continued_block block = { .sid = sid, .ps = ps };
-    bpf_map_update_elem(&continued_blocks, &ctx->conn, &block, BPF_ANY);
+    frame->dt_count_before = dt_info->count;
 
-    return res;
+    struct http2_parse_state ps = _new_http2_parse_state(HTTP_SRC_BUF);
+    u32 res = _parse_hdr_buf(ctx, blk.len, dt_info, &ps, pres);
+
+    frame->dt_count = dt_info->count;
+
+    return (res < blk.len) ? -1 : total;
 }
 
 // Whether a frame carries anything the parser needs to read.
@@ -1059,7 +1202,7 @@ static __always_inline int _parse_frame(const struct msg_ctx *ctx, u32 off, u32 
         u16 s = S_FIELD;
         res = _parse_stg_from(ctx, start, end, &s, pres, null_prefix);
     } else {
-        res = _parse_hdr_frame(ctx, start, end, type, flags, frame->sid, pres, null_prefix);
+        res = _parse_hdr_frame(ctx, start, end, pres, null_prefix);
     }
 
     frame->dt_count = dt_info ? dt_info->count : 0;
@@ -1072,16 +1215,20 @@ static __always_inline int _parse_frame(const struct msg_ctx *ctx, u32 off, u32 
 // frames are decoded into `pres`, SETTINGS frames are applied to the mirrored
 // dynamic table and every other frame is skipped.
 //
-// The whole frame is pulled into the linear part of the message before it is
-// parsed. A message may carry several frames, so a caller has to keep calling
-// this until the message is consumed.
+// A HEADERS frame that does not end its header block is read along with the
+// CONTINUATION frames that carry the block on, up to the one that ends it, and
+// the block is put together in `block_bufs`, which the values captured of it
+// point into, see `HTTP_SRC_BUF`. `frame` describes the HEADERS frame.
 //
-// Returns the number of bytes the frame occupies, 0 if the message is too short
-// to hold a frame header, `-EPROTO` if the frame breaks a header block (see
-// `EPROTO` in beeper/http2.h), or -1 if the frame cannot be parsed otherwise.
-// That includes a frame that is longer than the message, which happens when the
-// peer writes a frame in pieces: `frame->len` then says how long it is, so that
-// the caller can cork the message until the rest has arrived.
+// What is parsed is pulled into the linear part of the message first. A message
+// may carry several frames, so a caller has to keep calling this until the
+// message is consumed.
+//
+// Returns the number of bytes the frame occupies, along with the CONTINUATION
+// frames of its block, 0 if the message is too short to hold a frame header,
+// `-EAGAIN` if it is too short to hold the frame or the rest of its block (see
+// `EAGAIN` in beeper/http2.h), `-EPROTO` if the frame breaks the rules for
+// header blocks (see `EPROTO`), or -1 if it cannot be parsed otherwise.
 SEC("freplace")
 int parse_msg(struct sk_msg_md *msg, struct http_parse_res *pres __arg_nonnull, struct http2_frame *frame __arg_nonnull) {
     u8 *data = (u8 *)(long)msg->data;
@@ -1093,20 +1240,42 @@ int parse_msg(struct sk_msg_md *msg, struct http_parse_res *pres __arg_nonnull, 
     u8 type = data[3];
     u8 flags = data[4];
     u32 frame_len = HTTP2_FRAME_HDR_LEN + len;
+    u32 size = msg->size;
 
     *frame = _new_http2_frame(data, len, type, flags);
 
     bpf_debug("Parsing HTTP/2 message with length %d, type %d, flags %d", len, type, flags);
 
     struct msg_ctx ctx = _new_msg_ctx(msg);
-    if (_violates_block_rules(&ctx.conn, type, frame->sid)) {
-        return _reject_frame(frame_len, msg->size);
+    if (_violates_block_rules(type, frame->sid)) {
+        return _reject_frame(frame, frame_len, size);
     }
 
     if (!_is_parsed_frame(type, flags)) {
         _skip_frame(&ctx.conn, frame);
 
         return frame_len;
+    }
+
+    if (frame_len > size) {
+        frame->need = frame_len;
+        return -EAGAIN;
+    }
+
+    if (type == HTTP2_HEADERS_FRAME && (flags & HTTP2_END_HEADERS_FLAG) == 0) {
+        // the frames behind it are pulled in as well, as far as they can be read
+        u32 pulled = size;
+        if (pulled > MAX_BYTES) pulled = MAX_BYTES;
+        if (bpf_msg_pull_data(msg, 0, pulled, 0) < 0) return -1;
+
+        ctx = _new_msg_ctx(msg);
+        int res = _parse_block(&ctx, 0, pres, frame);
+
+        // a block whose frames have arrived, but not all of which could be
+        // pulled in, would never be read
+        if (res == -EAGAIN && frame->need <= size) return -1;
+
+        return res;
     }
 
     if (bpf_msg_pull_data(msg, 0, frame_len, 0) < 0) return -1;
@@ -1120,6 +1289,8 @@ int parse_msg(struct sk_msg_md *msg, struct http_parse_res *pres __arg_nonnull, 
 
 // Parses the frame that starts `off` bytes into the packet. Returns what
 // `parse_msg` returns.
+//
+// `null_prefix` is only honoured for a header block that is sent in one frame.
 SEC("freplace")
 int parse_skb(struct __sk_buff *skb, u32 off, struct http_parse_res *pres __arg_nonnull, struct http2_frame *frame __arg_nonnull, struct null_prefix *null_prefix) {
     if (off > MAX_BYTES) return -1;
@@ -1144,20 +1315,39 @@ int parse_skb(struct __sk_buff *skb, u32 off, struct http_parse_res *pres __arg_
     u8 type = hdr[3];
     u8 flags = hdr[4];
     u32 frame_len = HTTP2_FRAME_HDR_LEN + len;
+    u32 size = skb->len - off;
 
     *frame = _new_http2_frame(hdr, len, type, flags);
 
     bpf_debug("Parsing HTTP/2 sk_buff with length %d, type %d, flags %d", len, type, flags);
 
     struct msg_ctx ctx = _new_skb_ctx(skb);
-    if (_violates_block_rules(&ctx.conn, type, frame->sid)) {
-        return _reject_frame(frame_len, skb->len - off);
+    if (_violates_block_rules(type, frame->sid)) {
+        return _reject_frame(frame, frame_len, size);
     }
 
     if (!_is_parsed_frame(type, flags)) {
         _skip_frame(&ctx.conn, frame);
 
         return frame_len;
+    }
+
+    if (frame_len > size) {
+        frame->need = frame_len;
+        return -EAGAIN;
+    }
+
+    if (type == HTTP2_HEADERS_FRAME && (flags & HTTP2_END_HEADERS_FLAG) == 0) {
+        // see `parse_msg`
+        u32 pulled = skb->len;
+        if (pulled > off + MAX_BYTES) pulled = off + MAX_BYTES;
+        if (bpf_skb_pull_data(skb, pulled) < 0) return -1;
+
+        ctx = _new_skb_ctx(skb);
+        int res = _parse_block(&ctx, off, pres, frame);
+        if (res == -EAGAIN && frame->need <= size) return -1;
+
+        return res;
     }
 
     if (bpf_skb_pull_data(skb, off + frame_len) < 0) return -1;

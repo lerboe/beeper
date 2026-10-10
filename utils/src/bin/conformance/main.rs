@@ -58,22 +58,19 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 /// ones the case sends, which the server echoes.
 const RESPONSE_FIELDS: &[&str] = &[":status", "content-type", "content-length", "allow"];
 
-/// The flag of a HEADERS or CONTINUATION frame that ends its header block.
-const END_HEADERS: u8 = 0x4;
-
 /// The frame type a header block starts with.
 const HEADERS: u8 = 0x1;
 
 /// The frame type that carries on a header block.
 const CONTINUATION: u8 = 0x9;
 
-/// A header block as the parser saw it, put together from its frames.
+/// A header block as the parser saw it.
 #[derive(Debug, Default)]
 struct ParsedBlock {
     client_port: u16,
     sid: u32,
 
-    /// What the parser returned for the first of its frames it failed on.
+    /// What the parser returned for it, if it failed on it.
     error: Option<i32>,
 
     /// What the parser captured, indexed by match id.
@@ -81,79 +78,43 @@ struct ParsedBlock {
 }
 
 impl ParsedBlock {
-    fn add(&mut self, frame: &Frame) {
-        if frame.ret < 0 && self.error.is_none() {
-            self.error = Some(frame.ret);
-        }
-        self.captures.resize(frame.captures.len(), None);
-        for (i, capture) in frame.captures.iter().enumerate() {
-            if capture.is_some() {
-                self.captures[i] = capture.clone();
-            }
+    fn new(frame: &Frame) -> Self {
+        ParsedBlock {
+            client_port: frame.client_port,
+            sid: frame.sid,
+            error: (frame.ret < 0).then_some(frame.ret),
+            captures: frame.captures.clone(),
         }
     }
 }
 
-/// Puts the header frames the parser reported together into the blocks they
-/// make up, requests and responses apart, each in the order they were sent.
+/// Sorts the header frames the parser reported into the blocks they stand for,
+/// requests and responses apart, each in the order they were sent.
 ///
-/// A CONTINUATION frame carries on the block of its stream if that block has
-/// not ended yet, and starts a block of its own otherwise.
-///
-/// A frame the parser reports with `-EPROTO`, of any type, breaks the blocks
-/// that have not ended yet on its connection, in its direction. A frame of
-/// another type is only reported if the parser failed on it.
+/// The parser reads a header block in one go, from its HEADERS frame to the
+/// CONTINUATION frame that ends it, and reports it as its HEADERS frame. A
+/// header frame it rejects is reported on its own. A frame of another type is
+/// only reported if the parser failed on it, which is a problem.
 fn blocks(frames: &[Frame]) -> (Vec<ParsedBlock>, Vec<ParsedBlock>, Vec<String>) {
     let mut requests: Vec<ParsedBlock> = Vec::new();
     let mut responses: Vec<ParsedBlock> = Vec::new();
     let mut problems = Vec::new();
 
-    // the blocks that have not ended yet, by connection, direction and stream
-    let mut open: HashMap<(u16, bool, u32), usize> = HashMap::new();
-
     for frame in frames {
+        if frame.frame_type != HEADERS && frame.frame_type != CONTINUATION {
+            problems.push(format!(
+                "the parser failed on a frame of type {} on stream {} ({})",
+                frame.frame_type, frame.sid, frame.ret
+            ));
+            continue;
+        }
+
         let blocks = if frame.upstream {
             &mut responses
         } else {
             &mut requests
         };
-
-        let breaks = frame.ret == -libc::EPROTO;
-        if breaks {
-            for (&(port, upstream, _), &idx) in &open {
-                if port == frame.client_port && upstream == frame.upstream {
-                    blocks[idx].error.get_or_insert(frame.ret);
-                }
-            }
-        }
-
-        if frame.frame_type != HEADERS && frame.frame_type != CONTINUATION {
-            if !breaks {
-                problems.push(format!(
-                    "the parser failed on a frame of type {} on stream {} ({})",
-                    frame.frame_type, frame.sid, frame.ret
-                ));
-            }
-            continue;
-        }
-
-        let key = (frame.client_port, frame.upstream, frame.sid);
-        let idx = match open.remove(&key) {
-            Some(idx) if frame.frame_type == CONTINUATION => idx,
-            _ => {
-                blocks.push(ParsedBlock {
-                    client_port: frame.client_port,
-                    sid: frame.sid,
-                    ..Default::default()
-                });
-                blocks.len() - 1
-            }
-        };
-
-        blocks[idx].add(frame);
-        if frame.flags & END_HEADERS == 0 {
-            open.insert(key, idx);
-        }
+        blocks.push(ParsedBlock::new(frame));
     }
 
     (requests, responses, problems)
@@ -170,10 +131,6 @@ enum Expected {
 
     /// These bytes, as they were sent.
     Raw(Vec<u8>),
-
-    /// What the inner one expects, which the parser is known to get wrong for
-    /// the reason given.
-    Limited(Box<Expected>, &'static str),
 }
 
 impl Expected {
@@ -183,10 +140,6 @@ impl Expected {
             Value::Authority => authority.as_bytes().to_vec(),
             Value::Dummy => vec![b'x'; DUMMY_LEN],
             Value::Raw(raw) => return Expected::Raw(raw.to_vec()),
-            Value::Split(value) => {
-                let inner = Expected::new(value, authority);
-                return Expected::Limited(Box::new(inner), "a value split across frames");
-            }
         };
 
         Expected::Value(value)
@@ -199,7 +152,6 @@ impl Expected {
     /// to that length, as the parser only keeps that much of an entry.
     fn matches(&self, capture: Option<&Capture>) -> bool {
         let sent = match (self, capture) {
-            (Expected::Limited(inner, _), _) => return inner.matches(capture),
             (Expected::Absent, None) => return true,
             (Expected::Absent, Some(_)) | (_, None) => return false,
             (Expected::Raw(raw), Some(capture)) => {
@@ -227,7 +179,6 @@ impl std::fmt::Display for Expected {
             Expected::Absent => write!(f, "nothing"),
             Expected::Value(value) => write!(f, "{:?}", abbreviate(value)),
             Expected::Raw(raw) => write!(f, "{raw:x?}"),
-            Expected::Limited(inner, why) => write!(f, "{inner} (known limitation: {why})"),
         }
     }
 }
@@ -511,14 +462,14 @@ fn check_requests(
     }
 }
 
-/// Checks the frames of the requests of a violation, `frames`, against the
-/// ones that were sent, see [`Expect::Violation`], and describes what the
-/// parser got wrong in `problems`.
+/// Checks what the parser made of the requests of a violation, `frames`,
+/// against what it is expected to, see [`Expect::Violation`], and describes
+/// what it got wrong in `problems`.
 ///
-/// Each header frame the parser accepted is checked for the fields it carries
-/// itself, and every frame it rejected with `-EPROTO` is expected to be one
-/// that violates the rules. The frames after the first violation may be
-/// missing, but not the ones up to it.
+/// Each block the parser read is checked for the fields it carries, and every
+/// frame it rejected with `-EPROTO` is expected to be one that violates the
+/// rules. The frames after the first violation may be missing, but not the
+/// ones up to it.
 fn check_violation(
     parser: &CaseParser,
     sent: &[Block],
@@ -600,8 +551,9 @@ fn check(
     }
 
     let answers: Vec<Fields> = case
-        .requests()
+        .blocks()
         .iter()
+        .filter_map(Block::sent)
         .filter_map(|block| response_fields(block, authority))
         .collect();
 
@@ -772,20 +724,14 @@ mod tests {
     }
 
     #[test]
-    fn expect_what_was_sent_despite_a_known_limitation() {
-        let expected = Expected::new(&Value::Split(Box::new(Value::Str("ok"))), "");
-        assert!(matches!(expected, Expected::Limited(..)));
-        assert!(expected.matches(Some(&capture(b"ok"))));
-        assert!(!expected.matches(None));
-        assert!(expected.to_string().contains("known limitation"));
-    }
-
-    #[test]
     fn match_raw_bytes_exactly() {
         let expected = Expected::new(&Value::Raw(b"\x49\x50\x90"), "");
         assert!(expected.matches(Some(&capture(b"\x49\x50\x90"))));
         assert!(!expected.matches(Some(&capture(b"\x49\x50"))));
     }
+
+    /// The flag of a HEADERS or CONTINUATION frame that ends its header block.
+    const END_HEADERS: u8 = 0x4;
 
     fn frame(frame_type: u8, flags: u8, sid: u32, upstream: bool, ret: i32) -> Frame {
         Frame {
@@ -800,13 +746,15 @@ mod tests {
     }
 
     #[test]
-    fn put_continued_blocks_together() {
+    fn sort_header_frames_into_blocks() {
+        const DATA: u8 = 0x0;
+        let eproto = -libc::EPROTO;
         let frames = [
-            frame(HEADERS, 0, 1, false, 10),
+            // a block that carries on into CONTINUATION frames is reported as
+            // its HEADERS frame
+            frame(HEADERS, 0, 1, false, 30),
             frame(HEADERS, END_HEADERS, 3, false, 10),
-            frame(CONTINUATION, END_HEADERS, 1, false, 10),
-            // a CONTINUATION after the block ended starts one of its own
-            frame(CONTINUATION, END_HEADERS, 1, false, -libc::EPROTO),
+            frame(CONTINUATION, END_HEADERS, 1, false, eproto),
             frame(HEADERS, END_HEADERS, 1, true, -1),
         ];
 
@@ -817,37 +765,12 @@ mod tests {
                 .iter()
                 .map(|b| (b.sid, b.error))
                 .collect::<Vec<_>>(),
-            vec![(1, None), (3, None), (1, Some(-libc::EPROTO))]
+            vec![(1, None), (3, None), (1, Some(eproto))]
         );
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0].error, Some(-1));
-    }
 
-    #[test]
-    fn a_frame_that_breaks_a_block_breaks_the_open_ones() {
-        const DATA: u8 = 0x0;
-        let eproto = -libc::EPROTO;
-        let frames = [
-            frame(HEADERS, 0, 1, false, 10),
-            // the server's own block is not affected
-            frame(HEADERS, 0, 1, true, 10),
-            frame(DATA, 0, 1, false, eproto),
-            frame(CONTINUATION, END_HEADERS, 1, false, eproto),
-            frame(CONTINUATION, END_HEADERS, 1, true, 10),
-        ];
-
-        let (requests, responses, problems) = blocks(&frames);
-        assert!(problems.is_empty());
-        assert_eq!(
-            requests.iter().map(|b| b.error).collect::<Vec<_>>(),
-            vec![Some(eproto)]
-        );
-        assert_eq!(
-            responses.iter().map(|b| b.error).collect::<Vec<_>>(),
-            vec![None]
-        );
-
-        // any other failure is reported as is
+        // a frame of another type is only reported when the parser failed on it
         let (_, _, problems) = blocks(&[frame(DATA, 0, 1, false, -1)]);
         assert_eq!(problems.len(), 1);
     }
@@ -866,19 +789,6 @@ mod tests {
         );
 
         assert!(response_fields(&[("x-test", Value::Str("ok"))], "").is_none());
-    }
-
-    #[test]
-    fn answer_the_request_a_violation_carries_on() {
-        let case = cases::cases()
-            .into_iter()
-            .find(|c| c.ids.contains(&"http2/6.10/5"))
-            .unwrap();
-        let requests = case.requests();
-        assert_eq!(requests.len(), 1);
-
-        let fields = response_fields(&requests[0], "").unwrap();
-        assert_eq!(fields["x-dummy0"], Expected::Value(vec![b'x'; cases::DUMMY_LEN]));
     }
 
     #[test]

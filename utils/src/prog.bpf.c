@@ -279,12 +279,14 @@ int msg_verdict(struct sk_msg_md *msg) {
         struct http2_frame frame = { 0 };
         msg_len = parse_http2_msg(msg, &pres, &frame);
 
-        // a frame written in pieces is parsed once all of it has arrived
-        u32 frame_len = HTTP2_FRAME_HDR_LEN + frame.len;
-        if (msg_len == 0 || (msg_len < 0 && frame_len > msg->size)) {
-            bpf_msg_cork_bytes(msg, msg_len == 0 ? HTTP2_FRAME_HDR_LEN : frame_len);
+        // a frame written in pieces is parsed once all of it has arrived, and
+        // a header block once all of the frames it is sent in have
+        if (msg_len == 0 || msg_len == -EAGAIN) {
+            bpf_msg_cork_bytes(msg, msg_len == 0 ? HTTP2_FRAME_HDR_LEN : frame.need);
             return SK_PASS;
         }
+
+        u32 frame_len = HTTP2_FRAME_HDR_LEN + frame.len;
 
         if (msg_len < 0) {
             struct parse_result *r = new_frame_result(&ikey, !is_downstream, msg_len, &frame);
@@ -372,9 +374,40 @@ static __always_inline struct ip4_conn skb_conn(const struct __sk_buff *skb) {
 #define HTTP2_PREFACE "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 #define HTTP2_PREFACE_LEN 24
 
+// The most CONTINUATION frames `skb_parser` puts into one message along with
+// the HEADERS frame of their block.
+#define MAX_CONTINUATIONS 256
+
+// Returns the length of the HTTP/2 message that starts `off` bytes into `skb`:
+// a frame, or a HEADERS frame that does not end its header block along with the
+// CONTINUATION frames that carry it on, as the parser reads a block in one go.
+// A frame that breaks into the block ends the message before it, which leaves
+// the parser to reject the block. Returns 0 while the header of a frame of the
+// message has not arrived yet.
+static __always_inline u32 h2_msg_len(struct __sk_buff *skb, u32 off) {
+    u32 o = off;
+    u32 k = 0;
+    bpf_for(k, 0, MAX_CONTINUATIONS + 1) {
+        u8 hdr[5];
+        if (bpf_skb_load_bytes(skb, o, hdr, sizeof(hdr)) < 0) return 0;
+
+        u32 len = (u32)hdr[0] << 16 | (u32)hdr[1] << 8 | hdr[2];
+        u8 type = hdr[3];
+        u8 flags = hdr[4];
+
+        if (k > 0 && type != 0x9) return o - off;
+
+        o += HTTP2_FRAME_HDR_LEN + len;
+        if ((k == 0 && type != 0x1) || (flags & 0x4) != 0) return o - off;
+    }
+
+    return o - off;
+}
+
 // Cuts what arrives on a socket into the messages `skb_verdict` parses: an
-// HTTP/2 frame at a time on an upgraded connection, the preface on its own, and
-// whatever arrived otherwise.
+// HTTP/2 frame at a time on an upgraded connection, or a header block with all
+// of its frames, see `h2_msg_len`, the preface on its own, and whatever arrived
+// otherwise.
 //
 // The message starts `off` bytes into the sk_buff, the kernel hands over the
 // whole of it, and the length returned is counted from `off`.
@@ -387,11 +420,7 @@ int skb_parser(struct __sk_buff *skb) {
     u32 avail = skb->len - off;
 
     if (bpf_map_lookup_elem(&upgraded_conns, &ikey) != NULL) {
-        u8 hdr[3];
-        if (bpf_skb_load_bytes(skb, off, hdr, sizeof(hdr)) < 0) return 0;
-
-        u32 len = (u32)hdr[0] << 16 | (u32)hdr[1] << 8 | hdr[2];
-        return 9 + len;
+        return h2_msg_len(skb, off);
     }
 
     const char preface[] = HTTP2_PREFACE;

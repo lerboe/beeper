@@ -20,11 +20,6 @@ pub enum Value {
     /// Bytes that are not a valid Huffman code, which the parser is expected
     /// to capture as they are.
     Raw(&'static [u8]),
-
-    /// Known limitation: a value that is split across a HEADERS and a
-    /// CONTINUATION frame. The parser points into the frame it parses, so it
-    /// cannot point at a value that is in two of them, and captures nothing.
-    Split(Box<Value>),
 }
 
 use Value::*;
@@ -43,10 +38,10 @@ pub enum Block {
     Malformed,
 
     /// Only in a [`Violation`]: a frame that violates the rules for the frames a
-    /// header block is sent in, e.g. a CONTINUATION frame that does not carry
-    /// on the block of its stream, see `EPROTO` in beeper/http2.h. Such a frame
-    /// is a connection error, and the parser is expected to reject it with
-    /// `-EPROTO`.
+    /// header block is sent in, see `EPROTO` in beeper/http2.h, e.g. a
+    /// CONTINUATION frame that carries on no block, or the HEADERS frame of a
+    /// block another frame breaks into. Such a frame is a connection error, and
+    /// the parser is expected to reject it with `-EPROTO`.
     Rejected,
 }
 
@@ -74,12 +69,15 @@ pub enum Expect {
     /// These header blocks, in order.
     Blocks(Vec<Block>),
 
-    /// These frames, in order, some of which violate the rules for the frames
-    /// a header block is sent in. Each of them is listed: a header frame the
-    /// parser accepts with the fields it carries, and a frame of any type it
-    /// [`Rejected`].
+    /// What the parser makes of a case some of whose frames violate the rules
+    /// for the frames a header block is sent in, in order: each block it reads
+    /// with the fields it carries, and each header frame it [`Rejected`].
     ///
-    /// The parser is expected to reject the frames that violate the rules
+    /// The parser reads a block in one go, from its HEADERS frame to the
+    /// CONTINUATION frame that ends it, so a frame that breaks into a block
+    /// gets the HEADERS frame of the block rejected, and a CONTINUATION frame
+    /// that is not read along with a block is rejected on its own. A frame of
+    /// another type is skipped. The parser is expected to reject the frames
     /// without changing any of its state, and to read the valid ones after
     /// them as if they had not been sent. The peer may close the connection as
     /// soon as it sees the first violation, though, so what h2spec gets to
@@ -91,33 +89,12 @@ pub enum Expect {
 pub use Expect::{Blocks, Violation};
 
 impl Case {
-    /// The header blocks the case sends, or for a violation its frames.
+    /// The header blocks the case sends, or for a violation what the parser
+    /// makes of its frames.
     pub fn blocks(&self) -> &[Block] {
         match &self.expect {
             Blocks(blocks) | Violation(blocks) => blocks,
         }
-    }
-
-    /// The fields of each request the case sends, which is what the server
-    /// answers. A violation lists frames rather than blocks, and a frame that
-    /// carries no `:method` there carries on the request before it, as a
-    /// CONTINUATION frame of its block, whatever frames came between them.
-    pub fn requests(&self) -> Vec<Vec<Field>> {
-        let sent = self.blocks().iter().filter_map(Block::sent);
-        let Violation(_) = &self.expect else {
-            return sent.map(<[Field]>::to_vec).collect();
-        };
-
-        let mut requests: Vec<Vec<Field>> = Vec::new();
-        for frame in sent {
-            let starts = frame.iter().any(|(name, _)| *name == ":method");
-            match requests.last_mut() {
-                Some(request) if !starts => request.extend_from_slice(frame),
-                _ => requests.push(frame.to_vec()),
-            }
-        }
-
-        requests
     }
 }
 
@@ -162,16 +139,20 @@ pub fn cases() -> Vec<Case> {
                 // CONTINUATION frame of a block
                 "http2/4.3/2",
                 "http2/6.2/1",
-                // the HEADERS frame of another stream comes between the HEADERS
-                // and the CONTINUATION frame of a block
-                "http2/4.3/3",
-                "http2/6.2/2",
+                // a DATA frame follows a CONTINUATION frame of a block that has
+                // not ended
+                "http2/6.10/2",
+                // a CONTINUATION frame on stream 0 follows the HEADERS frame of
+                // a block that has not ended
+                "http2/6.10/3",
             ],
-            expect: Violation(vec![
-                get(vec![]),
-                Rejected,
-                fields(vec![("x-dummy0", Dummy)]),
-            ]),
+            expect: Violation(vec![Rejected, Rejected]),
+        },
+        // the HEADERS frame of another stream comes between the HEADERS and the
+        // CONTINUATION frame of a block
+        Case {
+            ids: &["http2/4.3/3", "http2/6.2/2"],
+            expect: Violation(vec![Rejected, get(vec![]), Rejected]),
         },
         Case {
             ids: &[
@@ -179,6 +160,9 @@ pub fn cases() -> Vec<Case> {
                 "http2/5.1/4",
                 // a HEADERS frame on stream 0
                 "http2/6.2/3",
+                // an unknown extension frame follows the HEADERS frame of a
+                // block that has not ended
+                "http2/5.5/2",
             ],
             expect: Violation(vec![Rejected]),
         },
@@ -189,44 +173,20 @@ pub fn cases() -> Vec<Case> {
                 "http2/5.1/10",
                 "http2/5.1/13",
                 "http2/6.10/4",
-                // an unknown extension frame follows the HEADERS frame of a
-                // block that has not ended
-                "http2/5.5/2",
-                // a CONTINUATION frame on stream 0 follows the HEADERS frame
-                // of a block that has not ended
-                "http2/6.10/3",
             ],
             expect: Violation(vec![get(vec![]), Rejected]),
         },
-        // a CONTINUATION frame on a stream whose block has ended
+        // a CONTINUATION frame on a stream whose block has ended with the
+        // CONTINUATION frame before it
         Case {
             ids: &["http2/6.10/5"],
-            expect: Violation(vec![
-                get(vec![]),
-                fields(vec![("x-dummy0", Dummy)]),
-                Rejected,
-            ]),
-        },
-        // a DATA frame follows a CONTINUATION frame of a block that has not
-        // ended
-        Case {
-            ids: &["http2/6.10/2"],
-            expect: Violation(vec![
-                post(vec![]),
-                fields(vec![("x-dummy0", Dummy)]),
-                Rejected,
-            ]),
+            expect: Violation(vec![get(vec![("x-dummy0", Dummy)]), Rejected]),
         },
         // a DATA frame comes between the HEADERS and the CONTINUATION frame of a
-        // block, the last of which is on stream 0
+        // block, the second of which is on stream 0
         Case {
             ids: &["http2/6.10/6"],
-            expect: Violation(vec![
-                post(vec![]),
-                Rejected,
-                fields(vec![("x-dummy0", Dummy)]),
-                Rejected,
-            ]),
+            expect: Violation(vec![Rejected, Rejected, Rejected]),
         },
         Case {
             ids: &[
@@ -412,7 +372,7 @@ pub fn cases() -> Vec<Case> {
                 (":method", Str("GET")),
                 (":scheme", Str("http")),
                 (":path", Str("/")),
-                (":authority", Split(Box::new(Authority))),
+                (":authority", Authority),
             ])]),
         },
         Case {

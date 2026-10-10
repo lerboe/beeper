@@ -18,24 +18,36 @@ struct http2_frame {
     u32 dt_count_before;
     u32 dt_count;
 
-    // The length of the frame's payload, as its header announces it. A parser
-    // that returns a negative value for a frame that is longer than the
-    // message leaves it here, so that the caller can wait for the rest of it,
-    // e.g. with `bpf_msg_cork_bytes`.
+    // The length of the frame's payload, as its header announces it.
     u32 len;
+
+    // The number of bytes, counted from the start of the frame, the message
+    // has to hold for the parser to get on with it, if it returned `-EAGAIN`.
+    // The caller is to wait until they have arrived, e.g. with
+    // `bpf_msg_cork_bytes`, and parse the frame again.
+    u32 need;
 };
+
+// What an HTTP/2 parser returns, negated, for a frame that has not arrived in
+// full yet, or for a HEADERS frame whose header block carries on into
+// CONTINUATION frames that have not all arrived yet: a block is only read once
+// all of it is there, see `need` in `http2_frame`.
+#ifndef EAGAIN
+#define EAGAIN 11
+#endif
 
 // What an HTTP/2 parser returns, negated, for a frame that violates the rules
 // for the frames a header block is sent in, see sections 4.3, 5.5, 6.2 and 6.10
-// of RFC 9113: a HEADERS or CONTINUATION frame on stream 0, any frame but a
-// CONTINUATION frame of the same stream while a block has not ended, and a
-// CONTINUATION frame while no block is open. The peer is to treat it as a
-// connection error, and it is up to the caller to remember that the connection
-// is broken: the parser does not parse the frame, captures nothing of it, and
-// changes none of its state, so that it reads the frames after it as if it had
-// not been sent. A block that was open stays open, e.g. a CONTINUATION frame of
-// its stream still carries it on. Every other frame that cannot be parsed is
-// reported as -1.
+// of RFC 9113: a HEADERS or CONTINUATION frame on stream 0, a HEADERS frame
+// whose block is broken into by any frame but a CONTINUATION frame of its
+// stream, and a CONTINUATION frame that carries on no block. The parser reads
+// a block in one go, from its HEADERS frame to the frame that ends it, so a
+// CONTINUATION frame it is handed on its own carries on no block. The peer is
+// to treat a violation as a connection error, and it is up to the caller to
+// remember that the connection is broken: the parser does not parse the frame,
+// captures nothing of it, and changes none of its state, so that it reads the
+// frames after it as if it had not been sent. Every other frame that cannot be
+// parsed is reported as -1.
 #ifndef EPROTO
 #define EPROTO 71
 #endif
