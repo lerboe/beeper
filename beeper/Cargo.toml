@@ -15,6 +15,7 @@ default = ["http1", "http2"]
 build = []
 http1 = []
 http2 = []
+dns = []
 
 [dependencies]
 as-bytes = "0.2.0"
@@ -35,3 +36,4 @@ tokio = { version = "1.53", features = ["full"] }
 utils = { path = "../utils" }
 h2 = "0.4.16"
 xbpf = { version = "0.0.6", features = ["build"] }
+hickory-proto = { version = "0.26.3", default-features = false, features = ["std", "dnssec-ring"] }

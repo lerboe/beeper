@@ -7,8 +7,9 @@
 //! user space.
 //!
 //! The target program declares the functions it wants Beeper to provide with
-//! the `BEEPER_*` macros of `beeper/http1.h` or `beeper/http2.h` and then
-//! names them in the [`http1`] or [`http2`] builder:
+//! the `BEEPER_*` macros of `beeper/http1.h`, `beeper/http2.h` or
+//! `beeper/dns.h` and then names them in the [`http1`], [`http2`] or `dns`
+//! builder:
 //!
 //! ```no_run
 //! # fn main() -> Result<(), beeper::Error> {
@@ -44,6 +45,9 @@ pub mod http1;
 
 #[cfg(feature = "http2")]
 pub mod http2;
+
+#[cfg(feature = "dns")]
+pub mod dns;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MessageBuffer {
