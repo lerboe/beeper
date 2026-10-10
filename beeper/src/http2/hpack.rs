@@ -69,26 +69,32 @@ fn insert_field_row(dfa: &mut Dfa<Action>) {
 /// Inserts the edges of the byte announcing the length of a name and of
 /// the one announcing the length of a value (see
 /// [Section 5.2 of RFC 7541](https://datatracker.ietf.org/doc/html/rfc7541#section-5.2)).
+///
+/// A name is matched against the trie of the names to capture in the form it
+/// is sent in, Huffman coded or not.
 fn insert_length_rows(dfa: &mut Dfa<Action>) {
     let rows = [
         (
             S_KEY_LEN,
             Kind::KeyLen,
-            S_NAME,
+            (S_NAME_PLAIN, S_NAME),
             S_KEY_LEN_CONT,
             S_KEY_LEN_CONT_HUFF,
         ),
         (
             S_VAL_LEN,
             Kind::ValLen,
-            S_FIELD,
+            (S_FIELD, S_FIELD),
             S_VAL_LEN_CONT,
             S_VAL_LEN_CONT_HUFF,
         ),
     ];
 
-    for (from, kind, to, cont, cont_huff) in rows {
-        for (base, flags, cont) in [(0x00u8, 0, cont), (0x80u8, F_HUFF, cont_huff)] {
+    for (from, kind, (to_plain, to_huff), cont, cont_huff) in rows {
+        for (base, flags, to, cont) in [
+            (0x00u8, 0, to_plain, cont),
+            (0x80u8, F_HUFF, to_huff, cont_huff),
+        ] {
             for len in 0..0x7F {
                 let action = Action::new(kind, len, flags);
                 dfa.insert_edge(from, Input::from(base | len as u8), to, Some(action));
@@ -109,7 +115,7 @@ fn insert_continuation_rows(dfa: &mut Dfa<Action>) {
         (S_IDX6_CONT, Kind::IdxName, S_VAL_LEN, F_ADD_DT),
         (S_IDX4_CONT, Kind::IdxName, S_VAL_LEN, 0),
         (S_STG_CONT, Kind::TableSize, S_FIELD, 0),
-        (S_KEY_LEN_CONT, Kind::KeyLen, S_NAME, 0),
+        (S_KEY_LEN_CONT, Kind::KeyLen, S_NAME_PLAIN, 0),
         (S_KEY_LEN_CONT_HUFF, Kind::KeyLen, S_NAME, F_HUFF),
         (S_VAL_LEN_CONT, Kind::ValLen, S_FIELD, 0),
         (S_VAL_LEN_CONT_HUFF, Kind::ValLen, S_FIELD, F_HUFF),
@@ -235,13 +241,13 @@ mod tests {
     use crate::{MatchId, StateId};
     use std::collections::HashSet;
 
-    /// Returns the states a representation is walked with. `S_DEAD` and
-    /// `S_NAME` are left out, as it is the patterns that give those their
-    /// transitions.
+    /// Returns the states a representation is walked with. `S_DEAD` and the
+    /// roots of the name tries are left out, as it is the patterns that give
+    /// those their transitions.
     fn representation_states() -> Vec<StateId> {
         (S_FIELD.0..S_RESERVED)
             .map(StateId)
-            .filter(|state| *state != S_NAME)
+            .filter(|state| *state != S_NAME && *state != S_NAME_PLAIN)
             .collect()
     }
 
@@ -271,7 +277,7 @@ mod tests {
 
         for (_, _, to, _) in dfa.iter_transitions() {
             assert!(
-                to == S_DEAD || to == S_NAME || from.contains(&to),
+                to == S_DEAD || to == S_NAME || to == S_NAME_PLAIN || from.contains(&to),
                 "state {to:?} leads nowhere"
             );
         }

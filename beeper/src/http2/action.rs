@@ -20,7 +20,8 @@ pub const S_KEY_LEN: StateId = StateId(4);
 /// State marking the first byte of a field value.
 pub const S_VAL_LEN: StateId = StateId(5);
 
-/// The root of the trie of the field names to capture.
+/// The root of the trie of the field names to capture, as they read Huffman
+/// coded.
 pub const S_NAME: StateId = StateId(6);
 
 /// Continuation of the index of an indexed field.
@@ -48,8 +49,12 @@ pub const S_VAL_LEN_CONT: StateId = StateId(13);
 /// Continuation of the length of a Huffman coded field value.
 pub const S_VAL_LEN_CONT_HUFF: StateId = StateId(14);
 
+/// The root of the trie of the field names to capture, as they read when they
+/// are not Huffman coded.
+pub const S_NAME_PLAIN: StateId = StateId(15);
+
 /// Number of reserved states (see definitions above).
-pub const S_RESERVED: u16 = 15;
+pub const S_RESERVED: u16 = 16;
 
 /// Boolean indicating that the string is Huffman-encoded.
 pub const F_HUFF: u8 = 1 << 0;

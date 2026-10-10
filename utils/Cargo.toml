@@ -10,6 +10,7 @@ as-bytes = "0.2.0"
 axum = { version = "0.8.9", features = ["http2"] }
 beeper = { path = "../beeper", features = ["http1", "http2"] }
 bytes = "1.12.1"
+httlib-huffman = "0.3.4"
 libc = "0.2.189"
 tokio = { version = "1.53", features = ["full"] }
 tracing = "0.1.44"

@@ -116,7 +116,7 @@ static __always_inline int _parse_from(u8 *data, u8 *data_end, u16 start, struct
             ms[mid] = (struct http_match) {
                 .idx = cidx[mid],
                 .len = i - cidx[mid] + 1,
-                .in_msg = true
+                .source = HTTP_SRC_MSG
             };
         }
 

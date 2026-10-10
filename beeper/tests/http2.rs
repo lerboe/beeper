@@ -273,6 +273,22 @@ impl RawClient {
         self.read_frame(0x01).await;
     }
 
+    /// Same as `request_continued`, but writes the CONTINUATION frame on its
+    /// own, after the HEADERS frame has gone out, so that the parser has to
+    /// wait for it.
+    async fn request_continued_apart(&mut self, block: Vec<u8>, split: usize) {
+        let id = self.next_stream_id;
+        self.next_stream_id += 2;
+
+        // END_STREAM, but the block carries on
+        self.send_raw(&frame(0x01, 0x01, id, &block[..split])).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // CONTINUATION | END_HEADERS
+        self.send_raw(&frame(0x09, 0x04, id, &block[split..])).await;
+
+        self.read_frame(0x01).await;
+    }
+
     /// Sends every request in `reqs` in a single write, so that the parser has
     /// to find each frame by the length of the one before it. Each of them is
     /// the flags its HEADERS frame carries on top of END_STREAM and
@@ -858,6 +874,42 @@ async fn update_dynamic_table_size() {
 }
 
 #[tokio::test]
+async fn clear_dynamic_table_with_a_size_update_to_zero() {
+    let addr = server::launch().await.expect("launch server");
+
+    let mut open_obj = OpenObject::new();
+    let (_prog, _h1, h2, _mids) = attach_at(addr, &mut open_obj, Hook::Msg, &[]);
+
+    let mut client = RawClient::connect(addr).await;
+    client
+        .request(raw_request_block(
+            &addr.to_string(),
+            &[(Some(19), "accept", "*/*")],
+        ))
+        .await;
+
+    let info = h2
+        .dynamic_table_info(client.local_addr, client.remote_addr)
+        .expect("connection is known")
+        .expect("dynamic_table_info");
+    assert_eq!(info.count, 1);
+
+    // a size update to 0 clears the table, and the one to 4096 right after it
+    // grows it back without bringing anything back (h2spec generic/5/15)
+    let mut block = vec![0x20, 0x3F, 0xE1, 0x1F];
+    block.extend_from_slice(&raw_request_block(&addr.to_string(), &[]));
+    client.request(block).await;
+
+    let info = h2
+        .dynamic_table_info(client.local_addr, client.remote_addr)
+        .expect("connection is known")
+        .expect("dynamic_table_info");
+    assert_eq!(info.max_size, 4096);
+    assert_eq!(info.count, 0);
+    assert_eq!(info.size, 0);
+}
+
+#[tokio::test]
 async fn evict_header_field_from_dynamic_table() {
     let addr = server::launch().await.expect("launch server");
 
@@ -1170,39 +1222,53 @@ async fn parse_header_block_split_over_a_continuation_frame() {
     );
 }
 
-#[tokio::test]
-async fn mark_the_table_as_drifted_when_a_continuation_frame_splits_a_field() {
+/// Sends a request whose `accept` value is split across a HEADERS and a
+/// CONTINUATION frame that are written apart, and checks that the parser waited
+/// for the CONTINUATION frame and captured the value whole.
+async fn capture_a_value_split_across_a_continuation_frame(hook: Hook) {
     let addr = server::launch().await.expect("launch server");
 
     let mut open_obj = OpenObject::new();
-    let (prog, _h1, h2, mids) =
-        attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT.as_str()]);
+    let (prog, _h1, h2, mids) = attach_at(addr, &mut open_obj, hook, &[header::ACCEPT.as_str()]);
 
     let authority = addr.to_string();
     let accept_val = HeaderValue::from_static("across-the-break");
     let block = raw_request_block(&authority, &[(Some(19), "accept", "across-the-break")]);
 
-    // the block breaks two bytes into the authority, whose first half is in a
-    // frame the parser cannot address once the second one arrives
+    // the block breaks three bytes before its end, in the middle of the value
     let mut client = RawClient::connect(addr).await;
-    client.request_continued(block, 3 + 1 + 1 + 2).await;
+    let split = block.len() - 3;
+    client.request_continued_apart(block, split).await;
 
-    // the fields behind the break are still read, the parser only loses the one
-    // the break falls inside of
     assert_eq!(
         prog.get_match(mids[0]).expect("get_match").as_deref(),
         Some(accept_val.as_bytes()),
-        "the field behind the break was not read"
+        "the value across the break was not captured"
     );
 
+    let (local, remote) = conn_at(hook, client.local_addr, client.remote_addr);
     let info = h2
-        .dynamic_table_info(client.local_addr, client.remote_addr)
+        .dynamic_table_info(local, remote)
         .expect("connection is known")
         .expect("dynamic_table_info");
+
+    let expected_dt = &[(header::ACCEPT.as_str(), accept_val.clone())];
+    assert_eq!(info.count, expected_dt.len() as u32);
+    assert_eq!(info.size, dynamic_table_size_for_headers(expected_dt));
     assert_eq!(
-        info.dirty, 1,
-        "a block that breaks inside a field left the table looking trustworthy"
+        info.dirty, 0,
+        "a block that breaks inside a field left the table looking untrustworthy"
     );
+}
+
+#[tokio::test]
+async fn capture_a_value_split_across_a_continuation_frame_in_msg() {
+    capture_a_value_split_across_a_continuation_frame(Hook::Msg).await;
+}
+
+#[tokio::test]
+async fn capture_a_value_split_across_a_continuation_frame_in_skb() {
+    capture_a_value_split_across_a_continuation_frame(Hook::Skb).await;
 }
 
 #[tokio::test]

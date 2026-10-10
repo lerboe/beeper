@@ -183,10 +183,16 @@ impl Parser {
         let mut name_encoded = Vec::new();
         huffman::encode(name, &mut name_encoded)?;
 
+        // a peer may send the name Huffman coded or not, and the parser matches
+        // it in the form it was sent in
         let mid = self.new_match()?;
         self.dfa
             .start_pattern(S_NAME)
             .push_bytes(&name_encoded)
+            .with(Action::capture(mid));
+        self.dfa
+            .start_pattern(S_NAME_PLAIN)
+            .push_bytes(name)
             .with(Action::capture(mid));
 
         self.captures.insert(name.to_vec(), mid);
@@ -379,11 +385,9 @@ impl Parser {
 
         let dynamic_table_info = MapHandle::try_from(&skel.maps.dynamic_table_info)?;
         let dynamic_table = MapHandle::try_from(&skel.maps.dynamic_table)?;
-        let continued_blocks = MapHandle::try_from(&skel.maps.continued_blocks)?;
         Ok(AttachedParser {
             dynamic_table_info,
             dynamic_table,
-            continued_blocks,
             links,
         })
     }
@@ -457,9 +461,6 @@ pub struct AttachedParser {
     /// The entries of those dynamic tables.
     dynamic_table: MapHandle,
 
-    /// The header blocks that carry on into a CONTINUATION frame.
-    continued_blocks: MapHandle,
-
     #[allow(dead_code)]
     links: Vec<Link>,
 }
@@ -485,9 +486,9 @@ pub struct DynamicTableInfo {
     /// Whether the table has drifted from the peer's and can no longer be
     /// trusted.
     ///
-    /// It drifts when a header block is split over a HEADERS frame and the
-    /// CONTINUATION frames following it in the middle of a field (see [Section
-    /// 6.10 of RFC 9113](https://datatracker.ietf.org/doc/html/rfc7541#section-6.10).
+    /// It drifts when a Huffman coded field that is added to the table is longer
+    /// than an entry keeps, as its size can then no longer be counted the way
+    /// the peer counts it.
     pub dirty: u32,
 }
 
@@ -600,8 +601,6 @@ impl AttachedParser {
             delete_if_present(&self.dynamic_table_info, key)?;
         }
 
-        delete_if_present(&self.continued_blocks, key)?;
-
         Ok(())
     }
 }
@@ -617,6 +616,7 @@ fn delete_if_present(map: &MapHandle, key: &[u8]) -> Result<(), Error> {
 mod tests {
     use super::*;
     use crate::pseudo_header::{METHOD, PATH, STATUS};
+    use crate::{StateId, dfa::Input};
 
     fn hdr(i: u8) -> HeaderName {
         HeaderName::from_bytes(format!("x-{i}").as_bytes()).unwrap()
@@ -634,6 +634,38 @@ mod tests {
             parser.capture_hdr(&hdr(MAX_MATCHES)),
             Err(Error::MatchLimitExceeded(limit)) if limit == MAX_MATCHES as usize
         ));
+    }
+
+    /// Follows `name` from `root`, and returns the match the last byte of it
+    /// captures, if any.
+    fn walk(parser: &Parser, root: StateId, name: &[u8]) -> Option<u8> {
+        let transitions: Vec<_> = parser.dfa.iter_transitions().collect();
+        let mut state = root;
+        let mut captured = None;
+        for &byte in name {
+            let (_, _, to, action) = transitions
+                .iter()
+                .find(|(from, input, ..)| *from == state && *input == Input::from(byte))?;
+            state = *to;
+            captured = action
+                .filter(|action| action.kind == Kind::Capture)
+                .map(|action| action.val as u8);
+        }
+
+        captured
+    }
+
+    #[test]
+    fn a_name_is_matched_whether_it_is_huffman_coded_or_not() {
+        let mut parser = Parser::new();
+        let mid = parser.capture_hdr("te").expect("capture header");
+
+        let mut coded = Vec::new();
+        huffman::encode(b"te", &mut coded).unwrap();
+
+        assert_eq!(walk(&parser, S_NAME, &coded), Some(u8::from(mid)));
+        assert_eq!(walk(&parser, S_NAME_PLAIN, b"te"), Some(u8::from(mid)));
+        assert_eq!(walk(&parser, S_NAME_PLAIN, &coded), None);
     }
 
     #[test]

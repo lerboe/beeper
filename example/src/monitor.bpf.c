@@ -162,6 +162,26 @@ int msg_verdict(struct sk_msg_md *msg) {
     if (is_h2) {
         struct http2_frame frame = { 0 };
         msg_len = parse_http2(msg, &pres, &frame);
+
+        // a frame written in pieces is parsed once all of it has arrived, and
+        // a header block once all of the frames it is sent in have, the 9
+        // bytes being the frame header
+        if (msg_len == 0 || msg_len == -EAGAIN) {
+            bpf_msg_cork_bytes(msg, msg_len == 0 ? 9 : frame.need);
+            return SK_PASS;
+        }
+
+        u32 frame_len = 9 + frame.len;
+
+        // a frame that breaks the rules for header blocks is a connection
+        // error, which the peer is to answer by closing the connection. The
+        // parser skips it, so the frames after it are still logged
+        if (msg_len == -EPROTO) {
+            bpf_warn("%s [h2 stream %u] protocol error", is_downstream ? "-->" : "<--", frame.sid);
+            bpf_msg_apply_bytes(msg, frame_len);
+            return SK_PASS;
+        }
+
         if (msg_len < 0) {
             bpf_error("Failed to parse h2 message");
             return SK_PASS;
