@@ -7,10 +7,6 @@
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_core_read.h>
 
-// The program the integration tests attach a parser to. It parses every message
-// travelling in the direction under test and stores what the parser captured in
-// `matches`, where the test can read it back from user space.
-
 // The connections that carried an HTTP/2 preface and are parsed as HTTP/2 from
 // then on.
 struct {

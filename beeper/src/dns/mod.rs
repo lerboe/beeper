@@ -62,6 +62,3 @@ mod parser;
 
 pub use parser::AttachedParser;
 pub use parser::Parser;
-
-#[cfg(test)]
-mod tests;
