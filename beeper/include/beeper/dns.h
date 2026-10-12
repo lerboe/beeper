@@ -162,8 +162,7 @@ struct dns_parse_res {
     struct dns_edns edns;
 };
 
-// A resource record, as filled in by the record iterator. Zero it before the
-// first call, and pass it back unchanged to get the next record.
+// A resource record, as filled in by the record extraction.
 struct dns_rr {
     struct dns_name name;
     u16 type;
@@ -172,8 +171,6 @@ struct dns_rr {
     u16 rdlen;
     u16 rdata_off; // offset of the RDATA in the buffer
     u16 off;       // offset of the record in the buffer
-    u16 next;      // offset of the next record, 0 before the first call
-    u16 idx;       // number of records returned so far, this one included
     u8 section;    // DNS_SECTION_*
 };
 
@@ -224,31 +221,34 @@ struct dns_name_buf {
         return ret;                                                                                \
     }
 
-// Creates `name`, a stub for the record iterator (`dns::Parser::next_rr_fn`,
-// `MessageBuffer::Msg`). It moves `rr` to the next record of the answer,
-// authority and additional sections of a message the parser accepted. Returns
-// 0, or `DNS_ERR_END` once all records were returned.
-#define BEEPER_DNS_NEXT_RR_MSG(name)                                                               \
+// Creates `name`, a stub for the record extraction (`dns::Parser::extract_rr_fn`,
+// `MessageBuffer::Msg`). It parses the record at `idx` into `rr`, counted from
+// 0 across the answer, authority and additional sections of a message the
+// parser accepted. Returns 0, or `DNS_ERR_END` if the message holds no record
+// at `idx`.
+#define BEEPER_DNS_EXTRACT_RR_MSG(name)                                                            \
     __noinline int name(const struct sk_msg_md *msg, const struct dns_parse_res *pres __arg_nonnull, \
-                        struct dns_rr *rr __arg_nonnull) {                                         \
+                        u32 idx, struct dns_rr *rr __arg_nonnull) {                                \
         int ret = -1;                                                                              \
                                                                                                    \
         __sink(msg);                                                                               \
         __sink(pres);                                                                              \
+        __sink(idx);                                                                               \
         __sink(rr);                                                                                \
         __sink(ret);                                                                               \
                                                                                                    \
         return ret;                                                                                \
     }
 
-// Same as `BEEPER_DNS_NEXT_RR_MSG`, for `MessageBuffer::Skb`.
-#define BEEPER_DNS_NEXT_RR_SKB(name)                                                               \
+// Same as `BEEPER_DNS_EXTRACT_RR_MSG`, for `MessageBuffer::Skb`.
+#define BEEPER_DNS_EXTRACT_RR_SKB(name)                                                            \
     __noinline int name(const struct __sk_buff *skb, const struct dns_parse_res *pres __arg_nonnull, \
-                        struct dns_rr *rr __arg_nonnull) {                                         \
+                        u32 idx, struct dns_rr *rr __arg_nonnull) {                                \
         int ret = -1;                                                                              \
                                                                                                    \
         __sink(skb);                                                                               \
         __sink(pres);                                                                              \
+        __sink(idx);                                                                               \
         __sink(rr);                                                                                \
         __sink(ret);                                                                               \
                                                                                                    \

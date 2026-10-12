@@ -323,7 +323,11 @@ fn attach_http1_parser(prog_fd: i32, hook: Hook) -> http1::AttachedParser {
 
 /// Attaches a parser capturing `hdrs` and returns it along with the match id
 /// of each of them, in the order they were configured in.
-fn attach_http2_parser(prog_fd: i32, hook: Hook, hdrs: &[&str]) -> (http2::AttachedParser, Vec<MatchId>) {
+fn attach_http2_parser(
+    prog_fd: i32,
+    hook: Hook,
+    hdrs: &[&str],
+) -> (http2::AttachedParser, Vec<MatchId>) {
     let mut h2 = http2::Parser::new();
 
     let mut mids = Vec::new();

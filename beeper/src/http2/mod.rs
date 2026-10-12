@@ -67,8 +67,8 @@ use std::net::SocketAddr;
 mod action;
 mod hpack;
 mod parser;
-pub use parser::{AttachedParser, DynamicTableInfo, Parser};
 use parser::ip4_addr;
+pub use parser::{AttachedParser, DynamicTableInfo, Parser};
 
 impl From<SocketAddr> for ip4_addr {
     /// Converts `addr` into the address the BPF programs key their per

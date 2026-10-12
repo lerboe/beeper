@@ -9,7 +9,7 @@
 
 // The functions beeper replaces with the parser when a test attaches it.
 BEEPER_DNS_PARSE_SKB(parse_dns)
-BEEPER_DNS_NEXT_RR_SKB(next_dns_rr)
+BEEPER_DNS_EXTRACT_RR_SKB(extract_dns_rr)
 BEEPER_DNS_EXTRACT_NAME_SKB(extract_dns_name)
 
 #define TEST_MAX_RRS 16
@@ -21,13 +21,13 @@ u32 test_name_flags = 0;
 int test_ret = 0;
 struct dns_parse_res test_res = { 0 };
 
-// The records the iterator returned, along with what it returned last.
+// The records the extraction returned, along with what it returned last.
 int test_rr_ret = 0;
 u32 test_num_rrs = 0;
 struct dns_rr test_rrs[TEST_MAX_RRS] = { 0 };
 
-// The cursor of the iterator. It is kept out of the stack, as it is behind the
-// pointer the target program passes to the record iterator.
+// The record extracted last. It is kept out of the stack, as it is behind the
+// pointer the target program passes to the record extraction.
 struct dns_rr test_cur = { 0 };
 
 // The question name and the owner of every record in `test_rrs`, decompressed.
@@ -47,7 +47,7 @@ int run(struct __sk_buff *skb) {
 
     u32 i;
     bpf_for(i, 0, TEST_MAX_RRS) {
-        test_rr_ret = next_dns_rr(skb, &test_res, &test_cur);
+        test_rr_ret = extract_dns_rr(skb, &test_res, i, &test_cur);
         if (test_rr_ret < 0) break;
 
         test_rrs[i] = test_cur;

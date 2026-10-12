@@ -20,7 +20,7 @@
 //!
 //! let parser = dns::Parser::new()
 //!     .parse_fn("parse_dns", MessageBuffer::Skb)
-//!     .next_rr_fn("next_dns_rr", MessageBuffer::Skb)
+//!     .extract_rr_fn("extract_dns_rr", MessageBuffer::Skb)
 //!     .extract_name_fn("extract_dns_name", MessageBuffer::Skb)
 //!     .attach(prog_fd)?;
 //! # Ok(())
@@ -33,7 +33,7 @@
 //! #include "beeper/dns.h"
 //!
 //! BEEPER_DNS_PARSE_SKB(parse_dns)
-//! BEEPER_DNS_NEXT_RR_SKB(next_dns_rr)
+//! BEEPER_DNS_EXTRACT_RR_SKB(extract_dns_rr)
 //! BEEPER_DNS_EXTRACT_NAME_SKB(extract_dns_name)
 //!
 //! SEC("tc")
@@ -50,7 +50,9 @@
 //!     }
 //!
 //!     struct dns_rr rr = { 0 };
-//!     while (next_dns_rr(skb, &pres, &rr) == 0) {
+//!     u32 i;
+//!     bpf_for(i, 0, MAX_RRS) {
+//!         if (extract_dns_rr(skb, &pres, i, &rr) < 0) break;
 //!         // rr.type, rr.ttl, rr.rdata_off, ...
 //!     }
 //!

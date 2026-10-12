@@ -18,8 +18,8 @@ pub struct Parser {
     /// The parse function name for each message buffer.
     parse_fns: HashMap<MessageBuffer, String>,
 
-    /// The record iterator function name for each message buffer.
-    next_rr_fns: HashMap<MessageBuffer, String>,
+    /// The record extraction function name for each message buffer.
+    extract_rr_fns: HashMap<MessageBuffer, String>,
 
     /// The name extraction function name for each message buffer.
     extract_name_fns: HashMap<MessageBuffer, String>,
@@ -42,10 +42,15 @@ impl Parser {
     }
 
     /// Specifies the function template in the target program to be replaced with the record
-    /// iterator, declared with `BEEPER_DNS_NEXT_RR_MSG` or `BEEPER_DNS_NEXT_RR_SKB`. The
-    /// function will not be replaced until `attach` is called.
-    pub fn next_rr_fn<S: ToString>(mut self, next_rr_fn: S, msg_buf: MessageBuffer) -> Parser {
-        self.next_rr_fns.insert(msg_buf, next_rr_fn.to_string());
+    /// extraction, declared with `BEEPER_DNS_EXTRACT_RR_MSG` or `BEEPER_DNS_EXTRACT_RR_SKB`.
+    /// The function will not be replaced until `attach` is called.
+    pub fn extract_rr_fn<S: ToString>(
+        mut self,
+        extract_rr_fn: S,
+        msg_buf: MessageBuffer,
+    ) -> Parser {
+        self.extract_rr_fns
+            .insert(msg_buf, extract_rr_fn.to_string());
         self
     }
 
@@ -65,7 +70,7 @@ impl Parser {
 
     /// Loads the configured parser and attaches it to the target program.
     ///
-    /// Every function configured with [`Parser::parse_fn`], [`Parser::next_rr_fn`] or
+    /// Every function configured with [`Parser::parse_fn`], [`Parser::extract_rr_fn`] or
     /// [`Parser::extract_name_fn`] is replaced in the target program, the remaining parser
     /// programs are left unloaded.
     ///
@@ -92,14 +97,14 @@ impl Parser {
             (&self.parse_fns, MessageBuffer::Msg, &mut progs.parse_msg),
             (&self.parse_fns, MessageBuffer::Skb, &mut progs.parse_skb),
             (
-                &self.next_rr_fns,
+                &self.extract_rr_fns,
                 MessageBuffer::Msg,
-                &mut progs.next_rr_msg,
+                &mut progs.extract_rr_msg,
             ),
             (
-                &self.next_rr_fns,
+                &self.extract_rr_fns,
                 MessageBuffer::Skb,
-                &mut progs.next_rr_skb,
+                &mut progs.extract_rr_skb,
             ),
             (
                 &self.extract_name_fns,
@@ -127,8 +132,16 @@ impl Parser {
         let loaded = [
             (&self.parse_fns, MessageBuffer::Msg, &progs.parse_msg),
             (&self.parse_fns, MessageBuffer::Skb, &progs.parse_skb),
-            (&self.next_rr_fns, MessageBuffer::Msg, &progs.next_rr_msg),
-            (&self.next_rr_fns, MessageBuffer::Skb, &progs.next_rr_skb),
+            (
+                &self.extract_rr_fns,
+                MessageBuffer::Msg,
+                &progs.extract_rr_msg,
+            ),
+            (
+                &self.extract_rr_fns,
+                MessageBuffer::Skb,
+                &progs.extract_rr_skb,
+            ),
             (
                 &self.extract_name_fns,
                 MessageBuffer::Msg,
