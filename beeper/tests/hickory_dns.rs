@@ -88,7 +88,7 @@ fn attach_dns_parser(prog_fd: i32, hook: Hook) -> dns::AttachedParser {
     let suffix = hook.to_string();
     dns::Parser::new()
         .parse_fn(format!("parse_dns_{suffix}"), hook.into())
-        .extract_rr_fn(format!("extract_dns_rr_{suffix}"), hook.into())
+        .next_rr_fn(format!("next_dns_rr_{suffix}"), hook.into())
         .extract_name_fn(format!("extract_dns_name_{suffix}"), hook.into())
         .attach(prog_fd)
         .expect("attach parser")

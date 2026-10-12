@@ -64,11 +64,11 @@ BEEPER_EXTRACT_MATCH_SKB(extract_http2_match_skb)
 BEEPER_HTTP2_PARSE_SKB(parse_http2_skb)
 
 BEEPER_DNS_PARSE_MSG(parse_dns_msg)
-BEEPER_DNS_EXTRACT_RR_MSG(extract_dns_rr_msg)
+BEEPER_DNS_NEXT_RR_MSG(next_dns_rr_msg)
 BEEPER_DNS_EXTRACT_NAME_MSG(extract_dns_name_msg)
 
 BEEPER_DNS_PARSE_SKB(parse_dns_skb)
-BEEPER_DNS_EXTRACT_RR_SKB(extract_dns_rr_skb)
+BEEPER_DNS_NEXT_RR_SKB(next_dns_rr_skb)
 BEEPER_DNS_EXTRACT_NAME_SKB(extract_dns_name_skb)
 
 extern void *bpf_cast_to_kern_ctx(void *obj) __ksym;
@@ -140,7 +140,7 @@ struct dns_name_buf dns_rr_names[DNS_MAX_RRS] = { 0 };
 struct dns_rr dns_cur = { 0 };
 
 // Records the question name and the records of the message `dns_res` holds.
-#define STORE_DNS_MSG(ctx, extract_rr, extract_name)                                               \
+#define STORE_DNS_MSG(ctx, next_rr, extract_name)                                                  \
     do {                                                                                           \
         u32 flags = DNS_NAME_DOTTED | DNS_NAME_LOWER;                                              \
         if (dns_res.hdr.qdcount > 0) {                                                             \
@@ -148,9 +148,10 @@ struct dns_rr dns_cur = { 0 };
         }                                                                                          \
                                                                                                    \
         dns_num_rrs = 0;                                                                           \
+        struct dns_cursor cur = { 0 };                                                             \
         u32 j = 0;                                                                                 \
         bpf_for(j, 0, DNS_MAX_RRS) {                                                               \
-            if (extract_rr(ctx, &dns_res, j, &dns_cur) < 0) break;                                 \
+            if (next_rr(ctx, &dns_res, &cur, &dns_cur) < 0) break;                                 \
                                                                                                    \
             dns_rrs[j] = dns_cur;                                                                  \
             extract_name(ctx, &dns_res, dns_cur.name.off, flags, &dns_rr_names[j]);                \
@@ -168,7 +169,7 @@ static __always_inline int dns_msg_verdict(struct sk_msg_md *msg) {
         if (dns_ret < 0) break;
 
         dns_num_msgs += 1;
-        STORE_DNS_MSG(msg, extract_dns_rr_msg, extract_dns_name_msg);
+        STORE_DNS_MSG(msg, next_dns_rr_msg, extract_dns_name_msg);
 
         off += dns_ret;
         if (off >= msg->size) break;
@@ -341,7 +342,7 @@ int skb_verdict(struct __sk_buff *skb) {
         dns_ret = parse_dns_skb(skb, off, DNS_PARSE_TCP, &dns_res);
         if (dns_ret >= 0) {
             dns_num_msgs += 1;
-            STORE_DNS_MSG(skb, extract_dns_rr_skb, extract_dns_name_skb);
+            STORE_DNS_MSG(skb, next_dns_rr_skb, extract_dns_name_skb);
         }
 
         return SK_PASS;

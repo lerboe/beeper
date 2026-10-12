@@ -9,7 +9,7 @@
 
 // The functions beeper replaces with the parser when a test attaches it.
 BEEPER_DNS_PARSE_SKB(parse_dns)
-BEEPER_DNS_EXTRACT_RR_SKB(extract_dns_rr)
+BEEPER_DNS_NEXT_RR_SKB(next_dns_rr)
 BEEPER_DNS_EXTRACT_NAME_SKB(extract_dns_name)
 
 #define TEST_MAX_RRS 16
@@ -45,9 +45,10 @@ int run(struct __sk_buff *skb) {
         test_qname_ret = extract_dns_name(skb, &test_res, test_res.q.name.off, test_name_flags, &test_qname);
     }
 
+    struct dns_cursor cur = { 0 };
     u32 i;
     bpf_for(i, 0, TEST_MAX_RRS) {
-        test_rr_ret = extract_dns_rr(skb, &test_res, i, &test_cur);
+        test_rr_ret = next_dns_rr(skb, &test_res, &cur, &test_cur);
         if (test_rr_ret < 0) break;
 
         test_rrs[i] = test_cur;

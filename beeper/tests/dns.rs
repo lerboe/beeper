@@ -104,7 +104,7 @@ fn attach(open_obj: &mut MaybeUninit<OpenObject>) -> (DnsProgram<'_>, dns::Attac
     let prog = DnsProgram::load(open_obj).expect("load");
     let parser = dns::Parser::new()
         .parse_fn("parse_dns", MessageBuffer::Skb)
-        .extract_rr_fn("extract_dns_rr", MessageBuffer::Skb)
+        .next_rr_fn("next_dns_rr", MessageBuffer::Skb)
         .extract_name_fn("extract_dns_name", MessageBuffer::Skb)
         .attach(prog.prog_fd())
         .expect("attach parser");

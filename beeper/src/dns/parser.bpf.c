@@ -3,180 +3,9 @@
 #include "xbpf.h"
 #include <bpf/bpf_helpers.h>
 
-// The DNS parser. Like the HTTP parsers, it walks a message byte by byte along
-// a DFA that user space builds and injects, see dns/grammar.rs. The DFA knows
-// the layout of the header, of a name and of every entry, and its actions tell
-// the runtime below what a byte is. The runtime keeps what the DFA cannot: the
-// counts of the entries, the lengths of labels, RDATA and TLVs, which it skips,
-// and the compression pointers, which it follows with the name walk.
-
 // The number of steps a name walk takes at most. A name holds at most 128 labels
 // (RFC 1035 3.1, the root included), which leaves room for at least 64 pointers.
 #define DNS_NAME_STEPS (128 + 64)
-
-// A hook-agnostic message context.
-struct msg_ctx {
-    u64 data;
-    u32 size;
-    u32 base;
-    u32 end;
-};
-
-static __always_inline struct msg_ctx _new_msg_ctx(u64 data, u64 data_end) {
-    return (struct msg_ctx) {
-        .data = data,
-        .size = data_end > data ? data_end - data : 0,
-    };
-}
-
-// Returns `off`, of which the verifier then only knows that it fits 16 bits.
-static __always_inline u32 _dns_widen(u32 off, u32 i) {
-    volatile u64 slots[2];
-    slots[0] = off;
-    slots[1] = off;
-
-    u64 o = slots[i & 1];
-    asm volatile("%0 &= 0xFFFF" : "+r"(o));
-    return o;
-}
-
-static __always_inline int _dns_read(const struct msg_ctx *m, u32 off, void *dst, u32 size) {
-    u64 end = (u64)off + size;
-    if (end > m->end || end > m->size) return DNS_ERR_FORMAT;
-
-    if (bpf_probe_read_kernel(dst, size, (const void *)(m->data + off)) < 0) return DNS_ERR_FORMAT;
-    return 0;
-}
-
-static __always_inline int _dns_u16(const struct msg_ctx *m, u32 off, u16 *v) {
-    u8 b[2];
-    if (_dns_read(m, off, b, sizeof(b)) < 0) return DNS_ERR_FORMAT;
-
-    *v = ((u16)b[0] << 8) | b[1];
-    return 0;
-}
-
-static __always_inline int _dns_u32(const struct msg_ctx *m, u32 off, u32 *v) {
-    u8 b[4];
-    if (_dns_read(m, off, b, sizeof(b)) < 0) return DNS_ERR_FORMAT;
-
-    *v = ((u32)b[0] << 24) | ((u32)b[1] << 16) | ((u32)b[2] << 8) | b[3];
-    return 0;
-}
-
-static __always_inline int _dns_append_label(const struct msg_ctx *m, u32 off, u8 len, u32 flags,
-                                             struct dns_name_buf *out) {
-    len &= DNS_MAX_LABEL;
-    if (len == 0) return DNS_ERR_FORMAT;
-
-    u32 olen = out->len;
-    if (!(flags & DNS_NAME_DOTTED)) {
-        out->buf[olen & DNS_MAX_NAME] = len;
-        olen += 1;
-    }
-    else if (olen > 0) {
-        out->buf[olen & DNS_MAX_NAME] = '.';
-        olen += 1;
-    }
-
-    u32 k;
-    bpf_for(k, 0, (len + 7) / 8) {
-        u8 chunk[8];
-        u32 done = k * 8;
-        u32 size = len - done > 8 ? 8 : len - done;
-        if (_dns_read(m, off + done, chunk, size) < 0) return DNS_ERR_FORMAT;
-
-        u32 j;
-        bpf_for(j, 0, size) {
-            u8 ch = chunk[j & 7];
-            if ((flags & DNS_NAME_LOWER) && ch >= 'A' && ch <= 'Z') ch += 'a' - 'A';
-
-            out->buf[(olen + done + j) & DNS_MAX_NAME] = ch;
-        }
-    }
-
-    out->len = olen + len;
-    out->labels += 1;
-
-    return 0;
-}
-
-static __always_inline void _dns_finish_name(u32 flags, struct dns_name_buf *out) {
-    u32 olen = out->len;
-    if (!(flags & DNS_NAME_DOTTED)) {
-        out->buf[olen & DNS_MAX_NAME] = 0;
-        olen += 1;
-    }
-    else if (olen == 0) {
-        out->buf[0] = '.';
-        olen = 1;
-    }
-
-    olen &= DNS_MAX_NAME;
-    out->buf[olen] = '\0';
-    out->len = olen;
-}
-
-// Walks the name at `pos`, following its compression pointers. If `out` is not
-// NULL, the name is decompressed into it as `flags` (DNS_NAME_*) ask. `steps`
-// counts the steps a walk took to reach `pos`, if it is the target of a
-// pointer.
-//
-// A pointer has to point before the label sequence it is part of (RFC 1035
-// 4.1.4 calls it a prior occurrence), which also keeps a walk from looping.
-// Labels with the `01` (RFC 6891 5) or `10` prefix are malformed, as are names
-// longer than 255 octets (RFC 1035 3.1).
-//
-// Returns the length of the uncompressed name, root label included, or one of
-// the `DNS_ERR_*`.
-__noinline __weak int _dns_name(const struct msg_ctx *m __arg_nonnull, u32 pos, u32 flags,
-                                struct dns_name_buf *out, u32 steps) {
-    u32 p = pos;
-    u32 floor = pos;
-    u32 wlen = 0;
-
-    if (out) {
-        out->len = 0;
-        out->labels = 0;
-    }
-
-    u32 i;
-    bpf_for(i, steps, DNS_NAME_STEPS) {
-        u8 len = 0;
-        if (_dns_read(m, p, &len, 1) < 0) return DNS_ERR_FORMAT;
-
-        u8 kind = len & 0xC0;
-        if (kind == 0xC0) {
-            u16 ptr = 0;
-            if (_dns_u16(m, p, &ptr) < 0) return DNS_ERR_FORMAT;
-
-            // the header holds no names, and a pointer has to lead backwards
-            u32 target = m->base + (ptr & 0x3FFF);
-            if (target < m->base + DNS_HDR_LEN || target >= floor) return DNS_ERR_FORMAT;
-
-            p = target;
-            floor = target;
-            continue;
-        }
-
-        if (kind != 0) return DNS_ERR_FORMAT;
-
-        wlen = _dns_widen(wlen, i) + 1 + len;
-        if (wlen > DNS_MAX_NAME) return DNS_ERR_FORMAT;
-
-        if (len == 0) {
-            if (out) _dns_finish_name(flags, out);
-
-            return wlen;
-        }
-
-        if (out && _dns_append_label(m, p + 1, len, flags, out) < 0) return DNS_ERR_FORMAT;
-
-        p = _dns_widen(p + 1 + len, i);
-    }
-
-    return DNS_ERR_LIMIT;
-}
 
 // The states the runtime refers to. Every other one is left to the DFA that
 // user space builds, see dns/grammar.rs.
@@ -229,26 +58,26 @@ __noinline __weak int _dns_name(const struct msg_ctx *m __arg_nonnull, u32 pos, 
 #define DNS_FIELD_RDLEN_TLV 10  // the TLVs of an OPT record
 #define DNS_FIELD_TLV_LEN 11
 
-// A single action of the DFA.
 struct dns_action {
     u16 val;
     u8 kind;
     u8 flags;
 };
 
-// All three are masked onto an index, so all three have to be powers of two.
 #define MAX_STATES 256
 #define MAX_EDGES 256
 #define MAX_ACTIONS 256
 
-// The edges of the DFA, indexed by state and input byte, along with their
-// actions. User space fills both in before the program is loaded.
 volatile const struct trans s2ts[MAX_STATES][MAX_EDGES];
 volatile const struct dns_action a2as[MAX_ACTIONS];
 
-// The state of a walk over a message.
+// The state of a walk over a message, which `struct dns_cursor` holds between
+// two records.
 struct dns_parse_state {
-    struct msg_ctx m;
+    // where the message starts and ends, and where the walk goes on
+    u32 base;
+    u32 end;
+    u32 pos;
 
     // the state of the DFA, and the field it accumulates
     u32 s;
@@ -275,6 +104,11 @@ struct dns_parse_state {
     u32 name_len;
     u32 name_labels;
 
+    // the name ends with a pointer, of which the second byte is next, and the
+    // uncompressed length of what it points to
+    u32 in_ptr;
+    u32 ptr_len;
+
     // the RDATA the DFA walks: where it ends
     u32 in_rdata;
     u32 rd_end;
@@ -285,13 +119,126 @@ struct dns_parse_state {
     // where the message ended once it did
     u32 done;
 
-    // the record to extract, or -1, and whether it was
-    s32 want;
-    u32 found;
-
     // the entry being read
     struct dns_rr rr;
 };
+
+_Static_assert(sizeof(struct dns_parse_state) <= sizeof(struct dns_cursor), "dns_cursor is too small");
+
+static __always_inline int _dns_append_label(const u8 *data, const u8 *data_end, u32 end,
+                                             u32 off, u8 len, u32 flags, struct dns_name_buf *out) {
+    len &= DNS_MAX_LABEL;
+    if (len == 0 || off + len > end) return DNS_ERR_FORMAT;
+
+    u32 olen = out->len;
+    if (!(flags & DNS_NAME_DOTTED)) {
+        out->buf[olen & DNS_MAX_NAME] = len;
+        olen += 1;
+    }
+    else if (olen > 0) {
+        out->buf[olen & DNS_MAX_NAME] = '.';
+        olen += 1;
+    }
+
+    u32 j;
+    bpf_for(j, 0, len) {
+        u32 pos = off + j;
+        bpf_clamp_uminmax(pos, 0, MAX_BYTES);
+
+        const u8 *b = data + pos;
+        if (b + 1 > data_end) return DNS_ERR_FORMAT;
+
+        u8 ch = *b;
+        if ((flags & DNS_NAME_LOWER) && ch >= 'A' && ch <= 'Z') ch += 'a' - 'A';
+
+        out->buf[(olen + j) & DNS_MAX_NAME] = ch;
+    }
+
+    out->len = olen + len;
+    out->labels += 1;
+
+    return 0;
+}
+
+static __always_inline void _dns_finish_name(u32 flags, struct dns_name_buf *out) {
+    u32 olen = out->len;
+    if (!(flags & DNS_NAME_DOTTED)) {
+        out->buf[olen & DNS_MAX_NAME] = 0;
+        olen += 1;
+    }
+    else if (olen == 0) {
+        out->buf[0] = '.';
+        olen = 1;
+    }
+
+    olen &= DNS_MAX_NAME;
+    out->buf[olen] = '\0';
+    out->len = olen;
+}
+
+// Walks the name at `pos`, following its compression pointers. If `out` is not
+// NULL, the name is decompressed into it as `flags` (DNS_NAME_*) ask. `steps`
+// counts the steps a walk took to reach `pos`, if it is the target of a
+// pointer.
+//
+// A pointer has to point before the label sequence it is part of (RFC 1035
+// 4.1.4 calls it a prior occurrence), which also keeps a walk from looping.
+// Labels with the `01` (RFC 6891 5) or `10` prefix are malformed, as are names
+// longer than 255 octets (RFC 1035 3.1).
+//
+// Returns the length of the uncompressed name, root label included, or one of
+// the `DNS_ERR_*`.
+static __always_inline int _dns_name(const u8 *data, const u8 *data_end, u32 base, u32 end, u32 pos,
+                                     u32 flags, struct dns_name_buf *out, u32 steps) {
+    u32 p = pos;
+    u32 floor = pos;
+    u32 wlen = 0;
+
+    if (out) {
+        out->len = 0;
+        out->labels = 0;
+    }
+
+    u32 i;
+    bpf_for(i, steps, DNS_NAME_STEPS) {
+        if (p >= end) return DNS_ERR_FORMAT;
+        bpf_clamp_uminmax(p, 0, MAX_BYTES);
+
+        const u8 *b = data + p;
+        if (b + 1 > data_end) return DNS_ERR_FORMAT;
+
+        u8 len = b[0];
+        u8 kind = len & 0xC0;
+        if (kind == 0xC0) {
+            if (p + 1 >= end || b + 2 > data_end) return DNS_ERR_FORMAT;
+
+            // the header holds no names, and a pointer has to lead backwards
+            u32 target = base + (((len & 0x3F) << 8) | b[1]);
+            if (target < base + DNS_HDR_LEN || target >= floor) return DNS_ERR_FORMAT;
+
+            p = target;
+            floor = target;
+            continue;
+        }
+
+        if (kind != 0) return DNS_ERR_FORMAT;
+
+        wlen = wlen + 1 + len;
+        if (wlen > DNS_MAX_NAME) return DNS_ERR_FORMAT;
+
+        if (len == 0) {
+            if (out) _dns_finish_name(flags, out);
+
+            return wlen;
+        }
+
+        if (out && _dns_append_label(data, data_end, end, p + 1, len, flags, out) < 0) return DNS_ERR_FORMAT;
+
+        p = p + 1 + len;
+    }
+
+    return DNS_ERR_LIMIT;
+}
 
 static __always_inline void _name_begin(struct dns_parse_state *ps, u32 i) {
     if (ps->in_name) return;
@@ -356,9 +303,10 @@ static __always_inline int _next_entry(struct dns_parse_state *ps, struct dns_pa
     return 1;
 }
 
-// Ends the entry being read at `off`, and starts the next one.
+// Ends the entry being read at `off`, and starts the next one. A record is
+// copied to `out`, if it is not NULL.
 //
-// Returns 0, or 1 once the message ended or the record to extract was read.
+// Returns 0, 1 once the message ended, or 2 if a record was copied.
 static __always_inline int _end_entry(struct dns_parse_state *ps, struct dns_parse_res *pres, struct dns_rr *out, u32 off) {
     struct dns_rr *rr = &ps->rr;
 
@@ -389,15 +337,12 @@ static __always_inline int _end_entry(struct dns_parse_state *ps, struct dns_par
         pres->tsig_off = rr->off;
     }
 
-    if (ps->want == (s32)ps->idx) {
-        if (out) *out = *rr;
-        ps->found = 1;
-        ps->done = off;
-        return 1;
-    }
+    if (out) *out = *rr;
 
     ps->idx += 1;
-    return _next_entry(ps, pres, off);
+    ps->pos = off;
+    int ret = _next_entry(ps, pres, off);
+    return out ? 2 : ret;
 }
 
 // Reads the header the DFA walked, and starts the first entry at `off`.
@@ -421,7 +366,7 @@ static __always_inline int _begin(struct dns_parse_state *ps, struct dns_parse_r
 
         ps->dso = 1;
         ps->in_rdata = 1;
-        ps->rd_end = ps->m.end;
+        ps->rd_end = ps->end;
         ps->s = S_TLV;
         return 0;
     }
@@ -476,7 +421,7 @@ static __always_inline int _store(struct dns_parse_state *ps, struct dns_parse_r
     rr->rdlen = v;
     rr->rdata_off = i + 1;
     ps->rd_end = i + 1 + v;
-    if (ps->rd_end > ps->m.end) return DNS_ERR_FORMAT;
+    if (ps->rd_end > ps->end) return DNS_ERR_FORMAT;
 
     // RFC 2136 2.4, 2.5: prerequisites and updates may come without RDATA
     if (v == 0 && (update || field == DNS_FIELD_RDLEN_SKIP || field == DNS_FIELD_RDLEN_TLV)) {
@@ -498,8 +443,8 @@ static __always_inline int _store(struct dns_parse_state *ps, struct dns_parse_r
 
 // Reads the byte `c` at `i` of the message.
 //
-// Returns 0 to go on, 1 once the message ended or the record to extract was
-// read, or one of the `DNS_ERR_*`.
+// Returns 0 to go on, 1 once the message ended, 2 once a record was read into
+// `out`, or one of the `DNS_ERR_*`.
 __noinline __weak int _dns_step(struct dns_parse_state *ps __arg_nonnull, struct dns_parse_res *pres __arg_nonnull,
                                 struct dns_rr *out, u32 c, u32 i) {
     // RDATA the DFA walks may only end where a TLV of it would start
@@ -556,23 +501,14 @@ __noinline __weak int _dns_step(struct dns_parse_state *ps __arg_nonnull, struct
     case DNSA_PTR_HI:
         _name_begin(ps, i);
         ps->acc = act.val;
+        ps->in_ptr = 1;
         break;
-    case DNSA_PTR_LO: {
-        // the header holds no names, and a pointer has to lead before the
-        // name it is part of
-        u32 target = ps->m.base + ((ps->acc << 8) | c);
+    case DNSA_PTR_LO:
         ps->acc = 0;
-        if (target < ps->m.base + DNS_HDR_LEN || target >= ps->name_start) return DNS_ERR_FORMAT;
-
-        // the walk of the name extraction takes a step for each label and
-        // the pointer, which leave fewer for the rest
-        int len = _dns_name(&ps->m, target, 0, NULL, ps->name_labels + 1);
-        if (len < 0) return len;
-
-        ret = _name_add(ps, i, len);
+        ps->in_ptr = 0;
+        ret = _name_add(ps, i, ps->ptr_len);
         _name_end(ps, i);
         break;
-    }
     case DNSA_ACC:
         ps->acc = (ps->acc << 8) | c;
         break;
@@ -601,7 +537,7 @@ __noinline __weak int _dns_step(struct dns_parse_state *ps __arg_nonnull, struct
 // entry did.
 __noinline __weak int _dns_finish(struct dns_parse_state *ps __arg_nonnull, struct dns_parse_res *pres __arg_nonnull,
                                   struct dns_rr *out) {
-    u32 end = ps->m.end;
+    u32 end = ps->end;
 
     if (ps->in_rdata) {
         if (ps->rd_end != end || ps->s != S_TLV || ps->skip > 0) return DNS_ERR_FORMAT;
@@ -625,56 +561,65 @@ __noinline __weak int _dns_finish(struct dns_parse_state *ps __arg_nonnull, stru
     return 1;
 }
 
-// Walks the message `ps` describes from its header to its end, byte by byte.
+// Walks the message `ps` describes from where the walk stopped to its end,
+// byte by byte.
 //
-// Returns 1 once it ended or the record to extract was read, or one of the
+// Returns 1 once it ended, 2 once a record was read into `out`, or one of the
 // `DNS_ERR_*`.
 static __always_inline int _run(const u8 *data, const u8 *data_end, struct dns_parse_state *ps,
                                 struct dns_parse_res *pres, struct dns_rr *out) {
-    u32 start = ps->m.base;
-    u32 end = ps->m.end;
+    u32 start = ps->pos;
+    u32 end = ps->end;
     bpf_clamp_uminmax(end, 0, MAX_BYTES + 1);
-
-    ps->s = S_HDR;
 
     u32 i;
     bpf_for(i, start, end) {
         if (data + i + 1 > data_end) return DNS_ERR_FORMAT;
 
-        int ret = _dns_step(ps, pres, out, data[i], i);
+        u32 c = data[i];
+        if (ps->in_ptr) {
+            // the header holds no names, and a pointer has to lead before the
+            // name it is part of
+            u32 target = ps->base + ((ps->acc << 8) | c);
+            if (target < ps->base + DNS_HDR_LEN || target >= ps->name_start) return DNS_ERR_FORMAT;
+
+            // the walk of the name extraction takes a step for each label and
+            // the pointer, which leave fewer for the rest
+            int len = _dns_name(data, data_end, ps->base, ps->end, target, 0, NULL, ps->name_labels + 1);
+            if (len < 0) return len;
+
+            ps->ptr_len = len;
+        }
+
+        int ret = _dns_step(ps, pres, out, c, i);
         if (ret != 0) return ret;
     }
 
     return _dns_finish(ps, pres, out);
 }
 
-// Parses the message at `off` of the buffer between `data` and `data_end`. See
-// `BEEPER_DNS_PARSE_SKB`.
 static __always_inline int _parse(const u8 *data, const u8 *data_end, u32 off, u32 flags,
                                   struct dns_parse_res *pres) {
     bool tcp = (flags & DNS_PARSE_TCP) != 0;
     __builtin_memset(pres, 0, sizeof(*pres));
 
-    struct dns_parse_state ps = { .want = -1 };
-    ps.m = _new_msg_ctx((u64)(long)data, (u64)(long)data_end);
+    struct dns_parse_state ps = { .s = S_HDR };
 
-    u32 size = ps.m.size;
+    u32 size = data_end > data ? data_end - data : 0;
     if (size > MAX_BYTES + 1) {
         if (!tcp) return DNS_ERR_LIMIT;
         size = MAX_BYTES + 1;
     }
     if (off >= size) return DNS_ERR_INCOMPLETE;
-
-    ps.m.size = size;
-    ps.m.base = off;
-    ps.m.end = size;
+    bpf_clamp_uminmax(off, 0, MAX_BYTES);
 
     u32 base = off;
     u32 len = size - off;
     if (tcp) {
         // RFC 1035 4.2.2, RFC 7766 8
-        u16 prefix = 0;
-        if (_dns_u16(&ps.m, off, &prefix) < 0) return DNS_ERR_INCOMPLETE;
+        const u8 *b = data + off;
+        if (off + 2 > size || b + 2 > data_end) return DNS_ERR_INCOMPLETE;
+        u16 prefix = ((u16)b[0] << 8) | b[1];
 
         base = off + 2;
         len = prefix;
@@ -686,14 +631,15 @@ static __always_inline int _parse(const u8 *data, const u8 *data_end, u32 off, u
 
     if (len < DNS_HDR_LEN) return DNS_ERR_FORMAT;
 
-    ps.m.base = base;
-    ps.m.end = base + len;
+    ps.base = base;
+    ps.end = base + len;
+    ps.pos = base;
     pres->base = base;
 
     int ret = _run(data, data_end, &ps, pres, NULL);
     if (ret < 0) return ret;
 
-    if (ps.done != ps.m.end) {
+    if (ps.done != ps.end) {
         // over TCP the length prefix frames the message exactly
         if (tcp) return DNS_ERR_FORMAT;
         pres->flags |= DNS_RES_TRAILING;
@@ -705,37 +651,38 @@ static __always_inline int _parse(const u8 *data, const u8 *data_end, u32 off, u
     return tcp ? 2 + len : len;
 }
 
-// Extracts the record at `idx` of the message `pres` describes, walking it once
-// more up to there. See `BEEPER_DNS_EXTRACT_RR_MSG`.
-static __always_inline int _extract_rr(const u8 *data, const u8 *data_end, const struct dns_parse_res *pres,
-                                       u32 idx, struct dns_rr *rr) {
-    const struct dns_header *hdr = &pres->hdr;
-    if (DNS_OPCODE(hdr->flags) == DNS_OPCODE_DSO) return DNS_ERR_END;
-    if (idx >= (u32)hdr->ancount + hdr->nscount + hdr->arcount) return DNS_ERR_END;
+// Reads the next record of the message `pres` describes, walking it on from
+// where `cur` stopped. See `BEEPER_DNS_NEXT_RR_MSG`.
+static __always_inline int _next_rr(const u8 *data, const u8 *data_end, const struct dns_parse_res *pres,
+                                    struct dns_cursor *cur, struct dns_rr *rr) {
+    struct dns_parse_state *ps = (struct dns_parse_state *)cur;
+    if (DNS_OPCODE(pres->hdr.flags) == DNS_OPCODE_DSO || ps->done) return DNS_ERR_END;
 
-    struct dns_parse_state ps = { .want = idx };
-    ps.m = _new_msg_ctx((u64)(long)data, (u64)(long)data_end);
-    ps.m.base = pres->base;
-    ps.m.end = pres->base + pres->len;
-    if (ps.m.end > ps.m.size) return DNS_ERR_FORMAT;
+    // no state of the DFA is 0, a zeroed cursor has yet to walk the header
+    if (ps->s == 0) {
+        ps->s = S_HDR;
+        ps->base = pres->base;
+        ps->end = pres->base + pres->len;
+        ps->pos = pres->base;
+    }
 
-    struct dns_parse_res scratch = { 0 };
-    int ret = _run(data, data_end, &ps, &scratch, rr);
+    // the walk reads the counts of the header with every record
+    struct dns_parse_res scratch = { .hdr = pres->hdr };
+    int ret = _run(data, data_end, ps, &scratch, rr);
     if (ret < 0) return ret;
 
     // a truncated message may hold fewer records than the counts announce
-    return ps.found ? 0 : DNS_ERR_END;
+    return ret == 2 ? 0 : DNS_ERR_END;
 }
 
-static __always_inline int _extract_name(struct msg_ctx *m __arg_nonnull,
-                                        const struct dns_parse_res *pres __arg_nonnull,
-                                        u32 off, u32 flags, struct dns_name_buf *out __arg_nonnull) {
-    m->base = pres->base;
-    m->end = pres->base + pres->len;
+static __always_inline int _extract_name(const u8 *data, const u8 *data_end, const struct dns_parse_res *pres,
+                                         u32 off, u32 flags, struct dns_name_buf *out) {
+    u32 base = pres->base;
+    u32 end = base + pres->len;
 
-    if (off < m->base + DNS_HDR_LEN || off >= m->end) return DNS_ERR_FORMAT;
+    if (off < base + DNS_HDR_LEN || off >= end) return DNS_ERR_FORMAT;
 
-    int ret = _dns_name(m, off, flags, out, 0);
+    int ret = _dns_name(data, data_end, base, end, off, flags, out, 0);
     if (ret < 0) return ret;
 
     return out->len;
@@ -762,23 +709,21 @@ int parse_skb(struct __sk_buff *skb, u32 off, u32 flags, struct dns_parse_res *p
 }
 
 SEC("freplace")
-int extract_rr_msg(const struct sk_msg_md *msg, const struct dns_parse_res *pres __arg_nonnull, u32 idx, struct dns_rr *rr __arg_nonnull) {
-    return _extract_rr((const u8 *)(long)msg->data, (const u8 *)(long)msg->data_end, pres, idx, rr);
+int next_rr_msg(const struct sk_msg_md *msg, const struct dns_parse_res *pres __arg_nonnull, struct dns_cursor *cur __arg_nonnull, struct dns_rr *rr __arg_nonnull) {
+    return _next_rr((const u8 *)(long)msg->data, (const u8 *)(long)msg->data_end, pres, cur, rr);
 }
 
 SEC("freplace")
-int extract_rr_skb(const struct __sk_buff *skb, const struct dns_parse_res *pres __arg_nonnull, u32 idx, struct dns_rr *rr __arg_nonnull) {
-    return _extract_rr((const u8 *)(long)skb->data, (const u8 *)(long)skb->data_end, pres, idx, rr);
+int next_rr_skb(const struct __sk_buff *skb, const struct dns_parse_res *pres __arg_nonnull, struct dns_cursor *cur __arg_nonnull, struct dns_rr *rr __arg_nonnull) {
+    return _next_rr((const u8 *)(long)skb->data, (const u8 *)(long)skb->data_end, pres, cur, rr);
 }
 
 SEC("freplace")
 int extract_name_msg(const struct sk_msg_md *msg, const struct dns_parse_res *pres __arg_nonnull, u32 off, u32 flags, struct dns_name_buf *out __arg_nonnull) {
-    struct msg_ctx m = _new_msg_ctx((u64)(long)msg->data, (u64)(long)msg->data_end);
-    return _extract_name(&m, pres, off, flags, out);
+    return _extract_name((const u8 *)(long)msg->data, (const u8 *)(long)msg->data_end, pres, off, flags, out);
 }
 
 SEC("freplace")
 int extract_name_skb(const struct __sk_buff *skb, const struct dns_parse_res *pres __arg_nonnull, u32 off, u32 flags, struct dns_name_buf *out __arg_nonnull) {
-    struct msg_ctx m = _new_msg_ctx((u64)(long)skb->data, (u64)(long)skb->data_end);
-    return _extract_name(&m, pres, off, flags, out);
+    return _extract_name((const u8 *)(long)skb->data, (const u8 *)(long)skb->data_end, pres, off, flags, out);
 }
