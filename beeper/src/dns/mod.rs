@@ -1,9 +1,14 @@
 //! DNS parsing.
 //!
-//! Unlike HTTP, a DNS message is laid out in binary and announces the length
-//! of each of its parts, so [`Parser`] needs no patterns: it only picks which
-//! functions of the target program to replace. The parser follows RFC 1035 and
-//! the RFCs updating it, see `beeper/dns.h` for the details.
+//! [`Parser`] compiles the DNS message format into a DFA whose edges are
+//! injected into the BPF parser program, like the HTTP parsers do with their
+//! patterns. The kernel walks a message byte by byte, follows the edges and
+//! runs the action each of them carries: it accumulates the fields, skips the
+//! labels and the opaque RDATA, resolves compression pointers and keeps count
+//! of the entries the header announces. The format is fixed, so there is
+//! nothing to configure but the functions of the target program to replace.
+//! The parser follows RFC 1035 and the RFCs updating it, see `beeper/dns.h`
+//! for the details.
 //!
 //! The parser checks a message as a whole: its header, every question and
 //! record, the compression pointers of every name, the RDATA of the types laid
@@ -60,6 +65,8 @@
 //! }
 //! ```
 
+mod action;
+mod grammar;
 mod parser;
 
 pub use parser::AttachedParser;
