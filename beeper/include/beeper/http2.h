@@ -1,9 +1,5 @@
 #include "beeper/http.h"
 
-// The HTTP/2 specific part of the interface between a BPF program and the
-// parsers beeper attaches to it. See `beeper/http.h` for the type a parser
-// reports its results in and the stubs every HTTP parser shares.
-
 #ifndef __BEEPER_HTTP2_H__
 #define __BEEPER_HTTP2_H__
 

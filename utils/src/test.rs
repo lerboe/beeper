@@ -103,6 +103,27 @@ impl<'obj> TestProgram<'obj> {
         direction: Direction,
         hook: Hook,
     ) -> Result<Self> {
+        Self::attach_with(address, open_obj, direction, hook, false)
+    }
+
+    /// Same as [`TestProgram::attach_to`], for a connection that carries DNS
+    /// over TCP. The program parses the messages travelling downstream with
+    /// the DNS parser, see [`TestProgram::last_dns`].
+    pub fn attach_dns<A: ToSocketAddrs>(
+        address: A,
+        open_obj: &'obj mut MaybeUninit<libbpf_rs::OpenObject>,
+        hook: Hook,
+    ) -> Result<Self> {
+        Self::attach_with(address, open_obj, Direction::Downstream, hook, true)
+    }
+
+    fn attach_with<A: ToSocketAddrs>(
+        address: A,
+        open_obj: &'obj mut MaybeUninit<libbpf_rs::OpenObject>,
+        direction: Direction,
+        hook: Hook,
+        dns: bool,
+    ) -> Result<Self> {
         let address = address
             .to_socket_addrs()?
             .next()
@@ -129,6 +150,7 @@ impl<'obj> TestProgram<'obj> {
         open_skel.maps.rodata_data.as_mut().unwrap().http_parse_resp =
             direction == Direction::Upstream;
         open_skel.maps.rodata_data.as_mut().unwrap().hook_skb = hook == Hook::Skb;
+        open_skel.maps.rodata_data.as_mut().unwrap().dns = dns;
 
         let skel = open_skel.load()?;
         let sock_map_fd = skel.maps.sock_map.as_fd().as_raw_fd();
@@ -200,6 +222,54 @@ impl<'obj> TestProgram<'obj> {
         (bss.last_dt_count_before, bss.last_dt_count)
     }
 
+    /// Returns what the DNS parser made of the last message it parsed.
+    pub fn last_dns(&self) -> DnsMsg {
+        let bss = self.skel.maps.bss_data.as_ref().unwrap();
+        let name =
+            |buf: &dns_name_buf| String::from_utf8_lossy(&buf.buf[..buf.len as usize]).into_owned();
+
+        let res = &bss.dns_res;
+        DnsMsg {
+            ret: bss.dns_ret,
+            num_msgs: bss.dns_num_msgs,
+            base: res.base,
+            len: res.len,
+            id: res.hdr.id,
+            flags: res.hdr.flags,
+            counts: [
+                res.hdr.qdcount,
+                res.hdr.ancount,
+                res.hdr.nscount,
+                res.hdr.arcount,
+            ],
+            rcode: res.rcode,
+            res_flags: res.flags,
+            qname: (bss.dns_qname_ret >= 0 && res.hdr.qdcount > 0).then(|| name(&bss.dns_qname)),
+            qtype: res.q.qtype,
+            qclass: res.q.qclass,
+            edns_udp_size: res.edns.udp_size,
+            edns_version: res.edns.version,
+            edns_ext_rcode: res.edns.ext_rcode,
+            edns_flags: res.edns.flags,
+            edns_rdlen: res.edns.rdlen,
+            tsig_off: res.tsig_off,
+            rrs: (0..bss.dns_num_rrs as usize)
+                .map(|i| {
+                    let rr = &bss.dns_rrs[i];
+                    DnsRr {
+                        owner: name(&bss.dns_rr_names[i]),
+                        rtype: rr.r#type,
+                        class: rr.class,
+                        ttl: rr.ttl,
+                        rdlen: rr.rdlen,
+                        rdata_off: rr.rdata_off,
+                        section: rr.section,
+                    }
+                })
+                .collect(),
+        }
+    }
+
     /// Returns the file descriptor of the program a parser attaches to.
     pub fn prog_fd(&self) -> i32 {
         match self.hook {
@@ -207,4 +277,50 @@ impl<'obj> TestProgram<'obj> {
             Hook::Skb => self.skel.progs.skb_verdict.as_fd().as_raw_fd(),
         }
     }
+}
+
+/// What the DNS parser made of a message, see [`TestProgram::last_dns`].
+#[derive(Debug, Clone, Default)]
+pub struct DnsMsg {
+    /// What the parse function returned.
+    pub ret: i32,
+    /// The number of messages that were parsed so far.
+    pub num_msgs: u32,
+    /// The offset of the header in the buffer the parser parsed.
+    pub base: u16,
+    pub len: u16,
+    pub id: u16,
+    pub flags: u16,
+    /// QDCOUNT, ANCOUNT, NSCOUNT and ARCOUNT.
+    pub counts: [u16; 4],
+    pub rcode: u16,
+    /// The `DNS_RES_*` flags.
+    pub res_flags: u16,
+    /// The question name, dotted and lowercased.
+    pub qname: Option<String>,
+    pub qtype: u16,
+    pub qclass: u16,
+    pub edns_udp_size: u16,
+    pub edns_version: u8,
+    pub edns_ext_rcode: u8,
+    pub edns_flags: u16,
+    pub edns_rdlen: u16,
+    /// The offset of the TSIG record in the buffer, if there is one.
+    pub tsig_off: u16,
+    /// The first records of the message.
+    pub rrs: Vec<DnsRr>,
+}
+
+/// A record of a [`DnsMsg`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsRr {
+    /// The owner name, dotted and lowercased.
+    pub owner: String,
+    pub rtype: u16,
+    pub class: u16,
+    pub ttl: u32,
+    pub rdlen: u16,
+    /// The offset of the RDATA in the buffer the parser parsed.
+    pub rdata_off: u16,
+    pub section: u8,
 }
