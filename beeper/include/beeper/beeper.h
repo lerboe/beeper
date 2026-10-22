@@ -2,6 +2,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_endian.h>
+#include <asm-generic/errno.h>
 
 #ifndef __BEEPER_H__
 #define __BEEPER_H__

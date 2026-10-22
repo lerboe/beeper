@@ -202,6 +202,10 @@ impl<'obj> TestProgram<'obj> {
         self.skel.maps.bss_data.as_ref().unwrap().last_matches
     }
 
+    pub fn last_http1_result(&self) -> i32 {
+        self.skel.maps.bss_data.as_ref().unwrap().last_http1_result
+    }
+
     pub fn last_dt_counts(&self) -> (u32, u32) {
         let bss = self.skel.maps.bss_data.as_ref().unwrap();
         (bss.last_dt_count_before, bss.last_dt_count)

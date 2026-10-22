@@ -10,7 +10,7 @@ use tokio::{
 };
 use utils::{
     server,
-    test::{Direction, Hook, TestProgram},
+    test::{Direction, Hook, ParseResult, TestProgram},
 };
 use xbpf::OpenObject;
 
@@ -1029,6 +1029,29 @@ fn prioritised(block: Vec<u8>) -> Vec<u8> {
     payload.extend_from_slice(&block);
 
     payload
+}
+
+#[tokio::test]
+async fn reject_header_frame_with_impossible_padding() {
+    let addr = server::launch().await.expect("launch server");
+    let mut open_obj = OpenObject::new();
+    let (prog, _h1, _h2, _mids) = attach_at(addr, &mut open_obj, Hook::Msg, &[]);
+    let results = prog.results().expect("results");
+    let mut client = RawClient::connect(addr).await;
+
+    // The sole payload byte says there are two padding bytes after it.
+    client.send_raw(&frame(0x01, 0x0c, 1, &[2])).await;
+    loop {
+        if let ParseResult::Frame(result) = results
+            .recv_timeout(Duration::from_secs(2))
+            .expect("frame result")
+        {
+            if result.sid == 1 {
+                assert_eq!(result.ret, -libc::EBADMSG);
+                break;
+            }
+        }
+    }
 }
 
 #[tokio::test]

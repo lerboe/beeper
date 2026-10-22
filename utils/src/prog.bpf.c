@@ -161,6 +161,7 @@ u32 last_dt_count = 0;
 // The match ids the parser reported a capture for in the last message that was
 // parsed, one bit per id.
 u32 last_matches = 0;
+int last_http1_result = 0;
 
 // Records which of the 32 match ids the parser captured a value for.
 static __always_inline void store_matched(const struct http_parse_res *pres, bool is_h2) {
@@ -188,6 +189,15 @@ static __always_inline void store_match(u32 i, int res, const struct bytes *str)
     char tmp[128] = {0};
     bpf_probe_read_kernel(tmp, len, str->ptr);
     bpf_map_update_elem(&matches, &i, tmp, BPF_ANY);
+}
+
+// A failed parse must not leave captures from the preceding frame visible.
+static __always_inline void clear_matches(void) {
+    last_matches = 0;
+    u32 i = 0;
+    bpf_for(i, 0, MAX_MATCHES) {
+        bpf_map_delete_elem(&matches, &i);
+    }
 }
 
 // Starts the entry of `results` for the HTTP/2 frame `frame`, which the parser
@@ -293,6 +303,7 @@ int msg_verdict(struct sk_msg_md *msg) {
         u32 frame_len = HTTP2_FRAME_HDR_LEN + frame.len;
 
         if (msg_len < 0) {
+            clear_matches();
             struct parse_result *r = new_frame_result(&ikey, !is_downstream, msg_len, &frame);
             if (r) bpf_ringbuf_submit(r, 0);
 
@@ -329,7 +340,8 @@ int msg_verdict(struct sk_msg_md *msg) {
     }
     else {
         msg_len = parse_http1_msg(msg, &pres);
-        if (msg_len < 0) {
+        last_http1_result = msg_len;
+        if (msg_len < 0 && msg_len != -E2BIG) {
             // It's possible that this fails because we're actually parsing the body.
             // To avoid this, we'd have to parse the content-length to skip the body.
             // Consult the example to see how to do this.
@@ -343,7 +355,8 @@ int msg_verdict(struct sk_msg_md *msg) {
         store_matches = true;
     }
 
-    // only store matches if we parsed a HEADER frame
+    // An overlong HTTP/1 header may still contain captures in its first
+    // MAX_BYTES; record those without treating the header as fully parsed.
     if (store_matches) {
         store_matched(&pres, is_h2);
 
@@ -356,7 +369,7 @@ int msg_verdict(struct sk_msg_md *msg) {
     }
 
     bpf_debug("Apply verdict to %d/%dB", msg_len, msg->size);
-    bpf_msg_apply_bytes(msg, msg_len);
+    if (msg_len > 0) bpf_msg_apply_bytes(msg, msg_len);
 
     return SK_PASS;
 }
@@ -471,6 +484,7 @@ int skb_verdict(struct __sk_buff *skb) {
         // is keyed the way the sending end sees the connection
         struct ip4_conn skey = { .local = ikey.remote, .remote = ikey.local };
         if (len < 0) {
+            clear_matches();
             bpf_error("Failed to parse h2 skb");
 
             struct parse_result *r = new_frame_result(&skey, !is_downstream, len, &frame);

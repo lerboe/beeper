@@ -488,6 +488,7 @@ async fn parse_a_header_in_the_first_half_of_a_long_message() {
     _ = send_raw(addr, &req).await;
 
     assert_match_eq(&prog, mids[0], Some(&user_agent));
+    assert_eq!(prog.last_http1_result(), -libc::E2BIG);
 }
 
 #[tokio::test]

@@ -40,11 +40,13 @@ struct http_parse_res {
         return ret;                                                                                \
     }
 
-    // Declares a stub for the get function for SK_MSG.
+// Declares a stub for the get function for SK_MSG. Once replaced, it returns
+// 0, -EINVAL (invalid id), -ENOENT (absent/unavailable capture), or -EFAULT
+// (unreadable HTTP/1 range). The stub returns -ENOSYS until replaced.
 #define BEEPER_GET_MATCH_MSG(name)                                                             \
     __noinline int name(const struct sk_msg_md *msg, const struct http_parse_res *pres __arg_nonnull,   \
                         u8 idx, struct bytes *str __arg_nonnull) {                                 \
-        int ret = -1;                                                                              \
+        int ret = -ENOSYS;                                                                         \
                                                                                                    \
         __sink(msg);                                                                               \
         __sink(pres);                                                                              \
@@ -59,7 +61,7 @@ struct http_parse_res {
 #define BEEPER_GET_MATCH_SKB(name)                                                             \
     __noinline int name(const struct __sk_buff *skb, const struct http_parse_res *pres __arg_nonnull,   \
                         u8 idx, struct bytes *str __arg_nonnull) {                                 \
-        int ret = -1;                                                                              \
+        int ret = -ENOSYS;                                                                         \
                                                                                                    \
         __sink(skb);                                                                               \
         __sink(pres);                                                                              \

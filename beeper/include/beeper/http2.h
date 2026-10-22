@@ -41,12 +41,14 @@ struct http2_hdr_field {
     u8 val_huff;
 };
 
-// Creates `name`, a stub for the HTTP/2 message parser
+// Creates `name`, a stub for the HTTP/2 message parser. The attached parser
+// returns bytes consumed, 0 for an incomplete frame header, or a negative
+// errno; see docs/error-codes.md. This stub returns -ENOSYS until replaced.
 // (`http2::Parser::parse_fn`, `MessageBuffer::Msg`).
 #define BEEPER_HTTP2_PARSE_MSG(name)                                                                  \
     __noinline int name(struct sk_msg_md *msg, struct http_parse_res *pres __arg_nonnull,               \
                         struct http2_frame *frame __arg_nonnull) {                                    \
-        int ret = -1;                                                                              \
+        int ret = -ENOSYS;                                                                         \
                                                                                                    \
         __sink(msg);                                                                               \
         __sink(pres);                                                                              \
@@ -65,7 +67,7 @@ struct http2_hdr_field {
 #define BEEPER_HTTP2_PARSE_SKB(name)                                                                  \
     __noinline int name(struct __sk_buff *skb, u32 off, struct http_parse_res *pres __arg_nonnull,      \
                         struct http2_frame *frame __arg_nonnull, struct null_prefix *null_prefix) {   \
-        int ret = -1;                                                                              \
+        int ret = -ENOSYS;                                                                         \
                                                                                                    \
         __sink(skb);                                                                               \
         __sink(off);                                                                               \
@@ -88,7 +90,7 @@ struct http2_hdr_field {
                         struct http_parse_res *pres __arg_nonnull,                                      \
                         struct http2_frame *frame __arg_nonnull,                                      \
                         struct null_prefix *null_prefix) {                                         \
-        int ret = -1;                                                                              \
+        int ret = -ENOSYS;                                                                         \
                                                                                                    \
         __sink(buf_ptr);                                                                           \
         __sink(conn);                                                                              \
@@ -104,11 +106,12 @@ struct http2_hdr_field {
 // connection a message parsed with an HTTP/2 parser belongs to
 // (`http2::Parser::get_dynamic_table_entry`). `idx` is counted the HPACK way, i.e. 1
 // is the most recently added entry and `dt_count` (see `http2_frame`) the oldest
-// still live one. Returns 0 on success, -1 if there is no such entry.
+// still live one. Returns 0 on success, -EINVAL for index 0, or -ENOENT if
+// there is no such entry. The stub returns -ENOSYS until replaced.
 #define BEEPER_HTTP2_GET_DT_ENTRY(name)                                                               \
     __noinline int name(const struct ip4_conn *conn __arg_nonnull, u32 idx,                        \
                         struct http2_hdr_field *out __arg_nonnull) {                                  \
-        int ret = -1;                                                                              \
+        int ret = -ENOSYS;                                                                         \
                                                                                                    \
         __sink(conn);                                                                              \
         __sink(idx);                                                                               \

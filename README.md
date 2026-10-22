@@ -97,6 +97,10 @@ Please refer to the [example](example) for a simple HTTP monitoring tool.
 
 ## Build
 
+The eBPF functions return negative Linux errno values for failures. See
+[parser return codes](docs/error-codes.md) for their meanings and the actions
+clients should take, including when to cork an incomplete message.
+
 To build and test beeper, you need to install the following packages:
 
 ```bash

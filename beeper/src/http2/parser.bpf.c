@@ -228,14 +228,14 @@ __noinline __weak u32 hpack_huffman_decoded_len(const struct http2_hdr_field *hf
 // The offsets of the header block of the frame at `data`, whose payload is
 // `len` bytes long.
 //
-// Returns 0, or -1 if the frame is too short to hold what its flags announce.
+// Returns 0, -EBADMSG for invalid padding/priority, or -EFAULT if unreadable.
 static __always_inline int _http2_block(const u8 *data, const u8 *data_end, u32 len, u8 type, u8 flags, u16 *start, u16 *end) {
     u32 off = HTTP2_FRAME_HDR_LEN;
     u32 pad_len = 0;
 
     if (type == HTTP2_HEADERS_FRAME) {
         if ((flags & HTTP2_PADDED_FLAG) != 0) {
-            if (data + off + 1 > data_end) return -1;
+            if (data + off + 1 > data_end) return -EFAULT;
             pad_len = data[off];
             off += 1;
         }
@@ -243,7 +243,7 @@ static __always_inline int _http2_block(const u8 *data, const u8 *data_end, u32 
         if ((flags & HTTP2_PRIORITY_FLAG) != 0) off += HTTP2_PRIORITY_LEN;
     }
 
-    if (off + pad_len > HTTP2_FRAME_HDR_LEN + len) return -1;
+    if (off + pad_len > HTTP2_FRAME_HDR_LEN + len) return -EBADMSG;
 
     *start = off;
     *end = HTTP2_FRAME_HDR_LEN + len - pad_len;
@@ -502,19 +502,19 @@ static __always_inline u32 _try_evict_dynamic_table_entries(const struct msg_ctx
 // Adds the field made up of `key` and `val` to the dynamic table, evicting as
 // many of the oldest entries as it takes to make room for it.
 static __always_inline int _add_dynamic_table_entry(const struct msg_ctx *ctx __arg_nonnull, struct dynamic_table_info *dt_info __arg_nonnull, const struct http_match *key __arg_nonnull, const struct http_match *val __arg_nonnull) {
-    if (dt_info->dirty) return -1;
+    if (dt_info->dirty) return -EBADMSG;
 
     u8 *key_ptr = NULL;
     u32 key_len = 0;
     bool key_huff = false;
     _get_match(ctx, key, true, &key_ptr, &key_len, &key_huff);
-    if (!key_ptr) return -1;
+    if (!key_ptr) return key->source == HTTP_SRC_TABLE ? -ENOENT : -EBADMSG;
 
     u8 *val_ptr = NULL;
     u32 val_len = 0;
     bool val_huff = false;
     _get_match(ctx, val, false, &val_ptr, &val_len, &val_huff);
-    if (!val_ptr) return -1;
+    if (!val_ptr) return val->source == HTTP_SRC_TABLE ? -ENOENT : -EBADMSG;
 
     // an entry only keeps the first `HEADER_FIELD_MAXLEN` bytes of a field, but
     // it is sized by everything the peer sent, or the two tables would evict at
@@ -528,7 +528,7 @@ static __always_inline int _add_dynamic_table_entry(const struct msg_ctx *ctx __
 
     int per_cpu_key = 0;
     struct dynamic_table_entry *dt_val = bpf_map_lookup_elem(&dynamic_table_entry, &per_cpu_key);
-    if (!dt_val) return -1;
+    if (!dt_val) return -ENOSPC;
 
     u32 idx = DYNAMIC_TABLE_BASE + dt_info->count + dt_info->deleted;
     struct dynamic_table_key dt_key = _new_dynamic_table_key(&ctx->conn, idx);
@@ -549,7 +549,7 @@ static __always_inline int _add_dynamic_table_entry(const struct msg_ctx *ctx __
     if ((key_cut && key_huff) || (val_cut && val_huff)) {
         bpf_debug("dt: a Huffman coded field longer than %d bytes, the table has drifted", HEADER_FIELD_MAXLEN);
         dt_info->dirty = 1;
-        return -1;
+        return -E2BIG;
     }
 
     u32 key_len_decoded = key_huff ? hpack_huffman_decoded_len(&dt_val->field, false, key_len) : key_wire_len;
@@ -559,10 +559,10 @@ static __always_inline int _add_dynamic_table_entry(const struct msg_ctx *ctx __
     _try_evict_dynamic_table_entries(ctx, dt_info, dt_val->size);
     if (dt_info->size + dt_val->size > dt_info->max_size) {
         bpf_debug("dt: entry size %d exceeds max size %d", dt_val->size, dt_info->max_size);
-        return -1;
+        return 0; // HPACK does not insert entries larger than the table.
     }
 
-    bpf_map_update_elem(&dynamic_table, &dt_key, dt_val, BPF_ANY);
+    if (bpf_map_update_elem(&dynamic_table, &dt_key, dt_val, BPF_ANY) < 0) return -ENOSPC;
 
     dt_info->size += dt_val->size;
     dt_info->count += 1;
@@ -588,7 +588,7 @@ static __always_inline int _parse_stg_from(const struct msg_ctx *ctx, u16 start,
     u32 stream_id = data[5] << 24 | data[6] << 16 | data[7] << 8 | data[8];
 
     struct dynamic_table_info *dt_info = _get_dynamic_table(&ctx->conn);
-    if (!dt_info) return 0;
+    if (!dt_info) return -ENOSPC;
 
     u32 i = start;
     u8 j = 0;
@@ -596,7 +596,7 @@ static __always_inline int _parse_stg_from(const struct msg_ctx *ctx, u16 start,
     u32 val = 0;
 
     bpf_for(i, start, len) {
-        if (data + i + 1 > data_end) return -i;
+        if (data + i + 1 > data_end) return -EFAULT;
         u8 c = data[i];
 
         // skb clears the TLS header, but does not remove it
@@ -685,7 +685,7 @@ static __always_inline struct http2_parse_state _new_http2_parse_state(u8 src) {
 
 // Runs the action of the edges `ps` holds.
 //
-// Returns 0, or -1 if the block cannot be read any further.
+// Returns 0 or a negative errno if the block cannot be read any further.
 static __always_inline int _run_action(const struct msg_ctx *ctx __arg_nonnull, struct dynamic_table_info *dt_info __arg_nonnull, struct http_parse_res *pres __arg_nonnull, struct http2_parse_state *ps __arg_nonnull) {
     u32 v = ps->v & MAX_BYTES;
 
@@ -798,7 +798,7 @@ static __always_inline int _run_action(const struct msg_ctx *ctx __arg_nonnull, 
 
     if (ps->kind == HTTP2A_ERR) {
         bpf_debug("hdr: malformed representation at %d", ps->i);
-        return -1;
+        return -EBADMSG;
     }
 
     return 0;
@@ -806,7 +806,7 @@ static __always_inline int _run_action(const struct msg_ctx *ctx __arg_nonnull, 
 
 // Feeds the byte `c` at the offset `ps->i` to the header block `ps` reads, and
 // records the values of the fields whose name matches a pattern in `pres`.
-// Returns 0, or -1 if the block cannot be read any further.
+// Returns 0 or a negative errno if the block cannot be read any further.
 __noinline __weak int _parse_hdr_byte(const struct msg_ctx *ctx __arg_nonnull, struct dynamic_table_info *dt_info __arg_nonnull, struct http_parse_res *pres __arg_nonnull, struct http2_parse_state *ps __arg_nonnull, u32 c) {
     c &= 0xff;
 
@@ -872,7 +872,7 @@ static __always_inline int _parse_hdr_from(const struct msg_ctx *ctx, u16 start,
 
     u32 i = start;
     bpf_for(i, start, len) {
-        if (data + i + 1 > data_end) return -i;
+        if (data + i + 1 > data_end) return -EFAULT;
         u8 c = data[i];
 
         // skb clears the TLS header, but does not remove it
@@ -882,7 +882,8 @@ static __always_inline int _parse_hdr_from(const struct msg_ctx *ctx, u16 start,
         }
 
         ps->i = i;
-        if (_parse_hdr_byte(ctx, dt_info, pres, ps, c) < 0) return -i;
+        int err = _parse_hdr_byte(ctx, dt_info, pres, ps, c);
+        if (err < 0) return err;
     }
 
     return i;
@@ -917,7 +918,7 @@ static __always_inline int _reject_frame(struct http2_frame *frame, u32 frame_le
 // Returns the offset it stopped at, see `_parse_hdr_from`.
 static __always_inline int _parse_hdr_frame(const struct msg_ctx *ctx, u16 start, u16 end, struct http_parse_res *pres, struct null_prefix *null_prefix) {
     struct dynamic_table_info *dt_info = _get_dynamic_table(&ctx->conn);
-    if (!dt_info) return start;
+    if (!dt_info) return -ENOSPC;
 
     struct http2_parse_state ps = _new_http2_parse_state(HTTP_SRC_MSG);
     return _parse_hdr_from(ctx, start, end, dt_info, &ps, pres, null_prefix);
@@ -933,7 +934,7 @@ struct collected_block {
 __noinline __weak int _collect_block(const struct msg_ctx *ctx __arg_nonnull, u32 off, struct collected_block *blk __arg_nonnull) {
     u32 zero = 0;
     struct block_buf *buf = bpf_map_lookup_elem(&block_bufs, &zero);
-    if (buf == NULL) return -1;
+    if (buf == NULL) return -ENOSPC;
 
     const u8 *data = ctx->data;
     u32 avail = (u32)(ctx->data_end - ctx->data);
@@ -945,7 +946,7 @@ __noinline __weak int _collect_block(const struct msg_ctx *ctx __arg_nonnull, u3
 
     // a frame takes up at least the 9 bytes of its header
     bpf_for(k, 0, MAX_BYTES / HTTP2_FRAME_HDR_LEN + 1) {
-        if (o > MAX_BYTES) return -1;
+        if (o > MAX_BYTES) return -E2BIG;
 
         if (o + HTTP2_FRAME_HDR_LEN > avail) {
             blk->need = o - off + HTTP2_FRAME_HDR_LEN;
@@ -953,7 +954,7 @@ __noinline __weak int _collect_block(const struct msg_ctx *ctx __arg_nonnull, u3
         }
 
         u8 hdr[HTTP2_FRAME_HDR_LEN];
-        if (bpf_probe_read_kernel(hdr, sizeof(hdr), data + o) < 0) return -1;
+        if (bpf_probe_read_kernel(hdr, sizeof(hdr), data + o) < 0) return -EFAULT;
 
         u32 len = (u32)hdr[0] << 16 | (u32)hdr[1] << 8 | (u32)hdr[2];
         u8 type = hdr[3];
@@ -978,23 +979,23 @@ __noinline __weak int _collect_block(const struct msg_ctx *ctx __arg_nonnull, u3
         u32 pad_len = 0;
         if (k == 0 && (flags & HTTP2_PADDED_FLAG) != 0) {
             u8 pad = 0;
-            if (start + 1 > frame_len) return -1;
-            if (bpf_probe_read_kernel(&pad, 1, data + o + start) < 0) return -1;
+            if (start + 1 > frame_len) return -EBADMSG;
+            if (bpf_probe_read_kernel(&pad, 1, data + o + start) < 0) return -EFAULT;
             pad_len = pad;
             start += 1;
         }
         if (k == 0 && (flags & HTTP2_PRIORITY_FLAG) != 0) start += HTTP2_PRIORITY_LEN;
-        if (start + pad_len > frame_len) return -1;
+        if (start + pad_len > frame_len) return -EBADMSG;
 
         u32 n = frame_len - pad_len - start;
         if (pos + n > BLOCK_MAXLEN) {
             bpf_debug("hdr: a block longer than %u bytes", BLOCK_MAXLEN);
-            return -1;
+            return -E2BIG;
         }
 
         bpf_clamp_uminmax(pos, 0, BLOCK_MAXLEN);
         bpf_clamp_uminmax(n, 0, BLOCK_MAXLEN);
-        if (n > 0 && bpf_probe_read_kernel(buf->data + pos, n, data + o + start) < 0) return -1;
+        if (n > 0 && bpf_probe_read_kernel(buf->data + pos, n, data + o + start) < 0) return -EFAULT;
 
         pos += n;
         o += frame_len;
@@ -1006,7 +1007,7 @@ __noinline __weak int _collect_block(const struct msg_ctx *ctx __arg_nonnull, u3
         }
     }
 
-    return -1;
+    return -E2BIG;
 }
 
 // Decodes the header block `_collect_block` put together, `len` bytes long, and
@@ -1016,7 +1017,7 @@ __noinline __weak int _collect_block(const struct msg_ctx *ctx __arg_nonnull, u3
 static __always_inline int _parse_hdr_buf(const struct msg_ctx *ctx, u32 len, struct dynamic_table_info *dt_info, struct http2_parse_state *ps, struct http_parse_res *pres) {
     u32 zero = 0;
     struct block_buf *buf = bpf_map_lookup_elem(&block_bufs, &zero);
-    if (buf == NULL) return 0;
+    if (buf == NULL) return -ENOSPC;
 
     bpf_clamp_uminmax(len, 0, BLOCK_MAXLEN);
 
@@ -1030,7 +1031,8 @@ static __always_inline int _parse_hdr_buf(const struct msg_ctx *ctx, u32 len, st
         bpf_clamp_uminmax(j, 0, BLOCK_MAXLEN - 1);
 
         ps->i = i;
-        if (_parse_hdr_byte(ctx, dt_info, pres, ps, buf->data[j]) < 0) break;
+        int err = _parse_hdr_byte(ctx, dt_info, pres, ps, buf->data[j]);
+        if (err < 0) return err;
     }
 
     return i;
@@ -1041,7 +1043,7 @@ static __always_inline int _parse_hdr_buf(const struct msg_ctx *ctx, u32 len, st
 // describes it in `frame`.
 //
 // Returns the number of bytes the frames of the block take up, or what
-// `_collect_block` fails with, or -1 if the block could not be read to its end.
+// `_collect_block` fails with, or -EBADMSG if the block could not be decoded.
 static __always_inline int _parse_block(const struct msg_ctx *ctx, u32 off, struct http_parse_res *pres, struct http2_frame *frame) {
     struct collected_block blk = { 0 };
     int total = _collect_block(ctx, off, &blk);
@@ -1051,16 +1053,17 @@ static __always_inline int _parse_block(const struct msg_ctx *ctx, u32 off, stru
     }
 
     struct dynamic_table_info *dt_info = _get_dynamic_table(&ctx->conn);
-    if (!dt_info) return -1;
+    if (!dt_info) return -ENOSPC;
 
     frame->dt_count_before = dt_info->count;
 
     struct http2_parse_state ps = _new_http2_parse_state(HTTP_SRC_BUF);
-    u32 res = _parse_hdr_buf(ctx, blk.len, dt_info, &ps, pres);
+    int res = _parse_hdr_buf(ctx, blk.len, dt_info, &ps, pres);
 
     frame->dt_count = dt_info->count;
 
-    return (res < blk.len) ? -1 : total;
+    if (res < 0) return res;
+    return (res < blk.len) ? -EBADMSG : total;
 }
 
 // Whether a frame carries anything the parser needs to read.
@@ -1083,15 +1086,16 @@ static __always_inline void _skip_frame(const struct ip4_conn *conn, struct http
 
 // Parses the frame that starts `off` bytes into `ctx`.
 //
-// Returns 0, or -1 if the frame could not be read to its end.
+// Returns 0 or a negative errno if the frame could not be read to its end.
 static __always_inline int _parse_frame(const struct msg_ctx *ctx, u32 off, u32 len, u8 type, u8 flags, struct http_parse_res *pres, struct http2_frame *frame, struct null_prefix *null_prefix) {
-    if (off > MAX_BYTES) return -1;
+    if (off > MAX_BYTES) return -E2BIG;
     bpf_clamp_uminmax(off, 0, MAX_BYTES);
 
     u16 start = 0, end = 0;
-    if (_http2_block(ctx->data + off, ctx->data_end, len, type, flags, &start, &end) < 0) return -1;
+    int block_err = _http2_block(ctx->data + off, ctx->data_end, len, type, flags, &start, &end);
+    if (block_err < 0) return block_err;
 
-    if (off + end > MAX_BYTES) return -1;
+    if (off + end > MAX_BYTES) return -E2BIG;
     start += off;
     end += off;
 
@@ -1108,7 +1112,8 @@ static __always_inline int _parse_frame(const struct msg_ctx *ctx, u32 off, u32 
 
     frame->dt_count = dt_info ? dt_info->count : 0;
 
-    return (res < end-1) ? -1 : 0;
+    if (res < 0) return res;
+    return (res < end-1) ? -EBADMSG : 0;
 }
 
 // Parses the frame the message starts with and describes it in `frame`, so that
@@ -1118,8 +1123,8 @@ static __always_inline int _parse_frame(const struct msg_ctx *ctx, u32 off, u32 
 //
 // Returns the number of bytes the frame and the CONTINUATION frames of its block
 // occupy, 0 if the message is too short to hold a frame header, `-EAGAIN` if it
-// is too short to hold the frame or the rest of its block, `-EPROTO` if the
-// frame breaks the rules for header blocks, or -1 if it cannot be parsed otherwise.
+// is too short to hold the frame or the rest of its block, or another negative
+// errno described in beeper/http2.h.
 SEC("freplace")
 int parse_msg(struct sk_msg_md *msg, struct http_parse_res *pres __arg_nonnull, struct http2_frame *frame __arg_nonnull) {
     u8 *data = (u8 *)(long)msg->data;
@@ -1157,19 +1162,19 @@ int parse_msg(struct sk_msg_md *msg, struct http_parse_res *pres __arg_nonnull, 
         // the frames behind it are pulled in as well, as far as they can be read
         u32 pulled = size;
         if (pulled > MAX_BYTES) pulled = MAX_BYTES;
-        if (bpf_msg_pull_data(msg, 0, pulled, 0) < 0) return -1;
+        if (bpf_msg_pull_data(msg, 0, pulled, 0) < 0) return -EFAULT;
 
         ctx = _new_msg_ctx(msg);
         int res = _parse_block(&ctx, 0, pres, frame);
 
         // a block whose frames have arrived, but not all of which could be
         // pulled in, would never be read
-        if (res == -EAGAIN && frame->need <= size) return -1;
+        if (res == -EAGAIN && frame->need <= size) return -E2BIG;
 
         return res;
     }
 
-    if (bpf_msg_pull_data(msg, 0, frame_len, 0) < 0) return -1;
+    if (bpf_msg_pull_data(msg, 0, frame_len, 0) < 0) return -EFAULT;
 
     ctx = _new_msg_ctx(msg);
     int err = _parse_frame(&ctx, 0, len, type, flags, pres, frame, NULL);
@@ -1182,7 +1187,7 @@ int parse_msg(struct sk_msg_md *msg, struct http_parse_res *pres __arg_nonnull, 
 // `parse_msg` returns.
 SEC("freplace")
 int parse_skb(struct __sk_buff *skb, u32 off, struct http_parse_res *pres __arg_nonnull, struct http2_frame *frame __arg_nonnull, struct null_prefix *null_prefix) {
-    if (off > MAX_BYTES) return -1;
+    if (off > MAX_BYTES) return -E2BIG;
     if (skb->len < off + HTTP2_FRAME_HDR_LEN) return 0;
     bpf_clamp_uminmax(off, 0, MAX_BYTES);
 
@@ -1191,14 +1196,14 @@ int parse_skb(struct __sk_buff *skb, u32 off, struct http_parse_res *pres __arg_
 
     // the linear part may well be empty, with everything in the fragments
     if (data + off + HTTP2_FRAME_HDR_LEN > data_end) {
-        if (bpf_skb_pull_data(skb, off + HTTP2_FRAME_HDR_LEN) < 0) return 0;
+        if (bpf_skb_pull_data(skb, off + HTTP2_FRAME_HDR_LEN) < 0) return -EFAULT;
 
         data = (u8 *)(long)skb->data;
         data_end = (u8 *)(long)skb->data_end;
     }
 
     u8 *hdr = data + off;
-    if (hdr + HTTP2_FRAME_HDR_LEN > data_end) return 0;
+    if (hdr + HTTP2_FRAME_HDR_LEN > data_end) return -EFAULT;
 
     u32 len = hdr[0] << 16 | hdr[1] << 8 | hdr[2];
     u8 type = hdr[3];
@@ -1230,16 +1235,16 @@ int parse_skb(struct __sk_buff *skb, u32 off, struct http_parse_res *pres __arg_
         // see `parse_msg`
         u32 pulled = skb->len;
         if (pulled > off + MAX_BYTES) pulled = off + MAX_BYTES;
-        if (bpf_skb_pull_data(skb, pulled) < 0) return -1;
+        if (bpf_skb_pull_data(skb, pulled) < 0) return -EFAULT;
 
         ctx = _new_skb_ctx(skb);
         int res = _parse_block(&ctx, off, pres, frame);
-        if (res == -EAGAIN && frame->need <= size) return -1;
+        if (res == -EAGAIN && frame->need <= size) return -E2BIG;
 
         return res;
     }
 
-    if (bpf_skb_pull_data(skb, off + frame_len) < 0) return -1;
+    if (bpf_skb_pull_data(skb, off + frame_len) < 0) return -EFAULT;
 
     ctx = _new_skb_ctx(skb);
     int err = _parse_frame(&ctx, off, len, type, flags, pres, frame, null_prefix);
@@ -1249,16 +1254,17 @@ int parse_skb(struct __sk_buff *skb, u32 off, struct http_parse_res *pres __arg_
 }
 
 // Reads the `idx`th entry of `conn`'s dynamic table into `out`, `idx` counted
-// as `_get_table_entry` counts it. Returns 0 on success, -1 if there is no
-// such entry.
+// as `_get_table_entry` counts it. Returns 0 on success, -EINVAL for index 0,
+// or -ENOENT when no entry is available.
 SEC("freplace")
 int get_dt_entry(const struct ip4_conn *conn __arg_nonnull, u32 idx, struct http2_hdr_field *out __arg_nonnull) {
     struct dynamic_table_info *dt_info = bpf_map_lookup_elem(&dynamic_table_info, conn);
-    if (dt_info == NULL) return -1;
+    if (idx == 0) return -EINVAL;
+    if (dt_info == NULL) return -ENOENT;
 
     struct http2_hdr_field *hf = NULL;
     _get_table_entry(conn, dt_info, idx, &hf);
-    if (hf == NULL) return -1;
+    if (hf == NULL) return -ENOENT;
 
     __builtin_memcpy(out, hf, sizeof(*out));
 
@@ -1266,12 +1272,12 @@ int get_dt_entry(const struct ip4_conn *conn __arg_nonnull, u32 idx, struct http
 }
 
 // Points `str` at the value captured for the match `m`, resolving it against
-// `ctx`. Returns 0 on success, -1 if the value cannot be resolved.
+// `ctx`. Returns 0 on success or -ENOENT if the value cannot be resolved.
 static __always_inline int _get_str(const struct msg_ctx *ctx, const struct http_match *m, struct bytes *str) {
     u8 *ptr = NULL;
     u32 len = 0;
     _get_match(ctx, m, false, &ptr, &len, NULL);
-    if (ptr == NULL) return -1;
+    if (ptr == NULL) return -ENOENT;
 
     *str = (struct bytes) {
         .len = len,
@@ -1300,14 +1306,14 @@ bool matched(const struct http_parse_res *pres __arg_nonnull, u8 idx) {
 // Points `str` at the value captured for the match `idx`, still Huffman encoded
 // if that is how it was sent.
 //
-// Returns 0 on success, -1 if nothing was captured for `idx` or if the value
-// can no longer be resolved.
+// Returns 0 on success, -EINVAL for an invalid id, or -ENOENT if the capture
+// is absent or can no longer be resolved.
 SEC("freplace")
 int get_match_msg(const struct sk_msg_md *msg, const struct http_parse_res *pres __arg_nonnull, u8 idx, struct bytes *str __arg_nonnull) {
-    if (idx >= MAX_MATCHES) return -1;
+    if (idx >= MAX_MATCHES) return -EINVAL;
 
     struct http_match m = pres->ms[idx & MAX_MATCH_MASK];
-    if (!_is_captured(&m)) return -1;
+    if (!_is_captured(&m)) return -ENOENT;
 
     struct msg_ctx ctx = _new_msg_ctx(msg);
     return _get_str(&ctx, &m, str);
@@ -1316,10 +1322,10 @@ int get_match_msg(const struct sk_msg_md *msg, const struct http_parse_res *pres
 // Same as `get_match`, for a match taken out of an sk_buff.
 SEC("freplace")
 int get_match_skb(const struct __sk_buff *skb, const struct http_parse_res *pres __arg_nonnull, u8 idx, struct bytes *str __arg_nonnull) {
-    if (idx >= MAX_MATCHES) return -1;
+    if (idx >= MAX_MATCHES) return -EINVAL;
 
     struct http_match m = pres->ms[idx & MAX_MATCH_MASK];
-    if (!_is_captured(&m)) return -1;
+    if (!_is_captured(&m)) return -ENOENT;
 
     struct msg_ctx ctx = _new_skb_ctx(skb);
     return _get_str(&ctx, &m, str);
