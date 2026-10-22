@@ -41,10 +41,7 @@ struct http2_hdr_field {
     u8 val_huff;
 };
 
-// Creates `name`, a stub for the HTTP/2 message parser. The attached parser
-// returns bytes consumed, 0 for an incomplete frame header, or a negative
-// errno; see docs/error-codes.md. This stub returns -ENOSYS until replaced.
-// (`http2::Parser::parse_fn`, `MessageBuffer::Msg`).
+// Declares a stub for the parse function for SK_MSG.
 #define BEEPER_HTTP2_PARSE_MSG(name)                                                                  \
     __noinline int name(struct sk_msg_md *msg, struct http_parse_res *pres __arg_nonnull,               \
                         struct http2_frame *frame __arg_nonnull) {                                    \
@@ -62,8 +59,7 @@ struct http2_hdr_field {
         return ret;                                                                                \
     }
 
-// Creates `name`, a stub for the HTTP/2 sk_buff parser
-// (`http2::Parser::parse_fn`, `MessageBuffer::Skb`).
+// Declares a stub for the parse function for SK_SKB.
 #define BEEPER_HTTP2_PARSE_SKB(name)                                                                  \
     __noinline int name(struct __sk_buff *skb, u32 off, struct http_parse_res *pres __arg_nonnull,      \
                         struct http2_frame *frame __arg_nonnull, struct null_prefix *null_prefix) {   \
@@ -83,8 +79,7 @@ struct http2_hdr_field {
         return ret;                                                                                \
     }
 
-// Creates `name`, a stub for the HTTP/2 buffer parser
-// (`http2::Parser::parse_fn`, `MessageBuffer::DynPtr`).
+// Declares a stub for the parse function for DYN_PTR.
 #define BEEPER_HTTP2_PARSE_BUF(name)                                                                  \
     __noinline int name(const struct bpf_dynptr *buf_ptr, struct ip4_conn *conn,                   \
                         struct http_parse_res *pres __arg_nonnull,                                      \
@@ -102,12 +97,7 @@ struct http2_hdr_field {
         return ret;                                                                                \
     }
 
-// Creates `name`, a stub reading the `idx`th entry of the dynamic table of the
-// connection a message parsed with an HTTP/2 parser belongs to
-// (`http2::Parser::get_dynamic_table_entry`). `idx` is counted the HPACK way, i.e. 1
-// is the most recently added entry and `dt_count` (see `http2_frame`) the oldest
-// still live one. Returns 0 on success, -EINVAL for index 0, or -ENOENT if
-// there is no such entry. The stub returns -ENOSYS until replaced.
+// Declares a stub for the get_dt function for SK_SKB.
 #define BEEPER_HTTP2_GET_DT_ENTRY(name)                                                               \
     __noinline int name(const struct ip4_conn *conn __arg_nonnull, u32 idx,                        \
                         struct http2_hdr_field *out __arg_nonnull) {                                  \

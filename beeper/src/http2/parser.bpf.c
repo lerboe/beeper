@@ -1,7 +1,5 @@
-#include "vmlinux.h"
 #include "beeper/http2.h"
 #include "xbpf.h"
-#include <bpf/bpf_helpers.h>
 
 // The number of bytes of a name or a value that are kept in a table entry.
 #define HEADER_FIELD_MAXLEN BEEPER_HTTP2_FIELD_MAXLEN
@@ -228,7 +226,7 @@ __noinline __weak u32 hpack_huffman_decoded_len(const struct http2_hdr_field *hf
 // The offsets of the header block of the frame at `data`, whose payload is
 // `len` bytes long.
 //
-// Returns 0, -EBADMSG for invalid padding/priority, or -EFAULT if unreadable.
+// Returns 0, or a negative error in case of failure.
 static __always_inline int _http2_block(const u8 *data, const u8 *data_end, u32 len, u8 type, u8 flags, u16 *start, u16 *end) {
     u32 off = HTTP2_FRAME_HDR_LEN;
     u32 pad_len = 0;
@@ -428,12 +426,12 @@ static __always_inline void _get_table_entry(const struct ip4_conn *conn __arg_n
 }
 
 // Walks the name trie over `key`, the name of a field the peer only referenced
-// by index, and returns the id of the capture it matched, or -1 if the name
-// matches no pattern.
+// by index.
+// Returns the match id, or a negative error in case of failure.
 static __always_inline int _match_header_key(const u8 *key __arg_nonnull, u16 key__sz, bool huff) {
     u16 s = huff ? S_NAME : S_NAME_PLAIN;
     u16 j = 0;
-    int mid = -1;
+    int mid = -ENOENT;
     bpf_for(j, 0, key__sz) {
         u16 a = 0;
         _next(s, key[j], &s, &a);
@@ -447,7 +445,9 @@ static __always_inline int _match_header_key(const u8 *key __arg_nonnull, u16 ke
 
 // Returns the state of `conn`'s dynamic table, creating an empty table with the
 // default maximum size of RFC 7540 if this is the first header block seen on
-// the connection. Returns NULL if the table could not be created.
+// the connection.
+//
+// Returns NULL if the table could not be created.
 static __always_inline struct dynamic_table_info* _get_dynamic_table(const struct ip4_conn *conn __arg_nonnull) {
     struct dynamic_table_info *info = bpf_map_lookup_elem(&dynamic_table_info, conn);
     if (info) return info;
@@ -685,7 +685,7 @@ static __always_inline struct http2_parse_state _new_http2_parse_state(u8 src) {
 
 // Runs the action of the edges `ps` holds.
 //
-// Returns 0 or a negative errno if the block cannot be read any further.
+// Returns 0 or a negative error in case of failure.
 static __always_inline int _run_action(const struct msg_ctx *ctx __arg_nonnull, struct dynamic_table_info *dt_info __arg_nonnull, struct http_parse_res *pres __arg_nonnull, struct http2_parse_state *ps __arg_nonnull) {
     u32 v = ps->v & MAX_BYTES;
 
@@ -806,7 +806,7 @@ static __always_inline int _run_action(const struct msg_ctx *ctx __arg_nonnull, 
 
 // Feeds the byte `c` at the offset `ps->i` to the header block `ps` reads, and
 // records the values of the fields whose name matches a pattern in `pres`.
-// Returns 0 or a negative errno if the block cannot be read any further.
+// Returns 0 or a negative error in case of failure.
 __noinline __weak int _parse_hdr_byte(const struct msg_ctx *ctx __arg_nonnull, struct dynamic_table_info *dt_info __arg_nonnull, struct http_parse_res *pres __arg_nonnull, struct http2_parse_state *ps __arg_nonnull, u32 c) {
     c &= 0xff;
 
@@ -861,7 +861,7 @@ __noinline __weak int _parse_hdr_byte(const struct msg_ctx *ctx __arg_nonnull, s
 // Decodes the header block between the offsets `start` and `end` and records
 // the values of the fields whose name matches a pattern in `pres`.
 //
-// Returns the offset it stopped at, which is `end` if the whole block was read.
+// Returns the number of bytes consumed, or a negative error in case of failure.
 static __always_inline int _parse_hdr_from(const struct msg_ctx *ctx, u16 start, u16 end, struct dynamic_table_info *dt_info, struct http2_parse_state *ps, struct http_parse_res *pres, struct null_prefix *null_prefix) {
     const u8 *data = ctx->data;
     const u8 *data_end = ctx->data_end;
@@ -914,8 +914,6 @@ static __always_inline int _reject_frame(struct http2_frame *frame, u32 frame_le
 
 // Reads the header block a HEADERS frame carries whole, between the offsets
 // `start` and `end`.
-//
-// Returns the offset it stopped at, see `_parse_hdr_from`.
 static __always_inline int _parse_hdr_frame(const struct msg_ctx *ctx, u16 start, u16 end, struct http_parse_res *pres, struct null_prefix *null_prefix) {
     struct dynamic_table_info *dt_info = _get_dynamic_table(&ctx->conn);
     if (!dt_info) return -ENOSPC;
@@ -1013,7 +1011,7 @@ __noinline __weak int _collect_block(const struct msg_ctx *ctx __arg_nonnull, u3
 // Decodes the header block `_collect_block` put together, `len` bytes long, and
 // records the values of the fields whose name matches a pattern in `pres`.
 //
-// Returns the offset it stopped at, which is `len` if the whole block was read.
+// Returns the number of bytes consumed, or a negative error in case of failure.
 static __always_inline int _parse_hdr_buf(const struct msg_ctx *ctx, u32 len, struct dynamic_table_info *dt_info, struct http2_parse_state *ps, struct http_parse_res *pres) {
     u32 zero = 0;
     struct block_buf *buf = bpf_map_lookup_elem(&block_bufs, &zero);
@@ -1042,8 +1040,7 @@ static __always_inline int _parse_hdr_buf(const struct msg_ctx *ctx, u32 len, st
 // does not end it, along with the CONTINUATION frames that carry it on, and
 // describes it in `frame`.
 //
-// Returns the number of bytes the frames of the block take up, or what
-// `_collect_block` fails with, or -EBADMSG if the block could not be decoded.
+// Returns the number of bytes consumed, or a negative error in case of failure.
 static __always_inline int _parse_block(const struct msg_ctx *ctx, u32 off, struct http_parse_res *pres, struct http2_frame *frame) {
     struct collected_block blk = { 0 };
     int total = _collect_block(ctx, off, &blk);
@@ -1086,7 +1083,7 @@ static __always_inline void _skip_frame(const struct ip4_conn *conn, struct http
 
 // Parses the frame that starts `off` bytes into `ctx`.
 //
-// Returns 0 or a negative errno if the frame could not be read to its end.
+// Returns 0, or a negative error in case of failure.
 static __always_inline int _parse_frame(const struct msg_ctx *ctx, u32 off, u32 len, u8 type, u8 flags, struct http_parse_res *pres, struct http2_frame *frame, struct null_prefix *null_prefix) {
     if (off > MAX_BYTES) return -E2BIG;
     bpf_clamp_uminmax(off, 0, MAX_BYTES);
@@ -1116,15 +1113,10 @@ static __always_inline int _parse_frame(const struct msg_ctx *ctx, u32 off, u32 
     return (res < end-1) ? -EBADMSG : 0;
 }
 
-// Parses the frame the message starts with and describes it in `frame`, so that
-// the caller can tell which stream it belongs to and where it ends. HEADERS
-// frames are decoded into `pres`, SETTINGS frames are applied to the mirrored
-// dynamic table and every other frame is skipped.
+// Consumes one HEADER frame in the message buffer and parses it into `frame`.
+// Note that this function transparently handles CONTINUATION and SETTINGS frames.
 //
-// Returns the number of bytes the frame and the CONTINUATION frames of its block
-// occupy, 0 if the message is too short to hold a frame header, `-EAGAIN` if it
-// is too short to hold the frame or the rest of its block, or another negative
-// errno described in beeper/http2.h.
+// Returns the number of bytes consumed, or a negative error in case of failure.
 SEC("freplace")
 int parse_msg(struct sk_msg_md *msg, struct http_parse_res *pres __arg_nonnull, struct http2_frame *frame __arg_nonnull) {
     u8 *data = (u8 *)(long)msg->data;
@@ -1183,8 +1175,10 @@ int parse_msg(struct sk_msg_md *msg, struct http_parse_res *pres __arg_nonnull, 
     return frame_len;
 }
 
-// Parses the frame that starts `off` bytes into the packet. Returns what
-// `parse_msg` returns.
+// Consumes one HEADER frame in the message buffer and parses it into `frame`.
+// Note that this function transparently handles CONTINUATION and SETTINGS frames.
+//
+// Returns the number of bytes consumed, or a negative error in case of failure.
 SEC("freplace")
 int parse_skb(struct __sk_buff *skb, u32 off, struct http_parse_res *pres __arg_nonnull, struct http2_frame *frame __arg_nonnull, struct null_prefix *null_prefix) {
     if (off > MAX_BYTES) return -E2BIG;
@@ -1253,9 +1247,8 @@ int parse_skb(struct __sk_buff *skb, u32 off, struct http_parse_res *pres __arg_
     return frame_len;
 }
 
-// Reads the `idx`th entry of `conn`'s dynamic table into `out`, `idx` counted
-// as `_get_table_entry` counts it. Returns 0 on success, -EINVAL for index 0,
-// or -ENOENT when no entry is available.
+// Reads the `idx`th entry of `conn`'s dynamic table into `out`.
+// Returns 0 on success, or a negative error in case of failure.
 SEC("freplace")
 int get_dt_entry(const struct ip4_conn *conn __arg_nonnull, u32 idx, struct http2_hdr_field *out __arg_nonnull) {
     struct dynamic_table_info *dt_info = bpf_map_lookup_elem(&dynamic_table_info, conn);
@@ -1271,8 +1264,7 @@ int get_dt_entry(const struct ip4_conn *conn __arg_nonnull, u32 idx, struct http
     return 0;
 }
 
-// Points `str` at the value captured for the match `m`, resolving it against
-// `ctx`. Returns 0 on success or -ENOENT if the value cannot be resolved.
+// Points `str` at the value captured for the match `m`.
 static __always_inline int _get_str(const struct msg_ctx *ctx, const struct http_match *m, struct bytes *str) {
     u8 *ptr = NULL;
     u32 len = 0;
@@ -1306,8 +1298,7 @@ bool matched(const struct http_parse_res *pres __arg_nonnull, u8 idx) {
 // Points `str` at the value captured for the match `idx`, still Huffman encoded
 // if that is how it was sent.
 //
-// Returns 0 on success, -EINVAL for an invalid id, or -ENOENT if the capture
-// is absent or can no longer be resolved.
+// Returns 0 on success, or a negative error in case of failure.
 SEC("freplace")
 int get_match_msg(const struct sk_msg_md *msg, const struct http_parse_res *pres __arg_nonnull, u8 idx, struct bytes *str __arg_nonnull) {
     if (idx >= MAX_MATCHES) return -EINVAL;

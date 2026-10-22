@@ -1,8 +1,5 @@
-#include "vmlinux.h"
 #include "beeper/http1.h"
 #include "xbpf.h"
-#include <bpf/bpf_helpers.h>
-#include <asm-generic/errno.h>
 
 // The source state the DFA initiates parsing with.
 const u16 s_init = 0;
@@ -71,7 +68,6 @@ static __always_inline void _next(u16 state, u8 input, u16 *next_state, u16 *act
 // are consumed. It may be NULL if the data cannot carry such a prefix.
 //
 // Returns the number of bytes consumed, or its negative if data ran out.
-// The public entry points translate this internal offset into errno.
 static __always_inline int _parse_from(u8 *data, u8 *data_end, u16 start, struct http_match *ms, u32* cidx, u16* s, struct null_prefix *null_prefix) {
     u32 len = (u32)(data_end - data);
     bpf_clamp_uminmax(len, 0, MAX_BYTES);
@@ -129,8 +125,7 @@ static __always_inline int _parse_from(u8 *data, u8 *data_end, u16 start, struct
 // not done by the end of it, the whole message is pulled in and parsing resumes
 // where it stopped.
 //
-// Returns the header length, -EAGAIN if more bytes are needed, -E2BIG if the
-// header exceeds MAX_BYTES, or -EFAULT if the message cannot be pulled in.
+// Returns the header length, or a negative error in case of failure.
 SEC("freplace")
 int parse_msg(struct sk_msg_md *msg, struct http_parse_res *pres __arg_nonnull) {
     u32 cidx[MAX_MATCHES] = { 0 };
@@ -156,8 +151,9 @@ int parse_msg(struct sk_msg_md *msg, struct http_parse_res *pres __arg_nonnull) 
 
 // Parses the header block of the message that starts `off` bytes into the
 // packet. The captured ranges are offsets into the
-// sk_buff, the return value is counted from the start of the message. See
-// `parse_msg` for the return value.
+// sk_buff, the return value is counted from the start of the message.
+//
+// Returns the header length, or a negative error in case of failure.
 SEC("freplace")
 int parse_skb(struct __sk_buff *skb, u32 off, struct http_parse_res *pres __arg_nonnull, struct null_prefix *null_prefix) {
     if (off >= MAX_BYTES) return -E2BIG;
@@ -193,8 +189,7 @@ bool matched(const struct http_parse_res *pres __arg_nonnull, u8 idx) {
 // Points `str` at the range captured for the match `idx`. The range points into
 // `msg`, so it is only valid until the program invalidates its data pointers.
 //
-// Returns 0 on success, -EINVAL for an invalid id, -ENOENT for no capture,
-// or -EFAULT if the captured range is no longer readable.
+// Returns 0 on success, or a negative error in case of failure.
 SEC("freplace")
 int get_match_msg(const struct sk_msg_md *msg, const struct http_parse_res *pres __arg_nonnull, u8 idx, struct bytes* str __arg_nonnull) {
     if (idx >= MAX_MATCHES) return -EINVAL;

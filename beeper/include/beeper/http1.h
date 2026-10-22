@@ -3,10 +3,7 @@
 #ifndef __BEEPER_HTTP1_H__
 #define __BEEPER_HTTP1_H__
 
-// Declares a stub for the parse function for SK_MSG. The attached parser
-// returns a positive header length, -EAGAIN for incomplete input, -E2BIG for
-// an overlong header, or -EFAULT if pulling data fails. The stub returns
-// -ENOSYS until replaced. See docs/error-codes.md for client actions.
+// Declares a stub for the parse function for SK_MSG.
 #define BEEPER_HTTP1_PARSE_MSG(name)                                                               \
     __noinline int name(struct sk_msg_md *msg, struct http_parse_res *pres __arg_nonnull) {        \
         int ret = -ENOSYS;                                                                         \
@@ -20,8 +17,7 @@
         return ret;                                                                                \
     }
 
-// Declares a stub for the parse function for SK_SKB. It also returns -EINVAL
-// for an offset beyond the skb length.
+// Declares a stub for the parse function for SK_SKB.
 #define BEEPER_HTTP1_PARSE_SKB(name)                                                               \
     __noinline int name(struct __sk_buff *skb, u32 off, struct http_parse_res *pres __arg_nonnull, \
                         struct null_prefix *null_prefix) {                                         \

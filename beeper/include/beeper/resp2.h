@@ -1,8 +1,5 @@
 #include "beeper/beeper.h"
 
-// The RESP2 specific part of the interface between a BPF program and the
-// parsers beeper attaches to it.
-
 #ifndef __BEEPER_RESP2_H__
 #define __BEEPER_RESP2_H__
 
@@ -24,8 +21,7 @@ struct resp2_parse_res {
     struct resp_match ms[MAX_MATCHES];
 };
 
-// Creates `name`, a stub for the RESP2 message parser
-// (`resp2::Parser::parse_fn`, `MessageBuffer::Msg`).
+// Declares a stub for the parse function for SK_MSG.
 #define BEEPER_RESP2_PARSE_MSG(name)                                                               \
     __noinline int name(struct sk_msg_md *msg, struct http_parse_res *pres __arg_nonnull) {             \
         int ret = -ENOSYS;                                                                         \
@@ -41,8 +37,7 @@ struct resp2_parse_res {
         return ret;                                                                                \
     }
 
-// Creates `name`, a stub for the RESP2 sk_buff parser
-// (`resp2::Parser::parse_fn`, `MessageBuffer::Skb`).
+// Declares a stub for the parse function for SK_MSG.
 #define BEEPER_RESP2_PARSE_SKB(name)                                                               \
     __noinline int name(struct __sk_buff *skb, u32 off, struct http_parse_res *pres __arg_nonnull,      \
                         struct null_prefix *null_prefix) {                                         \
@@ -61,8 +56,7 @@ struct resp2_parse_res {
         return ret;                                                                                \
     }
 
-// Creates `name`, a stub for the RESP2 buffer parser
-// (`resp2::Parser::parse_fn`, `MessageBuffer::DynPtr`).
+// Declares a stub for the parse function for DYN_PTR.
 #define BEEPER_RESP2_PARSE_BUF(name)                                                               \
     __noinline int name(const struct bpf_dynptr *buf_ptr, u32 len,                                 \
                         struct http_parse_res *pres __arg_nonnull, struct null_prefix *null_prefix) {   \
