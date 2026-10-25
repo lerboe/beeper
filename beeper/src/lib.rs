@@ -29,6 +29,9 @@
 //! The value returned by `attach` owns the links to the attached programs, so
 //! the parser stays in place until it is dropped.
 
+#[cfg(not(target_os = "linux"))]
+compile_error!("xbpf supports only Linux");
+
 pub(crate) use dfa::Dfa;
 use httlib_huffman::EncoderError;
 use std::fmt::Display;
