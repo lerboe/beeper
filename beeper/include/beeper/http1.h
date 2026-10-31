@@ -50,4 +50,20 @@
         return ret;                                                                                \
     }
 
+// Declares a stub for the get function for DYN_PTR.
+#define BEEPER_HTTP1_GET_MATCH_BUF(name)                                                           \
+    __noinline int name(const struct bpf_dynptr *buf_ptr,                                          \
+                        const struct http_parse_res *pres __arg_nonnull, u8 idx,                   \
+                        struct bytes *str __arg_nonnull) {                                         \
+        int ret = -ENOSYS;                                                                         \
+                                                                                                   \
+        __sink(buf_ptr);                                                                           \
+        __sink(pres);                                                                              \
+        __sink(idx);                                                                               \
+        __sink(str);                                                                               \
+        __sink(ret);                                                                               \
+                                                                                                   \
+        return ret;                                                                                \
+    }
+
 #endif // __BEEPER_HTTP1_H__

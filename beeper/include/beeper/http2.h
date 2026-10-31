@@ -97,6 +97,26 @@ struct http2_hdr_field {
         return ret;                                                                                \
     }
 
+// Declares a stub for the get function for DYN_PTR. A buffer carries no
+// connection of its own, so `conn` names the one whose HPACK tables a value
+// that was only referenced by index is read out of.
+#define BEEPER_HTTP2_GET_MATCH_BUF(name)                                                           \
+    __noinline int name(const struct bpf_dynptr *buf_ptr,                                          \
+                        const struct ip4_conn *conn __arg_nonnull,                                 \
+                        const struct http_parse_res *pres __arg_nonnull, u8 idx,                   \
+                        struct bytes *str __arg_nonnull) {                                         \
+        int ret = -ENOSYS;                                                                         \
+                                                                                                   \
+        __sink(buf_ptr);                                                                           \
+        __sink(conn);                                                                              \
+        __sink(pres);                                                                              \
+        __sink(idx);                                                                               \
+        __sink(str);                                                                               \
+        __sink(ret);                                                                               \
+                                                                                                   \
+        return ret;                                                                                \
+    }
+
 // Declares a stub for the get_dt function for SK_SKB.
 #define BEEPER_HTTP2_GET_DT_ENTRY(name)                                                               \
     __noinline int name(const struct ip4_conn *conn __arg_nonnull, u32 idx,                        \

@@ -72,6 +72,12 @@ BEEPER_HTTP1_PARSE_SKB(parse_http1_skb)
 BEEPER_GET_MATCH_SKB(get_http2_match_skb)
 BEEPER_HTTP2_PARSE_SKB(parse_http2_skb)
 
+BEEPER_HTTP1_GET_MATCH_BUF(get_http1_match_buf)
+BEEPER_HTTP1_PARSE_BUF(parse_http1_buf)
+
+BEEPER_HTTP2_GET_MATCH_BUF(get_http2_match_buf)
+BEEPER_HTTP2_PARSE_BUF(parse_http2_buf)
+
 extern void *bpf_cast_to_kern_ctx(void *obj) __ksym;
 
 // Returns where the message a stream parser cut out of `skb` starts. The kernel
@@ -596,6 +602,78 @@ int monitor_sockets(struct bpf_sock_ops *ops) {
     }
 
     return SK_PASS;
+}
+
+// The most bytes of a buffer a test can hand to `parse_buf_input`.
+#define MAX_BUF_INPUT 1024
+
+// The buffer to parse, written by the test before it runs `parse_buf_input`.
+// `conn` names the connection it belongs to, which only an HTTP/2 parse needs:
+// a buffer carries no connection of its own.
+struct buf_args {
+    struct ip4_conn conn;
+    u32 len;
+    bool is_h2;
+    u8 data[MAX_BUF_INPUT];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, struct buf_args);
+} buf_input SEC(".maps");
+
+// Parses the buffer of `buf_input` and records what the parser captured in
+// `matches`, the way the socket hooks do it for a message. The hooks that hand
+// out a dynptr are none a test can drive, so the buffer parsers are run over a
+// dynptr built on a map value instead.
+//
+// Returns what the parser returned for the buffer.
+SEC("syscall")
+int parse_buf_input(void *ctx) {
+    u32 zero = 0;
+    struct buf_args *args = bpf_map_lookup_elem(&buf_input, &zero);
+    if (args == NULL) return -ENOENT;
+
+    u32 len = args->len;
+    if (len > MAX_BUF_INPUT) return -E2BIG;
+    bpf_clamp_uminmax(len, 0, MAX_BUF_INPUT);
+
+    struct bpf_dynptr buf;
+    if (bpf_dynptr_from_mem(args->data, len, 0, &buf) < 0) return -EFAULT;
+
+    bool is_h2 = args->is_h2;
+    struct http_parse_res pres = { 0 };
+    int res;
+
+    if (is_h2) {
+        struct http2_frame frame = { 0 };
+        res = parse_http2_buf(&buf, &args->conn, &pres, &frame, NULL);
+
+        last_dt_count_before = frame.dt_count_before;
+        last_dt_count = frame.dt_count;
+    }
+    else {
+        res = parse_http1_buf(&buf, len, &pres, NULL);
+    }
+
+    if (res < 0) {
+        clear_matches();
+        return res;
+    }
+
+    store_matched(&pres, is_h2);
+
+    u32 i = 0;
+    bpf_for(i, 0, 32) {
+        struct bytes str = { 0 };
+        int mres = is_h2 ? get_http2_match_buf(&buf, &args->conn, &pres, i, &str)
+                         : get_http1_match_buf(&buf, &pres, i, &str);
+        store_match(i, mres, &str);
+    }
+
+    return res;
 }
 
 // Writes a mark to `results`, which a reader that receives it knows to have

@@ -66,6 +66,7 @@ pub mod http2;
 pub enum MessageBuffer {
     Skb,
     Msg,
+    DynPtr,
 }
 
 /// The ways a parser can fail.

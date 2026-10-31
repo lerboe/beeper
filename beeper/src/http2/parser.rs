@@ -311,6 +311,7 @@ impl Parser {
         if tracing::event_enabled!(target: "bpf", Level::TRACE) {
             open_skel.progs.parse_msg.set_log_level(1);
             open_skel.progs.parse_skb.set_log_level(1);
+            open_skel.progs.parse_buf.set_log_level(1);
         }
 
         // only the programs the parser was configured with are loaded
@@ -322,6 +323,7 @@ impl Parser {
             let prog = match msg_buf {
                 MessageBuffer::Msg => &mut open_skel.progs.parse_msg,
                 MessageBuffer::Skb => &mut open_skel.progs.parse_skb,
+                MessageBuffer::DynPtr => &mut open_skel.progs.parse_buf,
             };
             prog.set_autoload(true);
             prog.set_attach_target(target, Some(func.clone()))?;
@@ -337,6 +339,7 @@ impl Parser {
             let prog = match msg_buf {
                 MessageBuffer::Msg => &mut open_skel.progs.get_match_msg,
                 MessageBuffer::Skb => &mut open_skel.progs.get_match_skb,
+                MessageBuffer::DynPtr => &mut open_skel.progs.get_match_buf,
             };
             prog.set_autoload(true);
             prog.set_attach_target(target, Some(func.clone()))?;
@@ -359,6 +362,7 @@ impl Parser {
             links.push(match msg_buf {
                 MessageBuffer::Msg => skel.progs.parse_msg.attach()?,
                 MessageBuffer::Skb => skel.progs.parse_skb.attach()?,
+                MessageBuffer::DynPtr => skel.progs.parse_buf.attach()?,
             });
         }
 
@@ -370,6 +374,7 @@ impl Parser {
             links.push(match msg_buf {
                 MessageBuffer::Msg => skel.progs.get_match_msg.attach()?,
                 MessageBuffer::Skb => skel.progs.get_match_skb.attach()?,
+                MessageBuffer::DynPtr => skel.progs.get_match_buf.attach()?,
             });
         }
 

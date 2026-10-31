@@ -1247,6 +1247,108 @@ int parse_skb(struct __sk_buff *skb, u32 off, struct http_parse_res *pres __arg_
     return frame_len;
 }
 
+extern u32 bpf_dynptr_size(const struct bpf_dynptr *p) __ksym;
+
+// The bytes of the buffer a dynptr was walked over last, one copy per CPU.
+// `bpf_dynptr_data` only hands out a slice of a length the verifier knows at
+// load time, which the length of a frame never is, so the parser reads the
+// bytes out of the dynptr and walks the copy instead.
+//
+// ponytail: one copy per CPU, so what `get_match_buf` points into is only valid
+// until the next parse on the same CPU. A program that sleeps between parsing
+// and getting would need the copy keyed by something narrower.
+struct buf_copy {
+    u8 data[MAX_BYTES + 1];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, struct buf_copy);
+} buf_copies SEC(".maps");
+
+// Reads the first `*len` bytes of `buf_ptr` into this CPU's copy and returns
+// where they landed, cutting `*len` down to the bytes the copy holds. Returns
+// NULL if the buffer is shorter than that.
+//
+// It is kept out of line on purpose: the verifier does not track a dynptr that
+// was spilled to the stack, and inlining this into a caller that holds a few
+// more values live is enough for clang to spill the one it is handed.
+static __noinline u8 *_copy_buf(const struct bpf_dynptr *buf_ptr, u32 *len) {
+    u32 zero = 0;
+    struct buf_copy *buf = bpf_map_lookup_elem(&buf_copies, &zero);
+    if (buf == NULL) return NULL;
+
+    bpf_clamp_uminmax(*len, 0, MAX_BYTES);
+    if (bpf_dynptr_read(buf->data, *len, buf_ptr, 0, 0) < 0) return NULL;
+
+    return buf->data;
+}
+
+// Consumes one HEADER frame at the start of `buf_ptr` and parses it into
+// `frame`. A buffer carries no connection of its own, so `conn` has to name the
+// one it belongs to for the dynamic table to be found. See `parse_msg`.
+//
+// Returns the number of bytes consumed, or a negative error in case of failure.
+SEC("freplace")
+int parse_buf(const struct bpf_dynptr *buf_ptr, struct ip4_conn *conn, struct http_parse_res *pres __arg_nonnull, struct http2_frame *frame __arg_nonnull, struct null_prefix *null_prefix) {
+    if (conn == NULL) return -EINVAL;
+
+    u32 size = bpf_dynptr_size(buf_ptr);
+    if (size < HTTP2_FRAME_HDR_LEN) return 0;
+
+    u32 copied = size;
+    u8 *data = _copy_buf(buf_ptr, &copied);
+    if (data == NULL) return -EFAULT;
+
+    u32 len = data[0] << 16 | data[1] << 8 | data[2];
+    u8 type = data[3];
+    u8 flags = data[4];
+    u32 frame_len = HTTP2_FRAME_HDR_LEN + len;
+
+    *frame = _new_http2_frame(data, len, type, flags);
+
+    bpf_debug("Parsing HTTP/2 buf with length %d, type %d, flags %d", len, type, flags);
+
+    struct msg_ctx ctx = {
+        .data = data,
+        .data_end = data + copied,
+        .conn = *conn
+    };
+    if (_violates_block_rules(type, frame->sid)) {
+        return _reject_frame(frame, frame_len, size);
+    }
+
+    if (!_is_parsed_frame(type, flags)) {
+        _skip_frame(&ctx.conn, frame);
+
+        return frame_len;
+    }
+
+    if (frame_len > size) {
+        frame->need = frame_len;
+        return -EAGAIN;
+    }
+
+    if (type == HTTP2_HEADERS_FRAME && (flags & HTTP2_END_HEADERS_FLAG) == 0) {
+        int res = _parse_block(&ctx, 0, pres, frame);
+
+        // a block whose frames are all in the buffer, but not all in the copy,
+        // would never be read
+        if (res == -EAGAIN && frame->need <= size) return -E2BIG;
+
+        return res;
+    }
+
+    if (frame_len > copied) return -E2BIG;
+
+    int err = _parse_frame(&ctx, 0, len, type, flags, pres, frame, null_prefix);
+    if (err < 0) return err;
+
+    return frame_len;
+}
+
 // Reads the `idx`th entry of `conn`'s dynamic table into `out`.
 // Returns 0 on success, or a negative error in case of failure.
 SEC("freplace")
@@ -1319,5 +1421,31 @@ int get_match_skb(const struct __sk_buff *skb, const struct http_parse_res *pres
     if (!_is_captured(&m)) return -ENOENT;
 
     struct msg_ctx ctx = _new_skb_ctx(skb);
+    return _get_str(&ctx, &m, str);
+}
+
+// Same as `get_match`, for a match taken out of a buffer. A value that was
+// spelled out in a single frame points into the copy `parse_buf` made of the
+// buffer, so it is only valid until the next parse on the same CPU. `conn`
+// names the connection the buffer belongs to, the buffer itself carries none.
+SEC("freplace")
+int get_match_buf(const struct bpf_dynptr *buf_ptr, const struct ip4_conn *conn __arg_nonnull, const struct http_parse_res *pres __arg_nonnull, u8 idx, struct bytes *str __arg_nonnull) {
+    if (idx >= MAX_MATCHES) return -EINVAL;
+
+    struct http_match m = pres->ms[idx & MAX_MATCH_MASK];
+    if (!_is_captured(&m)) return -ENOENT;
+
+    struct msg_ctx ctx = { .conn = *conn };
+
+    // a value out of a table or a collected block is read from there, so only
+    // one spelled out in the frame needs the bytes of the buffer
+    if (m.source == HTTP_SRC_MSG) {
+        u32 len = (u32)m.idx + m.len;
+        ctx.data = _copy_buf(buf_ptr, &len);
+        if (ctx.data == NULL) return -EFAULT;
+
+        ctx.data_end = ctx.data + len;
+    }
+
     return _get_str(&ctx, &m, str);
 }
