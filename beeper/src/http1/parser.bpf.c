@@ -58,6 +58,43 @@ static __always_inline void _next(u16 state, u8 input, u16 *next_state, u16 *act
     *action = t.action;
 }
 
+// Feeds the byte `c` at offset `i` to the DFA in state `*s` and records the
+// range it captures in `ms`. See `_parse_from`.
+//
+// Returns whether the header block ends with `c`.
+static __always_inline bool _step(u8 c, u32 i, struct http_match *ms, u32 *cidx, u16 *s) {
+    u16 a = 0;
+    _next(*s, c, s, &a);
+
+    if (*s == s_any) {
+        _next(s_any, c, s, &a);
+    }
+
+    struct http1_action act = _action(a);
+    if (act.kind == HTTP1A_START_CAPTURE) {
+        u16 mid = act.mid & MAX_MATCH_MASK;
+        bpf_debug("start capture range (%d) in [%d, ...]", mid, i+1);
+        cidx[mid] = i + 1;
+    }
+    else if (act.kind == HTTP1A_END_CAPTURE) {
+        u16 mid = act.mid & MAX_MATCH_MASK;
+        bpf_debug("end capture range (%d) in [%d, %d]", mid, cidx[mid], i - cidx[mid] + 1);
+
+        ms[mid] = (struct http_match) {
+            .idx = cidx[mid],
+            .len = i - cidx[mid] + 1,
+            .source = HTTP_SRC_MSG
+        };
+    }
+
+    if ((act.flags & HTTP1F_DONE) != 0) {
+        bpf_debug("done parsing at %d", i);
+        return true;
+    }
+
+    return false;
+}
+
 // Walks the DFA over `data`, starting at offset `start` and in state `*s`, and
 // records the ranges it captures in `ms`. `cidx` holds the start index of every
 // open capture, `s` the state the walk ended in, so that a caller can resume
@@ -87,34 +124,7 @@ static __always_inline int _parse_from(u8 *data, u8 *data_end, u16 start, struct
             continue;
         }
 
-        u16 a = 0;
-        _next(*s, c, s, &a);
-
-        if (*s == s_any) {
-            _next(s_any, c, s, &a);
-        }
-
-        struct http1_action act = _action(a);
-        if (act.kind == HTTP1A_START_CAPTURE) {
-            u16 mid = act.mid & MAX_MATCH_MASK;
-            bpf_debug("start capture range (%d) in [%d, ...]", mid, i+1);
-            cidx[mid] = i + 1;
-        }
-        else if (act.kind == HTTP1A_END_CAPTURE) {
-            u16 mid = act.mid & MAX_MATCH_MASK;
-            bpf_debug("end capture range (%d) in [%d, %d]", mid, cidx[mid], i - cidx[mid] + 1);
-
-            ms[mid] = (struct http_match) {
-                .idx = cidx[mid],
-                .len = i - cidx[mid] + 1,
-                .source = HTTP_SRC_MSG
-            };
-        }
-
-        if ((act.flags & HTTP1F_DONE) != 0) {
-            bpf_debug("done parsing at %d", i);
-            return i+1;
-        }
+        if (_step(c, i, ms, cidx, s)) return i+1;
     }
 
     return -len;
@@ -177,58 +187,30 @@ int parse_skb(struct __sk_buff *skb, u32 off, struct http_parse_res *pres __arg_
     return skb->len >= MAX_BYTES ? -E2BIG : -EAGAIN;
 }
 
-// The bytes of the buffer a dynptr was walked over last, one copy per CPU.
-// `bpf_dynptr_data` only hands out a slice of a length the verifier knows at
-// load time, which the length of a message never is, so the parser reads the
-// bytes out of the dynptr and walks the copy instead.
-//
-// ponytail: one copy per CPU, so what `get_match_buf` points into is only valid
-// until the next parse on the same CPU. A program that sleeps between parsing
-// and getting would need the copy keyed by something narrower.
-struct buf_copy {
-    u8 data[MAX_BYTES + 1];
-};
+extern int bpf_dynptr_clone(const struct bpf_dynptr *p, struct bpf_dynptr *clone__uninit) __ksym;
 
-struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, u32);
-    __type(value, struct buf_copy);
-} buf_copies SEC(".maps");
-
-// Reads the first `*len` bytes of `buf_ptr` into this CPU's copy and returns
-// where they landed, cutting `*len` down to the bytes the copy holds. Returns
-// NULL if the buffer is shorter than that.
-//
-// It is kept out of line on purpose: the verifier does not track a dynptr that
-// was spilled to the stack, and inlining this into a caller that holds a few
-// more values live is enough for clang to spill the one it is handed.
-static __noinline u8 *_copy_buf(const struct bpf_dynptr *buf_ptr, u32 *len) {
-    u32 zero = 0;
-    struct buf_copy *buf = bpf_map_lookup_elem(&buf_copies, &zero);
-    if (buf == NULL) return NULL;
-
-    bpf_clamp_uminmax(*len, 0, MAX_BYTES);
-    if (bpf_dynptr_read(buf->data, *len, buf_ptr, 0, 0) < 0) return NULL;
-
-    return buf->data;
-}
-
-// Parses the header block of the first `len` bytes of `buf_ptr`. Unlike a
-// message or a packet, a buffer is contiguous, so a single pass is enough.
+// Parses the header block of the first `len` bytes of `buf_ptr`, see
+// `bpf_dynptr_for_each` for how it is read.
 //
 // Returns the header length, or a negative error in case of failure.
 SEC("freplace")
-int parse_buf(const struct bpf_dynptr *buf_ptr, u32 len, struct http_parse_res *pres __arg_nonnull, struct null_prefix *null_prefix) {
+int parse_buf(const struct bpf_dynptr *buf_ptr, u32 len, struct http_parse_res *pres __arg_nonnull) {
     u32 cidx[MAX_MATCHES] = { 0 };
     u16 s = s_init;
 
-    u8 *data = _copy_buf(buf_ptr, &len);
-    if (data == NULL) return -EFAULT;
+    // the verifier does not track a dynptr argument that clang spills to the
+    // stack, which the loop below makes it do. A clone lives on the stack, so
+    // a pointer to it is one the verifier always knows
+    struct bpf_dynptr buf;
+    if (bpf_dynptr_clone(buf_ptr, &buf) < 0) return -EFAULT;
 
-    int res = _parse_from(data, data + len, 0, pres->ms, cidx, &s, null_prefix);
+    bpf_clamp_uminmax(len, 0, MAX_BYTES);
 
-    if (res > 0) return res;
+    u8 tmp[BPF_DYNPTR_SLICE_LEN];
+    bpf_dynptr_for_each(&buf, tmp, 0, len, c, i,
+        if (_step(c, i, pres->ms, cidx, &s)) return i + 1;
+    );
+
     return len >= MAX_BYTES ? -E2BIG : -EAGAIN;
 }
 
@@ -285,8 +267,17 @@ int get_match_skb(const struct __sk_buff *skb, const struct http_parse_res *pres
 }
 
 // Same as `get_match`, for a match taken out of a buffer. The range points into
-// the copy `parse_buf` made of it, so it is only valid until the next parse on
-// the same CPU.
+// the bytes of `buf_ptr`, so it is only valid for as long as the dynptr is.
+//
+// A slice is as long as the verifier is told at load time, which the length of
+// a capture never is. The slice of the first byte points at all of the range if
+// the bytes of the dynptr are contiguous, the one of the last byte makes sure
+// the range is in the buffer.
+//
+// ponytail: the verifier only knows the first byte of `str` to be readable, so a
+// reader copies the rest with `bpf_probe_read_kernel`. A dynptr whose range is
+// not contiguous, e.g. split across the fragments of an xdp buffer, would need
+// a copy instead.
 SEC("freplace")
 int get_match_buf(const struct bpf_dynptr *buf_ptr, const struct http_parse_res *pres __arg_nonnull, u8 idx, struct bytes* str __arg_nonnull) {
     if (idx >= MAX_MATCHES) return -EINVAL;
@@ -294,12 +285,12 @@ int get_match_buf(const struct bpf_dynptr *buf_ptr, const struct http_parse_res 
     struct http_match m = pres->ms[idx & MAX_MATCH_MASK];
     if (m.len == 0) return -ENOENT;
 
-    u32 end = (u32)m.idx + m.len;
-    u32 len = end;
-    u8 *data = _copy_buf(buf_ptr, &len);
-    if (data == NULL || len < end) return -EFAULT;
+    if (bpf_dynptr_slice(buf_ptr, (u32)m.idx + m.len - 1, NULL, 1) == NULL) return -EFAULT;
 
-    str->ptr = data + m.idx;
+    u8 *ptr = bpf_dynptr_slice(buf_ptr, m.idx, NULL, 1);
+    if (ptr == NULL) return -EFAULT;
+
+    str->ptr = ptr;
     str->len = m.len;
 
     return 0;

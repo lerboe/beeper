@@ -649,13 +649,13 @@ int parse_buf_input(void *ctx) {
 
     if (is_h2) {
         struct http2_frame frame = { 0 };
-        res = parse_http2_buf(&buf, &args->conn, &pres, &frame, NULL);
+        res = parse_http2_buf(&buf, &args->conn, &pres, &frame);
 
         last_dt_count_before = frame.dt_count_before;
         last_dt_count = frame.dt_count;
     }
     else {
-        res = parse_http1_buf(&buf, len, &pres, NULL);
+        res = parse_http1_buf(&buf, len, &pres);
     }
 
     if (res < 0) {

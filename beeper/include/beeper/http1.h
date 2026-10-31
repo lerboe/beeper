@@ -37,14 +37,12 @@
 // Declares a stub for the parse function for DYN_PTR.
 #define BEEPER_HTTP1_PARSE_BUF(name)                                                               \
     __noinline int name(const struct bpf_dynptr *buf_ptr, u32 len,                                 \
-                        struct http_parse_res *pres __arg_nonnull,                                 \
-                        struct null_prefix *null_prefix) {                                         \
+                        struct http_parse_res *pres __arg_nonnull) {                               \
         int ret = -ENOSYS;                                                                         \
                                                                                                    \
         __sink(buf_ptr);                                                                           \
         __sink(len);                                                                               \
         __sink(pres);                                                                              \
-        __sink(null_prefix);                                                                       \
         __sink(ret);                                                                               \
                                                                                                    \
         return ret;                                                                                \

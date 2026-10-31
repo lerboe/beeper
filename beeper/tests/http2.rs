@@ -1822,3 +1822,24 @@ fn parse_header_field_split_across_continuation_in_buf() {
         Some(b"text/plain".as_slice()),
     );
 }
+
+#[test]
+fn apply_table_size_setting_in_buf() {
+    let mut open_obj = OpenObject::new();
+    let (prog, h2, _mids) = attach_buf_program(&mut open_obj, &[]);
+
+    let (local, remote) = buf_conn();
+    // SETTINGS_HEADER_TABLE_SIZE = 100
+    let buf = frame(0x04, 0x00, 0, &[0x00, 0x01, 0x00, 0x00, 0x00, 100]);
+
+    let res = prog
+        .parse_http2_buf(&buf, local, remote)
+        .expect("parse buffer");
+    assert_eq!(res, buf.len() as i32, "the whole frame was parsed");
+
+    let info = h2
+        .dynamic_table_info(local, remote)
+        .expect("connection is known")
+        .expect("dynamic_table_info");
+    assert_eq!(info.max_size, 100);
+}

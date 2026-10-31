@@ -1036,16 +1036,14 @@ static __always_inline int _parse_hdr_buf(const struct msg_ctx *ctx, u32 len, st
     return i;
 }
 
-// Reads the header block of the HEADERS frame `off` bytes into `ctx`, which
-// does not end it, along with the CONTINUATION frames that carry it on, and
-// describes it in `frame`.
+// Decodes the header block a collect function put together in `block_bufs`
+// out of `total` bytes of frames, as `blk` describes it, and describes it in
+// `frame`. `total` is what the collect function returned.
 //
 // Returns the number of bytes consumed, or a negative error in case of failure.
-static __always_inline int _parse_block(const struct msg_ctx *ctx, u32 off, struct http_parse_res *pres, struct http2_frame *frame) {
-    struct collected_block blk = { 0 };
-    int total = _collect_block(ctx, off, &blk);
+static __always_inline int _parse_collected(const struct msg_ctx *ctx, int total, const struct collected_block *blk, struct http_parse_res *pres, struct http2_frame *frame) {
     if (total < 0) {
-        if (total == -EAGAIN) frame->need = blk.need;
+        if (total == -EAGAIN) frame->need = blk->need;
         return total;
     }
 
@@ -1055,12 +1053,23 @@ static __always_inline int _parse_block(const struct msg_ctx *ctx, u32 off, stru
     frame->dt_count_before = dt_info->count;
 
     struct http2_parse_state ps = _new_http2_parse_state(HTTP_SRC_BUF);
-    int res = _parse_hdr_buf(ctx, blk.len, dt_info, &ps, pres);
+    int res = _parse_hdr_buf(ctx, blk->len, dt_info, &ps, pres);
 
     frame->dt_count = dt_info->count;
 
     if (res < 0) return res;
-    return (res < blk.len) ? -EBADMSG : total;
+    return (res < blk->len) ? -EBADMSG : total;
+}
+
+// Reads the header block of the HEADERS frame `off` bytes into `ctx`, which
+// does not end it, along with the CONTINUATION frames that carry it on, and
+// describes it in `frame`.
+//
+// Returns the number of bytes consumed, or a negative error in case of failure.
+static __always_inline int _parse_block(const struct msg_ctx *ctx, u32 off, struct http_parse_res *pres, struct http2_frame *frame) {
+    struct collected_block blk = { 0 };
+    int total = _collect_block(ctx, off, &blk);
+    return _parse_collected(ctx, total, &blk, pres, frame);
 }
 
 // Whether a frame carries anything the parser needs to read.
@@ -1248,80 +1257,210 @@ int parse_skb(struct __sk_buff *skb, u32 off, struct http_parse_res *pres __arg_
 }
 
 extern u32 bpf_dynptr_size(const struct bpf_dynptr *p) __ksym;
+extern int bpf_dynptr_clone(const struct bpf_dynptr *p, struct bpf_dynptr *clone__uninit) __ksym;
 
-// The bytes of the buffer a dynptr was walked over last, one copy per CPU.
-// `bpf_dynptr_data` only hands out a slice of a length the verifier knows at
-// load time, which the length of a frame never is, so the parser reads the
-// bytes out of the dynptr and walks the copy instead.
-//
-// ponytail: one copy per CPU, so what `get_match_buf` points into is only valid
-// until the next parse on the same CPU. A program that sleeps between parsing
-// and getting would need the copy keyed by something narrower.
-struct buf_copy {
-    u8 data[MAX_BYTES + 1];
+// The bytes `_collect_range_buf` copies.
+struct buf_range {
+    u32 from;
+    u32 to;
+    u32 pos;
 };
 
-struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, u32);
-    __type(value, struct buf_copy);
-} buf_copies SEC(".maps");
-
-// Reads the first `*len` bytes of `buf_ptr` into this CPU's copy and returns
-// where they landed, cutting `*len` down to the bytes the copy holds. Returns
-// NULL if the buffer is shorter than that.
+// Copies the bytes of `dp` in [`r->from`, `r->to`) to `r->pos` bytes into
+// `block_bufs`. It is a global function, so that the verifier checks it on its
+// own: inlined into the frame loop of `_collect_block_buf`, the reads are too
+// many branches for it. The range is handed over in memory, as scalar
+// arguments would be marked precise, which keeps the frame loop from
+// converging.
 //
-// It is kept out of line on purpose: the verifier does not track a dynptr that
-// was spilled to the stack, and inlining this into a caller that holds a few
-// more values live is enough for clang to spill the one it is handed.
-static __noinline u8 *_copy_buf(const struct bpf_dynptr *buf_ptr, u32 *len) {
+// Returns 0, or a negative error in case of failure.
+__noinline __weak int _collect_range_buf(const struct bpf_dynptr *dp, const struct buf_range *r __arg_nonnull) {
+    u32 from = r->from;
+    u32 to = r->to;
+    u32 pos = r->pos;
+
     u32 zero = 0;
-    struct buf_copy *buf = bpf_map_lookup_elem(&buf_copies, &zero);
-    if (buf == NULL) return NULL;
+    struct block_buf *buf = bpf_map_lookup_elem(&block_bufs, &zero);
+    if (buf == NULL) return -ENOSPC;
 
-    bpf_clamp_uminmax(*len, 0, MAX_BYTES);
-    if (bpf_dynptr_read(buf->data, *len, buf_ptr, 0, 0) < 0) return NULL;
+    // see `parse_buf`
+    struct bpf_dynptr clone;
+    if (bpf_dynptr_clone(dp, &clone) < 0) return -EFAULT;
 
-    return buf->data;
+    u8 tmp[BPF_DYNPTR_SLICE_LEN];
+    bpf_dynptr_for_each(&clone, tmp, from, to, c, at,
+        u32 dst = pos + (at - from);
+        bpf_clamp_uminmax(dst, 0, BLOCK_MAXLEN - 1);
+        buf->data[dst] = c;
+    );
+
+    return 0;
+}
+
+// Same as `_collect_block`, for the frames at the start of `buf_ptr`, which is
+// `size` bytes long. Each frame header is read with a slice of its own, the
+// rest as `bpf_dynptr_for_each` reads it.
+static __always_inline int _collect_block_buf(const struct bpf_dynptr *buf_ptr, u8 *tmp, u32 size, struct collected_block *blk) {
+    u32 zero = 0;
+    struct block_buf *buf = bpf_map_lookup_elem(&block_bufs, &zero);
+    if (buf == NULL) return -ENOSPC;
+
+    u32 o = 0;
+    u32 pos = 0;
+    u32 sid = 0;
+    u32 k = 0;
+
+    bpf_for(k, 0, MAX_BYTES / HTTP2_FRAME_HDR_LEN + 1) {
+        if (o > MAX_BYTES) return -E2BIG;
+
+        if (o + HTTP2_FRAME_HDR_LEN > size) {
+            blk->need = o + HTTP2_FRAME_HDR_LEN;
+            return -EAGAIN;
+        }
+
+        u8 *hdr = bpf_dynptr_slice(buf_ptr, o, tmp, HTTP2_FRAME_HDR_LEN);
+        if (hdr == NULL) return -EFAULT;
+
+        u32 len = (u32)hdr[0] << 16 | (u32)hdr[1] << 8 | (u32)hdr[2];
+        u8 type = hdr[3];
+        u8 flags = hdr[4];
+        u32 fsid = ((u32)hdr[5] << 24 | (u32)hdr[6] << 16 | (u32)hdr[7] << 8 | (u32)hdr[8]) & 0x7FFFFFFF;
+
+        if (k == 0) {
+            sid = fsid;
+        } else if (type != HTTP2_CONTINUATION_FRAME || fsid != sid) {
+            bpf_debug("hdr: a frame of type %u of stream %u breaks the block of stream %u", type, fsid, sid);
+            return -EPROTO;
+        }
+
+        u32 frame_len = HTTP2_FRAME_HDR_LEN + len;
+        if (o + frame_len > size) {
+            blk->need = o + frame_len;
+            return -EAGAIN;
+        }
+
+        // only the HEADERS frame may be padded and carry a priority
+        u32 start = HTTP2_FRAME_HDR_LEN;
+        u32 pad_len = 0;
+        if (k == 0 && (flags & HTTP2_PADDED_FLAG) != 0) {
+            if (start + 1 > frame_len) return -EBADMSG;
+
+            // the length of the padding ends up where the block starts, which
+            // the fragment of the frame overwrites again
+            struct buf_range pad_r = { .from = o + start, .to = o + start + 1, .pos = 0 };
+            int err = _collect_range_buf(buf_ptr, &pad_r);
+            if (err < 0) return err;
+
+            pad_len = buf->data[0];
+            start += 1;
+        }
+        if (k == 0 && (flags & HTTP2_PRIORITY_FLAG) != 0) start += HTTP2_PRIORITY_LEN;
+        if (start + pad_len > frame_len) return -EBADMSG;
+
+        u32 n = frame_len - pad_len - start;
+        if (pos + n > BLOCK_MAXLEN) {
+            bpf_debug("hdr: a block longer than %u bytes", BLOCK_MAXLEN);
+            return -E2BIG;
+        }
+
+        struct buf_range r = { .from = o + start, .to = o + start + n, .pos = pos };
+        int err = _collect_range_buf(buf_ptr, &r);
+        if (err < 0) return err;
+
+        pos += n;
+        o += frame_len;
+
+        if ((flags & HTTP2_END_HEADERS_FLAG) != 0) {
+            buf->len = pos;
+            blk->len = pos;
+            return o;
+        }
+    }
+
+    return -E2BIG;
+}
+
+// Same as `_parse_stg_from`, for the SETTINGS frame at the start of `buf_ptr`,
+// whose payload is `len` bytes long. It is a global function, so that its
+// stack does not add up with the one of `_collect_range_buf`.
+//
+// Returns 0, or a negative error in case of failure.
+__noinline __weak int _parse_stg_buf(const struct bpf_dynptr *buf_ptr, const struct ip4_conn *conn __arg_nonnull, u32 len) {
+    struct dynamic_table_info *dt_info = _get_dynamic_table(conn);
+    if (!dt_info) return -ENOSPC;
+
+    // see `parse_buf`
+    struct bpf_dynptr clone;
+    if (bpf_dynptr_clone(buf_ptr, &clone) < 0) return -EFAULT;
+
+    u8 tmp[BPF_DYNPTR_SLICE_LEN];
+
+    u8 j = 0;
+    u16 id = 0;
+    u32 val = 0;
+
+    bpf_dynptr_for_each(&clone, tmp, HTTP2_FRAME_HDR_LEN, HTTP2_FRAME_HDR_LEN + len, c, at,
+        if (j < 2) {
+            id = (id << 8) | c;
+        }
+        else {
+            val = (val << 8) | c;
+        }
+        j++;
+
+        if (j == 6) {
+            if (id == SETTINGS_HEADER_TABLE_SIZE) {
+                dt_info->max_size = val;
+                bpf_debug("stg: table header size: %u", val);
+            }
+            j = 0;
+            id = 0;
+            val = 0;
+        }
+    );
+
+    return 0;
 }
 
 // Consumes one HEADER frame at the start of `buf_ptr` and parses it into
 // `frame`. A buffer carries no connection of its own, so `conn` has to name the
-// one it belongs to for the dynamic table to be found. See `parse_msg`.
+// one it belongs to for the dynamic table to be found. Every header block is
+// put together in `block_bufs`, which the captures point into. See
+// `parse_msg`.
 //
 // Returns the number of bytes consumed, or a negative error in case of failure.
 SEC("freplace")
-int parse_buf(const struct bpf_dynptr *buf_ptr, struct ip4_conn *conn, struct http_parse_res *pres __arg_nonnull, struct http2_frame *frame __arg_nonnull, struct null_prefix *null_prefix) {
+int parse_buf(const struct bpf_dynptr *buf_ptr, struct ip4_conn *conn, struct http_parse_res *pres __arg_nonnull, struct http2_frame *frame __arg_nonnull) {
     if (conn == NULL) return -EINVAL;
 
-    u32 size = bpf_dynptr_size(buf_ptr);
+    // the verifier does not track a dynptr argument that clang spills to the
+    // stack. A clone lives on the stack, so a pointer to it is one the
+    // verifier always knows
+    struct bpf_dynptr buf;
+    if (bpf_dynptr_clone(buf_ptr, &buf) < 0) return -EFAULT;
+
+    u32 size = bpf_dynptr_size(&buf);
     if (size < HTTP2_FRAME_HDR_LEN) return 0;
 
-    u32 copied = size;
-    u8 *data = _copy_buf(buf_ptr, &copied);
-    if (data == NULL) return -EFAULT;
+    u8 tmp[HTTP2_FRAME_HDR_LEN];
+    u8 *hdr = bpf_dynptr_slice(&buf, 0, tmp, sizeof(tmp));
+    if (hdr == NULL) return -EFAULT;
 
-    u32 len = data[0] << 16 | data[1] << 8 | data[2];
-    u8 type = data[3];
-    u8 flags = data[4];
+    u32 len = hdr[0] << 16 | hdr[1] << 8 | hdr[2];
+    u8 type = hdr[3];
+    u8 flags = hdr[4];
     u32 frame_len = HTTP2_FRAME_HDR_LEN + len;
 
-    *frame = _new_http2_frame(data, len, type, flags);
+    *frame = _new_http2_frame(hdr, len, type, flags);
 
     bpf_debug("Parsing HTTP/2 buf with length %d, type %d, flags %d", len, type, flags);
 
-    struct msg_ctx ctx = {
-        .data = data,
-        .data_end = data + copied,
-        .conn = *conn
-    };
     if (_violates_block_rules(type, frame->sid)) {
         return _reject_frame(frame, frame_len, size);
     }
 
     if (!_is_parsed_frame(type, flags)) {
-        _skip_frame(&ctx.conn, frame);
+        _skip_frame(conn, frame);
 
         return frame_len;
     }
@@ -1331,22 +1470,18 @@ int parse_buf(const struct bpf_dynptr *buf_ptr, struct ip4_conn *conn, struct ht
         return -EAGAIN;
     }
 
-    if (type == HTTP2_HEADERS_FRAME && (flags & HTTP2_END_HEADERS_FLAG) == 0) {
-        int res = _parse_block(&ctx, 0, pres, frame);
+    if (type == HTTP2_SETTINGS_FRAME) {
+        int err = _parse_stg_buf(&buf, conn, len);
+        _skip_frame(conn, frame);
 
-        // a block whose frames are all in the buffer, but not all in the copy,
-        // would never be read
-        if (res == -EAGAIN && frame->need <= size) return -E2BIG;
-
-        return res;
+        return err < 0 ? err : frame_len;
     }
 
-    if (frame_len > copied) return -E2BIG;
+    struct msg_ctx ctx = { .conn = *conn };
+    struct collected_block blk = { 0 };
+    int total = _collect_block_buf(&buf, tmp, size, &blk);
 
-    int err = _parse_frame(&ctx, 0, len, type, flags, pres, frame, null_prefix);
-    if (err < 0) return err;
-
-    return frame_len;
+    return _parse_collected(&ctx, total, &blk, pres, frame);
 }
 
 // Reads the `idx`th entry of `conn`'s dynamic table into `out`.
@@ -1424,28 +1559,19 @@ int get_match_skb(const struct __sk_buff *skb, const struct http_parse_res *pres
     return _get_str(&ctx, &m, str);
 }
 
-// Same as `get_match`, for a match taken out of a buffer. A value that was
-// spelled out in a single frame points into the copy `parse_buf` made of the
-// buffer, so it is only valid until the next parse on the same CPU. `conn`
-// names the connection the buffer belongs to, the buffer itself carries none.
+// Same as `get_match`, for a match taken out of a buffer. `parse_buf` puts every
+// header block together in `block_bufs`, so a value is read from there or from
+// the tables, never from `buf_ptr`, and is only valid until the next parse on
+// the same CPU. `conn` names the connection the buffer belongs to, the buffer
+// itself carries none.
 SEC("freplace")
 int get_match_buf(const struct bpf_dynptr *buf_ptr, const struct ip4_conn *conn __arg_nonnull, const struct http_parse_res *pres __arg_nonnull, u8 idx, struct bytes *str __arg_nonnull) {
     if (idx >= MAX_MATCHES) return -EINVAL;
 
     struct http_match m = pres->ms[idx & MAX_MATCH_MASK];
     if (!_is_captured(&m)) return -ENOENT;
+    if (m.source == HTTP_SRC_MSG) return -EFAULT;
 
     struct msg_ctx ctx = { .conn = *conn };
-
-    // a value out of a table or a collected block is read from there, so only
-    // one spelled out in the frame needs the bytes of the buffer
-    if (m.source == HTTP_SRC_MSG) {
-        u32 len = (u32)m.idx + m.len;
-        ctx.data = _copy_buf(buf_ptr, &len);
-        if (ctx.data == NULL) return -EFAULT;
-
-        ctx.data_end = ctx.data + len;
-    }
-
     return _get_str(&ctx, &m, str);
 }

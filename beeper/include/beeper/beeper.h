@@ -74,4 +74,56 @@ struct trans {
 #define __sink(expr) asm volatile("" : "+g"(expr))
 #endif
 
+extern void *bpf_dynptr_slice(const struct bpf_dynptr *p, u32 offset, void *buffer__opt, u32 buffer__szk) __ksym;
+
+// The number of bytes `bpf_dynptr_for_each` reads with one slice.
+#define BPF_DYNPTR_SLICE_LEN 128
+
+// Runs the statements that follow `at` once for every byte of the dynptr `dp`
+// in [FROM, TO), with `c` the byte and `at` its offset. `tmp` is the
+// `BPF_DYNPTR_SLICE_LEN` bytes a slice is copied to if the dynptr cannot hand
+// out its bytes directly; the caller declares it to keep the stack small.
+//
+// A slice is as long as the verifier is told at load time, so the bytes are
+// read in slices of `BPF_DYNPTR_SLICE_LEN`, or of the largest power of two up
+// to TO if the dynptr is shorter than that. The last slice is moved back to
+// end at TO, and the bytes it shares with the one before are skipped.
+//
+// Returns -EFAULT from the calling function if a slice cannot be read.
+#define bpf_dynptr_for_each(dp, tmp, FROM, TO, c, at, ...)                                         \
+    do {                                                                                           \
+        u32 __to = (TO);                                                                           \
+        if (__to >= BPF_DYNPTR_SLICE_LEN) __bpf_dynptr_for_each(BPF_DYNPTR_SLICE_LEN, dp, tmp, FROM, __to, c, at, __VA_ARGS__);\
+        else if (__to >= 64) __bpf_dynptr_for_each(64, dp, tmp, FROM, __to, c, at, __VA_ARGS__);   \
+        else if (__to >= 32) __bpf_dynptr_for_each(32, dp, tmp, FROM, __to, c, at, __VA_ARGS__);   \
+        else if (__to >= 16) __bpf_dynptr_for_each(16, dp, tmp, FROM, __to, c, at, __VA_ARGS__);   \
+        else if (__to >= 8) __bpf_dynptr_for_each(8, dp, tmp, FROM, __to, c, at, __VA_ARGS__);     \
+        else if (__to >= 4) __bpf_dynptr_for_each(4, dp, tmp, FROM, __to, c, at, __VA_ARGS__);     \
+        else if (__to >= 2) __bpf_dynptr_for_each(2, dp, tmp, FROM, __to, c, at, __VA_ARGS__);     \
+        else if (__to >= 1) __bpf_dynptr_for_each(1, dp, tmp, FROM, __to, c, at, __VA_ARGS__);     \
+    } while (0)
+
+// One window length of `bpf_dynptr_for_each`.
+#define __bpf_dynptr_for_each(LEN, dp, tmp, FROM, TO, c, at, ...)                                  \
+    do {                                                                                           \
+        u32 __o = (FROM);                                                                          \
+        u32 __k = 0;                                                                               \
+        bpf_for(__k, 0, (TO) / (LEN) + 2) {                                                        \
+            if (__o >= (TO)) break;                                                                \
+                                                                                                   \
+            u32 __start = (__o + (LEN) > (TO)) ? (TO) - (LEN) : __o;                               \
+            u8 *__p = bpf_dynptr_slice((dp), __start, (tmp), (LEN));                               \
+            if (__p == NULL) return -EFAULT;                                                       \
+                                                                                                   \
+            u32 __j = 0;                                                                           \
+            bpf_for(__j, __o - __start, (LEN)) {                                                   \
+                u8 c = __p[__j];                                                                   \
+                u32 at = __start + __j;                                                            \
+                __VA_ARGS__                                                                        \
+            }                                                                                      \
+                                                                                                   \
+            __o = __start + (LEN);                                                                 \
+        }                                                                                          \
+    } while (0)
+
 #endif // __BEEPER_H__

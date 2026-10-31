@@ -680,3 +680,37 @@ fn report_a_buf_that_ends_mid_message() {
 
     assert_eq!(res, -libc::EAGAIN, "the parser ran out of bytes");
 }
+
+#[test]
+fn parse_headers_longer_than_a_slice_in_buf() {
+    let mut open_obj = OpenObject::new();
+    let prog = attach_buf_program(&mut open_obj);
+    let (_h1, mids) = attach_http1_parser(
+        prog.prog_fd(),
+        Hook::Buf,
+        true,
+        &[header::USER_AGENT.as_str()],
+    );
+
+    // the buffer is read in 128 byte slices, the last of which is moved back
+    // to end with it, and the user agent crosses from one slice into the next.
+    // The test program keeps 128 bytes of a capture, so the user agent stays
+    // shorter than that
+    let filler = "f".repeat(200);
+    let user_agent = "a".repeat(100);
+    let req = format!(
+        "GET / HTTP/1.1\r\nhost: beeper\r\nx-filler: {filler}\r\nuser-agent: {user_agent}\r\n\r\n"
+    );
+    let ua_start = req.find("user-agent: ").expect("user agent") + "user-agent: ".len();
+    assert!(ua_start < 256 && ua_start + user_agent.len() > 256);
+    assert!(req.len() % 128 != 0);
+
+    let res = prog.parse_http1_buf(req.as_bytes()).expect("parse buffer");
+
+    assert_eq!(res, req.len() as i32, "the whole header block was parsed");
+    assert_match_eq(
+        &prog,
+        mids[0],
+        Some(&HeaderValue::from_str(&user_agent).expect("header value")),
+    );
+}
