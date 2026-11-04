@@ -2,13 +2,13 @@
 name = "beeper"
 version = "0.1.7"
 edition = "2024"
-license.workspace = true
-authors.workspace = true
-repository.workspace = true
-readme.workspace = true
-keywords.workspace = true
-description.workspace = true
-categories.workspace = true
+license = "GPL-3.0"
+authors = ["lerboe <mail@laurinbrandner.ch>"]
+readme = "README.md"
+repository = "https://github.com/lerboe/beeper"
+description = "Application-layer parsing in eBPF"
+categories = ["os", "os::linux-apis", "network-programming"]
+keywords = ["ebpf", "bpf", "libbpf", "l7", "http"]
 
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]

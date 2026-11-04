@@ -1,14 +1,3 @@
 [workspace]
 resolver = "2"
 members = ["beeper", "example", "utils"]
-
-[workspace.package]
-license = "GPL-3.0"
-authors = [
-    "lerboe <mail@laurinbrandner.ch>",
-]
-repository = "https://github.com/lerboe/beeper"
-readme = "README.md"
-keywords = ["ebpf", "bpf", "libbpf", "l7", "http"]
-description = "Application-layer parsing in eBPF"
-categories = ["os", "os::linux-apis", "network-programming"]
