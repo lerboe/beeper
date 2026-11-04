@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["beeper", "example", "utils"]
+members = ["beeper", "example", "ffi", "utils"]
 
 [workspace.package]
 license = "GPL-3.0"

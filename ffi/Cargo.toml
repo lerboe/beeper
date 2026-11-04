@@ -1,0 +1,15 @@
+[package]
+name = "beeper-ffi"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "beeper_ffi"
+crate-type = ["staticlib"]
+
+[dependencies]
+beeper = { path = "../beeper", features = ["http1", "http2"] }

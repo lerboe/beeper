@@ -194,6 +194,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "beeper-ffi"
+version = "0.1.0"
+dependencies = [
+ "beeper",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
