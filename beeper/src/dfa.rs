@@ -76,12 +76,22 @@ impl<A: Copy + Debug + PartialEq + Eq> DfaBuilder<'_, A> {
 
     /// Attaches `action` to every transition that leads into the state the
     /// pattern has been built up to.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the pattern has no transition yet, as there is nothing to
+    /// attach `action` to.
     pub fn with(&mut self, action: A) -> &mut Self {
         trace!("with; state={:?}, action={:?}", self.state, action);
 
         // an optional prefix loops back into the current state, so it is one of
         // the routes into it and has to carry the action too
         self.push_optional_prefixes();
+
+        assert!(
+            !self.last_edges.is_empty(),
+            "Cannot attach {action:?} to a pattern without a transition"
+        );
 
         for (from, input, case_sensitive) in self.last_edges.clone() {
             self.dfa.add_action(from, input, action);
@@ -542,5 +552,12 @@ mod tests {
         let dfa = dfa_with_optional_input(false);
         assert!(matches_input(&dfa, INIT_STATE, b"aaa"));
         assert!(matches_input(&dfa, INIT_STATE, b"aaac"));
+    }
+
+    #[test]
+    #[should_panic(expected = "without a transition")]
+    fn an_action_needs_a_transition_to_attach_to() {
+        let mut dfa: Dfa<()> = Dfa::new();
+        dfa.start_pattern(INIT_STATE).with(());
     }
 }
