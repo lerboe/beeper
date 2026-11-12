@@ -468,7 +468,7 @@ async fn parse_a_header_in_the_first_half_of_a_long_message() {
         &[header::USER_AGENT.as_str()],
     );
 
-    // the parser walks the first 0x7FFF bytes of a message. The field below
+    // the parser walks the first 0xFF00 bytes of a message. The field below
     // sits well inside of them, the padding behind it pushes the message well
     // past them
     let user_agent = HeaderValue::from_static("beeper");
@@ -479,12 +479,12 @@ async fn parse_a_header_in_the_first_half_of_a_long_message() {
         req += &format!("x-pad-{i}: {pad}\r\n");
     }
     req += "user-agent: beeper\r\n";
-    for i in 8..38 {
+    for i in 8..70 {
         req += &format!("x-pad-{i}: {pad}\r\n");
     }
     req += "\r\n";
 
-    assert!(req.len() > 0x7FFF, "the message is not long enough");
+    assert!(req.len() > 0xFF00, "the message is not long enough");
     _ = send_raw(addr, &req).await;
 
     assert_match_eq(&prog, mids[0], Some(&user_agent));

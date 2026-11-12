@@ -10,7 +10,7 @@
 char LICENSE[] SEC("license") = "GPL";
 
 // The number of bytes a parser walks at most.
-#define MAX_BYTES 0x7FFF
+#define MAX_BYTES 0xFF00
 
 // The number of matches a any parser can get.
 #define MAX_MATCHES 32

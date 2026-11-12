@@ -687,7 +687,7 @@ static __always_inline struct http2_parse_state _new_http2_parse_state(u8 src) {
 //
 // Returns 0 or a negative error in case of failure.
 static __always_inline int _run_action(const struct msg_ctx *ctx __arg_nonnull, struct dynamic_table_info *dt_info __arg_nonnull, struct http_parse_res *pres __arg_nonnull, struct http2_parse_state *ps __arg_nonnull) {
-    u32 v = ps->v & MAX_BYTES;
+    u32 v = ps->v & 0xFFFF;
 
     bpf_trace("hdr: %d: kind %d, val %d", ps->i, ps->kind, v);
 
@@ -703,7 +703,7 @@ static __always_inline int _run_action(const struct msg_ctx *ctx __arg_nonnull, 
             slot = idx > STATIC_TABLE_SIZE ? _get_dynamic_table_index(dt_info, idx) : idx;
 
             // if we overflow, at least we won't report the wrong header
-            if (slot > 0xffff) slot = 0;
+            if (slot > 0xFFFF) slot = 0;
         }
 
         ps->add_to_dt = (ps->flags & HTTP2F_ADD_DT) != 0;
