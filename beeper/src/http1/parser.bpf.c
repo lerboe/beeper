@@ -33,6 +33,10 @@ struct http1_action {
 volatile const struct trans states[MAX_STATES][MAX_EDGES];
 volatile const struct http1_action actions[MAX_ACTIONS];
 
+// The action run before the very first byte of a message, but not before any
+// other byte. 0 is the noop action.
+volatile const u16 initial_action;
+
 // Reads the action an edge carries. Edge 0 leads to the fallback state.
 static __always_inline struct http1_action _action(u16 id) {
     return actions[id & (MAX_ACTIONS - 1)];
@@ -62,6 +66,39 @@ static __always_inline void _next(u16 state, u8 input, u16 *next_state, u16 *act
 // captures from its very first byte has no transition in front of that byte to
 // open the capture on, so such a capture starts with the message instead.
 #define CIDX_NONE ((u32)-1)
+
+// Runs the action `a` of a transition after which the message continues at
+// index `next`, recording the ranges it captures in `ms`. `cidx` and
+// `msg_start` are those of `_parse_from`.
+//
+// Returns whether the action ends parsing.
+static __always_inline bool _run_action(u16 a, u32 next, struct http_match *ms, u32 *cidx, u32 *msg_start) {
+    struct http1_action act = _action(a);
+    if (act.kind == HTTP1A_START_CAPTURE) {
+        u16 mid = act.mid & MAX_MATCH_MASK;
+        bpf_debug("start capture range (%d) in [%d, ...]", mid, next);
+        cidx[mid] = next;
+    }
+    else if (act.kind == HTTP1A_END_CAPTURE) {
+        u16 mid = act.mid & MAX_MATCH_MASK;
+        u32 from = cidx[mid];
+        if (from == CIDX_NONE) from = *msg_start;
+        bpf_debug("end capture range (%d) in [%d, %d]", mid, from, next - from);
+
+        ms[mid] = (struct http_match) {
+            .idx = from,
+            .len = next - from,
+            .source = HTTP_SRC_MSG
+        };
+    }
+
+    if ((act.flags & HTTP1F_DONE) != 0) {
+        bpf_debug("done parsing at %d", next);
+        return true;
+    }
+
+    return false;
+}
 
 // Walks the DFA over `data`, starting at offset `start` and in state `*s`, and
 // records the ranges it captures in `ms`. `cidx` holds the start index of every
@@ -94,6 +131,12 @@ static __always_inline int _parse_from(u8 *data, u8 *data_end, u16 start, struct
             continue;
         }
 
+        // the initial action has no transition to carry it, so it runs in
+        // front of the transition the first byte of the message takes
+        if (i == *msg_start && *s == s_init && _run_action(initial_action, i, ms, cidx, msg_start)) {
+            return i;
+        }
+
         u16 a = 0;
         _next(*s, c, s, &a);
 
@@ -101,28 +144,8 @@ static __always_inline int _parse_from(u8 *data, u8 *data_end, u16 start, struct
             _next(s_any, c, s, &a);
         }
 
-        struct http1_action act = _action(a);
-        if (act.kind == HTTP1A_START_CAPTURE) {
-            u16 mid = act.mid & MAX_MATCH_MASK;
-            bpf_debug("start capture range (%d) in [%d, ...]", mid, i+1);
-            cidx[mid] = i + 1;
-        }
-        else if (act.kind == HTTP1A_END_CAPTURE) {
-            u16 mid = act.mid & MAX_MATCH_MASK;
-            u32 from = cidx[mid];
-            if (from == CIDX_NONE) from = *msg_start;
-            bpf_debug("end capture range (%d) in [%d, %d]", mid, from, i - from + 1);
-
-            ms[mid] = (struct http_match) {
-                .idx = from,
-                .len = i - from + 1,
-                .source = HTTP_SRC_MSG
-            };
-        }
-
-        if ((act.flags & HTTP1F_DONE) != 0) {
-            bpf_debug("done parsing at %d", i);
-            return i+1;
+        if (_run_action(a, i + 1, ms, cidx, msg_start)) {
+            return i + 1;
         }
     }
 

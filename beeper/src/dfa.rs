@@ -1,6 +1,6 @@
 use crate::StateId;
 use std::{collections::HashMap, fmt::Debug, ops::RangeBounds};
-use tracing::trace;
+use tracing::{trace, warn};
 
 /// The state a message is parsed from.
 pub const INIT_STATE: StateId = StateId(0);
@@ -77,10 +77,14 @@ impl<A: Copy + Debug + PartialEq + Eq> DfaBuilder<'_, A> {
     /// Attaches `action` to every transition that leads into the state the
     /// pattern has been built up to.
     ///
+    /// If the pattern has no transition yet, `action` becomes the
+    /// [initial action](Dfa::initial_action) of the DFA instead, which the
+    /// parser runs before the very first byte of a message.
+    ///
     /// # Panics
     ///
-    /// Panics if the pattern has no transition yet, as there is nothing to
-    /// attach `action` to.
+    /// Panics if the pattern has no transition yet and the DFA already has an
+    /// initial action other than `action`.
     pub fn with(&mut self, action: A) -> &mut Self {
         trace!("with; state={:?}, action={:?}", self.state, action);
 
@@ -88,10 +92,17 @@ impl<A: Copy + Debug + PartialEq + Eq> DfaBuilder<'_, A> {
         // the routes into it and has to carry the action too
         self.push_optional_prefixes();
 
-        assert!(
-            !self.last_edges.is_empty(),
-            "Cannot attach {action:?} to a pattern without a transition"
-        );
+        if self.last_edges.is_empty() {
+            if self.state != INIT_STATE {
+                warn!(
+                    "{action:?} is attached to {:?} without a transition, it only runs before the first byte",
+                    self.state
+                );
+            }
+
+            self.dfa.set_initial_action(action);
+            return self;
+        }
 
         for (from, input, case_sensitive) in self.last_edges.clone() {
             self.dfa.add_action(from, input, action);
@@ -377,6 +388,10 @@ pub(crate) struct Dfa<A: Copy + Debug + PartialEq + Eq> {
 
     /// The transitions of the DFA, keyed by state and input.
     edges: EdgeMap<A>,
+
+    /// The action run before the very first byte of a message, attached by a
+    /// pattern that has no transition to carry it.
+    initial_action: Option<A>,
 }
 
 impl<A: Copy + Debug + PartialEq + Eq> Dfa<A> {
@@ -390,6 +405,7 @@ impl<A: Copy + Debug + PartialEq + Eq> Dfa<A> {
         Dfa {
             num_states: reserved.max(2),
             edges: HashMap::new(),
+            initial_action: None,
         }
     }
 
@@ -479,6 +495,28 @@ impl<A: Copy + Debug + PartialEq + Eq> Dfa<A> {
         edge.action = Some(action);
     }
 
+    /// Returns the action the parser runs before the very first byte of a
+    /// message, but not before any other byte.
+    pub fn initial_action(&self) -> Option<A> {
+        self.initial_action
+    }
+
+    /// Sets the [initial action](Dfa::initial_action).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the DFA already has an initial action other than `action`.
+    fn set_initial_action(&mut self, action: A) {
+        if let Some(old_action) = self.initial_action {
+            assert!(
+                old_action == action,
+                "Cannot {action:?} and {old_action:?} before the first byte"
+            );
+        }
+
+        self.initial_action = Some(action);
+    }
+
     /// Returns an iterator over the transitions of the DFA, each paired with
     /// the id of the action it carries.
     pub fn iter_transitions(
@@ -555,9 +593,19 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "without a transition")]
-    fn an_action_needs_a_transition_to_attach_to() {
-        let mut dfa: Dfa<()> = Dfa::new();
-        dfa.start_pattern(INIT_STATE).with(());
+    fn an_action_without_a_transition_runs_before_the_first_byte() {
+        let mut dfa: Dfa<u8> = Dfa::new();
+        dfa.start_pattern(INIT_STATE).with(1).push("a").with(2);
+
+        assert_eq!(dfa.initial_action(), Some(1));
+        assert!(dfa.iter_transitions().all(|(.., action)| action == Some(2)));
+    }
+
+    #[test]
+    #[should_panic(expected = "before the first byte")]
+    fn the_initial_action_cannot_be_combined_with_another() {
+        let mut dfa: Dfa<u8> = Dfa::new();
+        dfa.start_pattern(INIT_STATE).with(1);
+        dfa.start_pattern(INIT_STATE).with(2);
     }
 }
