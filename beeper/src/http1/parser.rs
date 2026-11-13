@@ -229,9 +229,9 @@ impl Parser {
     /// ```
     pub fn match_http2_preface(&mut self) -> Result<MatchId, Error> {
         let mid = self.new_match()?;
+        // a capture that no transition opens starts with the message
         self.dfa
             .start_pattern(INIT_STATE)
-            .with(Action::StartCapture(mid))
             .push(&format!(
                 "PRI * HTTP/2.0{}{}{}{}SM{}{}{}{}",
                 CR, LF, CR, LF, CR, LF, CR, LF
@@ -259,9 +259,9 @@ impl Parser {
 
         let mid = self.new_match()?;
         if name == METHOD.as_str() {
+            // a capture that no transition opens starts with the message
             self.dfa
                 .start_pattern(INIT_STATE)
-                .with(Action::StartCapture(mid))
                 .push_options_ci(&methods)
                 .with(Action::EndCapture(mid))
                 .push(" ")
@@ -483,6 +483,18 @@ impl Parser {
                 action,
             };
         }
+
+        let initial_action = self.dfa.initial_action();
+        let new_action_idx = action_idx.len();
+        let initial_action_idx = *action_idx.entry(initial_action).or_insert(new_action_idx);
+        if initial_action_idx >= data.actions.len() {
+            warn!(
+                "the patterns take more actions than the {} the parser holds",
+                data.actions.len()
+            );
+            return Err(Error::ParserExceedsStateLimit);
+        }
+        data.initial_action = initial_action_idx as u16;
 
         for (action, i) in action_idx {
             let Some(action) = action else { continue };

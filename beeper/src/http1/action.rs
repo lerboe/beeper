@@ -23,7 +23,8 @@ pub(super) const HTTP1F_DONE: u8 = 1 << 0;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Action {
     /// Starts capturing a range starting from the next byte. The
-    /// resulting range is identified by the [`MatchId`].
+    /// resulting range is identified by the [`MatchId`]. A range that
+    /// ends without one starts with the message.
     StartCapture(MatchId),
 
     /// Ends capturing a range ending with the next byte. The

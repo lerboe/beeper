@@ -512,7 +512,10 @@ int skb_verdict(struct __sk_buff *skb) {
         }
     }
     else {
-        if (parse_http1_skb(skb, off, &pres, NULL) < 0) return SK_PASS;
+        // a message behind a run of NULL bytes stands in for one that kTLS
+        // decrypted, which zeroes the TLS header rather than removing it
+        struct null_prefix null_prefix = { 0 };
+        if (parse_http1_skb(skb, off, &pres, &null_prefix) < 0) return SK_PASS;
 
         if (matched_http1(&pres, 0)) {
             upgrade_conn(&ikey);
