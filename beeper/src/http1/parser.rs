@@ -229,9 +229,9 @@ impl Parser {
     /// ```
     pub fn match_http2_preface(&mut self) -> Result<MatchId, Error> {
         let mid = self.new_match()?;
+        // a capture that no transition opens starts with the message
         self.dfa
             .start_pattern(INIT_STATE)
-            .with(Action::StartCapture(mid))
             .push(&format!(
                 "PRI * HTTP/2.0{}{}{}{}SM{}{}{}{}",
                 CR, LF, CR, LF, CR, LF, CR, LF
@@ -261,7 +261,6 @@ impl Parser {
         if name == METHOD.as_str() {
             self.dfa
                 .start_pattern(INIT_STATE)
-                .with(Action::StartCapture(mid))
                 .push_options_ci(&methods)
                 .with(Action::EndCapture(mid))
                 .push(" ")

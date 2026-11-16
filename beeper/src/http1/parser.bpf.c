@@ -58,17 +58,54 @@ static __always_inline void _next(u16 state, u8 input, u16 *next_state, u16 *act
     *action = t.action;
 }
 
+// The start index of a capture that no transition has opened.
+#define CIDX_NONE ((u32)-1)
+
+// Runs the action `a` of a transition after which the message continues at
+// index `next`, recording the ranges it captures in `ms`. `cidx` and
+// `msg_start` are those of `_parse_from`.
+//
+// Returns whether the action ends parsing.
+static __always_inline bool _run_action(u16 a, u32 next, struct http_match *ms, u32 *cidx, u32 *msg_start) {
+    struct http1_action act = _action(a);
+    if (act.kind == HTTP1A_START_CAPTURE) {
+        u16 mid = act.mid & MAX_MATCH_MASK;
+        bpf_debug("start capture range (%d) in [%d, ...]", mid, next);
+        cidx[mid] = next;
+    }
+    else if (act.kind == HTTP1A_END_CAPTURE) {
+        u16 mid = act.mid & MAX_MATCH_MASK;
+        u32 from = cidx[mid];
+        if (from == CIDX_NONE) from = *msg_start;
+        bpf_debug("end capture range (%d) in [%d, %d]", mid, from, next - from);
+
+        ms[mid] = (struct http_match) {
+            .idx = from,
+            .len = next - from,
+            .source = HTTP_SRC_MSG
+        };
+    }
+
+    if ((act.flags & HTTP1F_DONE) != 0) {
+        bpf_debug("done parsing at %d", next);
+        return true;
+    }
+
+    return false;
+}
+
 // Walks the DFA over `data`, starting at offset `start` and in state `*s`, and
 // records the ranges it captures in `ms`. `cidx` holds the start index of every
-// open capture, `s` the state the walk ended in, so that a caller can resume
-// where it stopped.
+// open capture, or `CIDX_NONE`, `msg_start` the index the message begins at and
+// `s` the state the walk ended in, so that a caller can resume where it stopped.
 //
 // `null_prefix` is the length of the run of NULL bytes at the beginning of the
 // buffer that is to be skipped rather than parsed; it is updated as those bytes
-// are consumed. It may be NULL if the data cannot carry such a prefix.
+// are consumed, and the message begins after them. It may be NULL if the data
+// cannot carry such a prefix.
 //
 // Returns the number of bytes consumed, or its negative if data ran out.
-static __always_inline int _parse_from(u8 *data, u8 *data_end, u16 start, struct http_match *ms, u32* cidx, u16* s, struct null_prefix *null_prefix) {
+static __always_inline int _parse_from(u8 *data, u8 *data_end, u16 start, struct http_match *ms, u32* cidx, u32 *msg_start, u16* s, struct null_prefix *null_prefix) {
     u32 len = (u32)(data_end - data);
     bpf_clamp_uminmax(len, 0, MAX_BYTES);
 
@@ -84,6 +121,7 @@ static __always_inline int _parse_from(u8 *data, u8 *data_end, u16 start, struct
         // skb clears the TLS header, but does not remove it
         if (null_prefix && c == '\0' && i == null_prefix->len) {
             null_prefix->len = i + 1;
+            if (*msg_start == i) *msg_start = i + 1;
             continue;
         }
 
@@ -94,26 +132,8 @@ static __always_inline int _parse_from(u8 *data, u8 *data_end, u16 start, struct
             _next(s_any, c, s, &a);
         }
 
-        struct http1_action act = _action(a);
-        if (act.kind == HTTP1A_START_CAPTURE) {
-            u16 mid = act.mid & MAX_MATCH_MASK;
-            bpf_debug("start capture range (%d) in [%d, ...]", mid, i+1);
-            cidx[mid] = i + 1;
-        }
-        else if (act.kind == HTTP1A_END_CAPTURE) {
-            u16 mid = act.mid & MAX_MATCH_MASK;
-            bpf_debug("end capture range (%d) in [%d, %d]", mid, cidx[mid], i - cidx[mid] + 1);
-
-            ms[mid] = (struct http_match) {
-                .idx = cidx[mid],
-                .len = i - cidx[mid] + 1,
-                .source = HTTP_SRC_MSG
-            };
-        }
-
-        if ((act.flags & HTTP1F_DONE) != 0) {
-            bpf_debug("done parsing at %d", i);
-            return i+1;
+        if (_run_action(a, i + 1, ms, cidx, msg_start)) {
+            return i + 1;
         }
     }
 
@@ -128,11 +148,12 @@ static __always_inline int _parse_from(u8 *data, u8 *data_end, u16 start, struct
 // Returns the header length, or a negative error in case of failure.
 SEC("freplace")
 int parse_msg(struct sk_msg_md *msg, struct http_parse_res *pres __arg_nonnull) {
-    u32 cidx[MAX_MATCHES] = { 0 };
+    u32 cidx[MAX_MATCHES] = { [0 ... MAX_MATCHES - 1] = CIDX_NONE };
+    u32 msg_start = 0;
     u16 s = s_init;
     u8 *data = (u8 *)(long)msg->data;
     u8 *data_end = (u8 *)(long)msg->data_end;
-    int res = _parse_from(data, data_end, 0, pres->ms, cidx, &s, NULL);
+    int res = _parse_from(data, data_end, 0, pres->ms, cidx, &msg_start, &s, NULL);
 
     if (res < 0 && msg->size > -res) {
         if (bpf_msg_pull_data(msg, 0, msg->size, 0) < 0) {
@@ -142,7 +163,7 @@ int parse_msg(struct sk_msg_md *msg, struct http_parse_res *pres __arg_nonnull) 
         u8 *data = (u8 *)(long)msg->data;
         u8 *data_end = (u8 *)(long)msg->data_end;
 
-        res = _parse_from(data, data_end, -res, pres->ms, cidx, &s, NULL);
+        res = _parse_from(data, data_end, -res, pres->ms, cidx, &msg_start, &s, NULL);
     }
 
     if (res > 0) return res;
@@ -169,9 +190,10 @@ int parse_skb(struct __sk_buff *skb, u32 off, struct http_parse_res *pres __arg_
         data_end = (u8 *)(long)skb->data_end;
     }
 
-    u32 cidx[MAX_MATCHES] = { 0 };
+    u32 cidx[MAX_MATCHES] = { [0 ... MAX_MATCHES - 1] = CIDX_NONE };
+    u32 msg_start = off;
     u16 s = s_init;
-    int res = _parse_from(data, data_end, off, pres->ms, cidx, &s, null_prefix);
+    int res = _parse_from(data, data_end, off, pres->ms, cidx, &msg_start, &s, null_prefix);
 
     if (res > 0) return res - (int)off;
     return skb->len >= MAX_BYTES ? -E2BIG : -EAGAIN;
