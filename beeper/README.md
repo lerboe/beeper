@@ -22,8 +22,8 @@ Beeper ([BEEline](https://github.com/nsg-ethz/beeline)'s ParsER) is an applicati
 
 | Protocol | Tests       | SK_SKB | SK_MSG | DYN_PTR | Kernel |
 |----------|-------------|--------|--------|---------|--------|
-| HTTP/1.1 | 19          | ✅     | ✅     | 🚧 WIP  | 6.8    |
-| HTTP/2   | 39 + h2spec | ✅     | ✅     | 🚧 WIP  | 6.8    |
+| HTTP/1.1 | 19          | ✅     | ✅     | 🚧 WIP  |  ≥ 6.8  |
+| HTTP/2   | 39 + h2spec | ✅     | ✅     | 🚧 WIP  | ≥ 6.8   |
 | RESP2    | 🚧 WIP      |        |        |         |        |
 | DNS      | 🚧 WIP      |        |        |         |        |
 
