@@ -623,3 +623,28 @@ async fn report_the_fields_that_were_matched() {
         "only the user agent is matched"
     );
 }
+
+#[tokio::test]
+async fn parse_the_status_line_behind_a_null_prefix_in_skb() {
+    let addr = server::launch().await.expect("launch server");
+
+    let mut open_obj = OpenObject::new();
+    let prog = TestProgram::attach_to(addr, &mut open_obj, Direction::Downstream, Hook::Skb)
+        .expect("attach");
+    let (_h1, mids) = attach_http1_parser(
+        prog.prog_fd(),
+        Hook::Skb,
+        true,
+        &[pseudo_header::METHOD.as_str(), pseudo_header::PATH.as_str()],
+    );
+
+    // kTLS zeroes the 13 bytes of the TLS record header in front of the
+    // message rather than removing them
+    let mut req = vec![0; 13];
+    req.extend_from_slice(format!("POST /compose HTTP/1.1\r\nHost: {addr}\r\n\r\n").as_bytes());
+
+    _ = send_raw_bytes(addr, &req).await;
+
+    assert_match_bytes_eq(&prog, mids[0], Some(b"POST"));
+    assert_match_bytes_eq(&prog, mids[1], Some(b"/compose"));
+}

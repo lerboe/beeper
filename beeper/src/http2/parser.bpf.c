@@ -1119,16 +1119,24 @@ static __always_inline int _parse_frame(const struct msg_ctx *ctx, u32 off, u32 
 // Returns the number of bytes consumed, or a negative error in case of failure.
 SEC("freplace")
 int parse_msg(struct sk_msg_md *msg, struct http_parse_res *pres __arg_nonnull, struct http2_frame *frame __arg_nonnull) {
+    u32 size = msg->size;
+    if (size < HTTP2_FRAME_HDR_LEN) return 0;
+
     u8 *data = (u8 *)(long)msg->data;
     u8 *data_end = (u8 *)(long)msg->data_end;
 
-    if (data + HTTP2_FRAME_HDR_LEN > data_end) return 0;
+    if (data + HTTP2_FRAME_HDR_LEN > data_end) {
+        if (bpf_msg_pull_data(msg, 0, HTTP2_FRAME_HDR_LEN, 0) < 0) return -EFAULT;
+
+        data = (u8 *)(long)msg->data;
+        data_end = (u8 *)(long)msg->data_end;
+        if (data + HTTP2_FRAME_HDR_LEN > data_end) return -EPROTO;
+    }
 
     u32 len = data[0] << 16 | data[1] << 8 | data[2];
     u8 type = data[3];
     u8 flags = data[4];
     u32 frame_len = HTTP2_FRAME_HDR_LEN + len;
-    u32 size = msg->size;
 
     *frame = _new_http2_frame(data, len, type, flags);
 
