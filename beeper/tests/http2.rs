@@ -860,6 +860,58 @@ async fn parse_frame_after_an_unknown_one() {
 }
 
 #[tokio::test]
+async fn parse_frame_whose_header_spans_two_fragments() {
+    let addr = server::launch().await.expect("launch server");
+
+    let mut open_obj = OpenObject::new();
+    let (prog, _h1, _h2, mids) =
+        attach_at(addr, &mut open_obj, Hook::Msg, &[header::ACCEPT.as_str()]);
+
+    let mut client = RawClient::connect(addr).await;
+
+    // the kernel copies a write to the start of the page fragment of this
+    // thread only once nothing sent before holds on to it anymore. A full
+    // exchange, and a pause for the acknowledgements the server may delay by
+    // 40ms, see to that
+    client
+        .request(raw_request_block(
+            &addr.to_string(),
+            &[(Some(19), "accept", "text/plain")],
+        ))
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // unassigned frame types, which the server discards, up to 4 bytes short
+    // of the end of the page fragment the write is copied to. The data
+    // pointers of an `sk_msg` program only cover a single fragment, so the
+    // header of the frame behind them is split across two. The fragment holds
+    // 32KiB, or a page if the kernel cannot get that much in one piece, which
+    // ends at the same offset
+    const FRAG_LEN: usize = 32 * 1024;
+    const MAX_FRAME_LEN: usize = 16 * 1024;
+    let mut out = frame(0xFA, 0, 0, &[0; MAX_FRAME_LEN]);
+    let rest = FRAG_LEN - 4 - out.len() - 9;
+    out.extend_from_slice(&frame(0xFA, 0, 0, &vec![0; rest]));
+    assert_eq!(out.len(), FRAG_LEN - 4);
+
+    let block = raw_request_block(&addr.to_string(), &[(Some(19), "accept", "*/*")]);
+    let id = client.next_stream_id;
+    client.next_stream_id += 2;
+    // END_STREAM | END_HEADERS
+    out.extend_from_slice(&frame(0x01, 0x05, id, &block));
+
+    client.send_raw(&out).await;
+    client.read_frame(0x01).await;
+
+    let accept_val = HeaderValue::from_static("*/*");
+    assert_eq!(
+        prog.get_match(mids[0]).expect("get_match").as_deref(),
+        Some(accept_val.as_bytes()),
+        "the parser did not read a frame header split across two fragments"
+    );
+}
+
+#[tokio::test]
 async fn update_dynamic_table_size() {
     let addr = server::launch().await.expect("launch server");
 
