@@ -20,11 +20,12 @@
 
 Beeper ([BEEline](https://github.com/nsg-ethz/beeline)'s ParsER) is an application-layer parser for eBPF. It allows you to process L7 protocols directly in the kernel, which can accelerate user space applications significantly. It achieves this by constructing an Aho-Corasick-like DFA in user space, reducing the parsing complexity to an eBPF-compatible level. With beeper, you can for example monitor application-layer traffic, redirect it based on its payload, or respond to it, directly from the kernel. For more information, please have a look at the [full paper][doi-url] or this [LPC talk](https://www.youtube.com/watch?v=uWmgVs8REjI).
 
-Protocol      | Status  | Minimal Kernel Version
-------------- | ------- | ----------------------
-HTTP/1.1      | ✅      | 6.8
-HTTP/2        | ✅      | 6.8
-RESP2         | WIP     | 
+| Protocol | Tests       | SK_SKB | SK_MSG | DYN_PTR | Kernel |
+|----------|-------------|--------|--------|---------|--------|
+| HTTP/1.1 | 19          | ✅     | ✅     | 🚧 WIP  | 6.8    |
+| HTTP/2   | 39 + h2spec | ✅     | ✅     | 🚧 WIP  | 6.8    |
+| RESP2    | 🚧 WIP      |        |        |         |        |
+| DNS      | 🚧 WIP      |        |        |         |        |
 
 ## Use Cases
 
